@@ -127,6 +127,13 @@ device.
 
 Rollback and delay-sync both carry multitap pad bytes.
 
+**BIOS settle:** each peer advertises `bios_offer` on ready (can run
+OpenBIOS / SCPH-1001, and whether OpenBIOS is selected). At Start the host
+publishes `match_caps.session_bios` (`openbios` or `scph1001`). The session
+uses OpenBIOS unless every seated peer can run SCPH-1001 and nobody selected
+OpenBIOS. That choice boots the match only — it does not change each peer’s
+saved BIOS preference. See `docs/BIOS_SELECTION.md` (Netplay lobby settle).
+
 ---
 
 ## Disc identity for multi-track titles
@@ -163,8 +170,9 @@ Generate & rebuild / prepare flows should point at the **`.cue`**, not a lone
   netplay.
 - **VERSION / lobby match pin:** peers should run the same release pin so
   generated code and protocol stay compatible.
-- **Mods:** netplay launches prefer a vanilla / synced mod plan (title-specific;
-  see launcher `commit_netplay` hooks).
+- **Mods:** disabled for all netplay sessions (lobby / LAN / direct / rematch).
+  Launcher `commit_netplay` and the runtime clear the in-session plan without
+  touching the user's offline mod selection. Synced mod plans are deferred.
 
 ---
 

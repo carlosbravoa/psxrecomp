@@ -267,6 +267,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
     ${PSXRECOMP_ROOT}/runtime/src/gte.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/nd_intro_ot.c
     ${PSXRECOMP_ROOT}/runtime/src/crc32.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_sha256.c
     ${PSXRECOMP_ROOT}/runtime/src/disc_identity.cpp
@@ -841,9 +842,18 @@ function(psxrecomp_add_runtime_target target)
                 "  (build that tool first if needed; see psxrecomp/docs/BUILDING.md). "
                 "This is expected on a fresh checkout before the first generation.")
         endif()
+        # Pass paths via a list file — large shard counts (hundreds of
+        # generated/*_full_*.c) make -DSOURCES=... exceed Windows' ~8191-char
+        # CreateProcess limit ("The system cannot execute the specified program").
+        set(_psxrt_gen_list
+            "${CMAKE_CURRENT_BINARY_DIR}/${target}_generated_sources.txt")
+        file(WRITE "${_psxrt_gen_list}" "")
+        foreach(_g IN LISTS _game_generated_check)
+            file(APPEND "${_psxrt_gen_list}" "${_g}\n")
+        endforeach()
         add_custom_target(${target}_require_generated
             COMMAND ${CMAKE_COMMAND}
-                    "-DSOURCES=${_game_generated_check}"
+                    "-DSOURCES_FILE=${_psxrt_gen_list}"
                     "-DTARGET=${target}"
                     "-DGAME_CONFIG=${PSXRT_DEFAULT_GAME_CONFIG_PATH}"
                     "-DRECOMPILER=${_psxrt_recompiler_hint}"
@@ -1159,6 +1169,11 @@ function(psxrecomp_add_runtime_target target)
         find_package(OpenGL)
         if(OpenGL_FOUND)
             target_link_libraries(${target} PRIVATE OpenGL::GL)
+        endif()
+        # Async lobby connect (psx_lobby_client.c) uses pthread on Unix.
+        if(PSXRECOMP_HAS_LOBBY_CLIENT)
+            find_package(Threads REQUIRED)
+            target_link_libraries(${target} PRIVATE Threads::Threads)
         endif()
     endif()
 

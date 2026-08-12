@@ -122,6 +122,25 @@ refuse to load under a different one. Without that check, switching BIOS would
 silently corrupt a restored state — the only quiet failure mode in this design,
 which is why it is enforced rather than warned about.
 
+## Netplay lobby settle
+
+Online lobbies advertise a per-peer `bios_offer` on `set_ready` and freeze a
+single `match_caps.session_bios` at host Start:
+
+- **OpenBIOS** if any seated peer prefers OpenBIOS, or any peer cannot run
+  SCPH-1001 (no linked retail backend and/or no validated dump), or a peer
+  sends no offer (legacy client).
+- **SCPH-1001** only when every seated peer can run it and nobody selected
+  OpenBIOS.
+
+Every peer applies that session BIOS before boot. Mixed BIOSes are invalid for
+rollback (kernel RAM layout differs).
+
+Session BIOS is **ephemeral**: it affects only that match’s runtime boot. It
+does **not** rewrite `bios.cfg`, `settings.toml`, or the launcher Settings BIOS
+row. Soft-return shows the player’s durable preference again; the next Start
+re-settles from `bios_offer` as usual.
+
 ## Why both are compiled in
 
 The alternative — a build flavour per BIOS — was the original design, and it
