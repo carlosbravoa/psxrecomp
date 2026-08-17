@@ -124,6 +124,10 @@ SW path (`gl_rep_for_rect`, unbumped span; mirrored rects sample the same
 image mirrored). Verified on Mega Man 8 (OpenGL, `[video] supersampling = 2`):
 identical replacements to the software path, 20,580 lookups → 17,960 hits.
 
+Like the software path, GL replaces only at internal scale > 1 (at 1× the
+FBO is the native picture; pack art would only be blurred down into it — a
+gap closed after B13's bilinear sampling made it visible).
+
 **Divergence (documented, accepted like the others in `gpu_gl_renderer.c`)**:
 on GL the hr FBO *is* VRAM — CPU readbacks (VRAM→CPU transfers, GPUREAD,
 `screenshot`, savestate VRAM) re-encode it, so replaced pixels of *rendered*

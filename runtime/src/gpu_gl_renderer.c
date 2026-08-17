@@ -2052,7 +2052,10 @@ static void gl_rep_for_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
                             int u, int v, int w, int h, float rep[GL_REP_N]) {
     for (int k = 0; k < 8; k++) rep[k] = 0.0f;
     rep[8] = rep[9] = rep[10] = 1.0f; rep[11] = rep[12] = rep[13] = 0.0f;
-    if (!g_texture_pack_replace) return;
+    /* Same rule as the software renderer: replacements only at internal
+     * scale > 1 (docs/TEXTURE_PACKS.md). At 1x the FBO is the native picture
+     * and pack art would only be down-sampled (blurred) into it. */
+    if (!g_texture_pack_replace || s_scale <= 1) return;
     gl_atlas_sync();
     if (!s_atlas_tex) return;
     float mod[6];
