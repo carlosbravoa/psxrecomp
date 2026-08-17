@@ -5227,6 +5227,7 @@ static void handle_gpu_state(int id, const char *json)
              "\"display_x\":%d,\"display_y\":%d,"
              "\"width\":%d,\"height\":%d,"
              "\"depth\":%d,\"depth24\":%d,"
+             "\"d24_rgb_limit\":%u,"
              "\"disabled\":%d,"
              "\"h_display\":[%u,%u],\"v_display\":[%u,%u],"
              "\"hres1\":%u,\"hres2\":%u,"
@@ -5254,6 +5255,7 @@ static void handle_gpu_state(int id, const char *json)
              id, di.display_x, di.display_y,
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
+             (unsigned)gpu_depth24_rgb_limit(di.display_x, di.width),
              di.disabled,
              hx1, hx2, hy1, hy2, hr1, hr2,
              gpustat,

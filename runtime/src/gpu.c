@@ -2123,7 +2123,7 @@ static uint16_t vram_write_pixels[1024 * 512];
 static uint32_t s_d24_upload_x1 = 0;
 static int      s_d24_present_hold = 0; /* vblanks to skip Swap after GP1(07h) */
 static uint32_t s_d24_prev_disp_h = 0;  /* last GP1(07h) band height */
-static void depth24_note_upload(uint32_t x, uint32_t w);
+static void depth24_note_upload(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
 static void gp0_commit_cpu_to_vram(void) {
     for (uint32_t row = 0; row < vram_write_h; row++)
@@ -2133,7 +2133,7 @@ static void gp0_commit_cpu_to_vram(void) {
                      ((vram_write_x + col) & 1023u)];
     gr_vram_transfer_in(vram_write_x, vram_write_y,
                         vram_write_w, vram_write_h, vram_write_pixels);
-    depth24_note_upload(vram_write_x, vram_write_w);
+    depth24_note_upload(vram_write_x, vram_write_y, vram_write_w, vram_write_h);
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
     text_xlate_vram_upload(vram_write_x, vram_write_y,
@@ -2696,10 +2696,33 @@ static uint8_t gpu_vram_byte(uint32_t byte_x, uint32_t y) {
  * hide trailing RGB columns when a movie blit doesn't fill the full CRTC
  * width — MotK's Star Wars crawl leaves ~8px of stale VRAM on the right.
  * Only FB-class A0s (w >= 256 halfwords) grow the span; texture uploads must
- * not collapse it. During present-hold, ignore updates entirely. */
-static void depth24_note_upload(uint32_t x, uint32_t w) {
-    if (!(display_depth & 1u) || w < 256u) return;
+ * not collapse it. During present-hold, ignore updates entirely.
+ *
+ * The upload must also land INSIDE the CRTC scanout band (display area
+ * columns AND rows). A wide upload elsewhere in VRAM is not movie coverage:
+ * Mega Man 8 stages two 256x8 palette/texture blits at y=480 right as its
+ * 24-bit intro starts, then streams every movie frame as 24-halfword
+ * (16-pixel) macroblock strips that never pass the width guard. Counting the
+ * off-band blits pinned the span at 256 halfwords = 170 RGB px, and the
+ * trailing-margin blank in the present path cropped the whole FMV to its
+ * left 53%. With no on-band FB-class upload the span stays 0 (= unknown),
+ * which the presenters treat as "default 8-column margin only". */
+static void depth24_note_upload(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!(display_depth & 1u) || w < 256u || h == 0u) return;
     if (s_d24_present_hold > 0) return;
+    {
+        GpuDisplayInfo di;
+        gpu_get_display_info(&di);
+        uint32_t dx = di.display_x & 1023u;
+        uint32_t dy = di.display_y & 511u;
+        uint32_t fb_w = (di.width * 3u + 1u) / 2u;   /* RGB px -> halfwords */
+        uint32_t fb_h = di.height;
+        uint32_t ux = x & 1023u, uy = y & 511u;
+        if (fb_w < 8u) fb_w = 8u;
+        if (fb_h < 1u) fb_h = 1u;
+        if (ux >= dx + fb_w || ux + w <= dx) return;   /* outside band columns */
+        if (uy >= dy + fb_h || uy + h <= dy) return;   /* outside band rows */
+    }
     uint32_t x1 = x + w;
     if (x1 > 1024u) x1 = 1024u;
     if (x1 > s_d24_upload_x1) s_d24_upload_x1 = x1;
