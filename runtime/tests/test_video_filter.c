@@ -258,7 +258,48 @@ static void test_prescale_rows(void) {
     free(d);
 }
 
+/* Supersampled source (internal scale ss > 1): upscalers stand down, the
+ * looks apply in place at the native line pitch (video_filter.h). */
+static void test_supersampled(void) {
+    /* one native line = 3 rows at ss=3, 4 native columns x 1 line = 12x3 */
+    enum { SS = 3, W = 4 * SS, H = 1 * SS };
+    uint32_t src[W * H], dst[W * H];
+    for (int i = 0; i < W * H; i++) src[i] = WHITE;
+    for (int k = 0; k < VF_COUNT; k++) {
+        const int up = video_filter_is_upscaler(k);
+        CHECK(video_filter_applies_at_scale(k, 1) == (k != VF_NONE), "applies at 1x: %d", k);
+        CHECK(video_filter_applies_at_scale(k, 2) == (k != VF_NONE && !up), "applies at 2x: %d", k);
+        if (up)
+            CHECK(video_filter_apply_cpu_ss(k, src, W, W, H, dst, W, SS) == 0, "upscaler %d stands down at ss>1", k);
+    }
+    /* sharp at ss: identity, same size */
+    memset(dst, 0, sizeof dst);
+    CHECK(video_filter_apply_cpu_ss(VF_SHARP, src, W, W, H, dst, W, SS) == 1, "sharp ss applies");
+    for (int i = 0; i < W * H; i++) CHECK(dst[i] == WHITE, "sharp ss is identity");
+    /* scanlines at ss=3: the 3 rows of the native line get the 1x profile 1:1
+     * (row 0 mid, row 1 core, row 2 gap): white stays white, gap darker grey */
+    VideoScanlineParams sp = { 1.0f, 0.35f, 0.0f };
+    video_filter_scanline_set(&sp);
+    CHECK(video_filter_apply_cpu_ss(VF_SCANLINES, src, W, W, H, dst, W, SS) == 1, "scanlines ss applies");
+    CHECK(dst[0] == WHITE && dst[W] == WHITE, "scanline ss rows 0/1 keep the line");
+    CHECK(dst[2 * W] == BLACK, "scanline ss row 2 is the gap (opacity 1, glow 0): %08X", dst[2 * W]);
+    /* ss=2: the profile sampled at row centres -> row 0 = mid (line), row 1 = gap */
+    uint32_t s2[4 * 2], d2[4 * 2];
+    for (int i = 0; i < 8; i++) s2[i] = WHITE;
+    CHECK(video_filter_apply_cpu_ss(VF_SCANLINES, s2, 4, 4, 2, d2, 4, 2) == 1, "scanlines ss=2 applies");
+    CHECK(d2[0] == WHITE && d2[4] == BLACK, "ss=2: line row then gap row: %08X %08X", d2[0], d2[4]);
+    /* ss=4: rows map mid, core, core, gap -> the last row is the gap */
+    uint32_t s4[4 * 4], d4[4 * 4];
+    for (int i = 0; i < 16; i++) s4[i] = WHITE;
+    CHECK(video_filter_apply_cpu_ss(VF_SCANLINES, s4, 4, 4, 4, d4, 4, 4) == 1, "scanlines ss=4 applies");
+    CHECK(d4[0] == WHITE && d4[4] == WHITE && d4[8] == WHITE && d4[12] == BLACK, "ss=4: last of 4 rows is the gap");
+    sp.opacity = VF_SCAN_OPACITY_DEFAULT; sp.glow = VF_SCAN_GLOW_DEFAULT; video_filter_scanline_set(&sp);
+    /* ss=1 delegates to the 1x path: same-size call is refused (dst too small for the prescale) */
+    CHECK(video_filter_apply_cpu_ss(VF_SCANLINES, s2, 4, 4, 2, d2, 4, 1) == 0, "ss=1 needs the N x buffer");
+}
+
 int main(void) {
+    test_supersampled();
     test_names();
     test_flat_and_sizes();
     test_scale2x_rules();

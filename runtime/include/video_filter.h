@@ -120,6 +120,20 @@ int  video_filter_cpu_scale(int kind);
  * untouched). */
 int  video_filter_apply_cpu(int kind, const uint32_t* src, int src_pitch,
                             int w, int h, uint32_t* dst, int dst_pitch);
+/* Supersampled source (internal scale `ss` > 1: the software hi-res mirror,
+ * every native line is `ss` rows, every native column `ss` pixels). The
+ * pixel-art upscalers are meaningless there — they were designed for the
+ * native pixel grid, and on supersampled / HD-replaced content they see
+ * staircases where there are none — so at ss > 1 they are NOT applied
+ * (returns 0: present the picture as it is). The final-pass looks keep
+ * working: sharp = identity, scanlines / crt = the row-weight profile of the
+ * 1x path stretched over the `ss` rows of each native line, output the SAME
+ * size as the input (dst is w x h, dst_pitch >= w). Returns 1 when dst was
+ * written, 0 when the caller must present unfiltered.
+ * video_filter_applies_at_scale(kind, ss) tells the same in advance. */
+int  video_filter_apply_cpu_ss(int kind, const uint32_t* src, int src_pitch,
+                               int w, int h, uint32_t* dst, int dst_pitch, int ss);
+int  video_filter_applies_at_scale(int kind, int ss);
 
 /* xBR tuning shared by the CPU reference and the GL shaders. Lumas are the
  * INTEGER 299*R + 587*G + 114*B of 8-bit channels (0..255000): every luma,

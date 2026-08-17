@@ -8979,12 +8979,15 @@ static void handle_video_filter(int id, const char *json)
     gl_renderer_video_filter_last_rect(lr);
     send_fmt("{\"id\":%d,\"ok\":true,\"filter\":\"%s\",\"kind\":%d,\"scale\":%d,"
              "\"cpu_scale\":%d,\"names\":[%s],\"scanline\":{\"opacity\":%.2f,\"size\":%.2f,\"glow\":%.2f},"
-             "\"gl\":{\"last_kind\":%d,\"broken_mask\":%u,\"passes\":%llu,\"fallbacks\":%llu,"
+             "\"applies_at_scale\":%d,\"internal_scale\":%d,"
+             "\"gl\":{\"last_kind\":%d,\"broken_mask\":%u,\"passes\":%llu,\"fallbacks\":%llu,\"stood_down\":%llu,"
              "\"last_rect\":[%d,%d,%d,%d],\"last_native\":[%d,%d],\"last_letterbox\":[%d,%d,%d,%d]}}",
              id, video_filter_name(cur), cur, video_filter_scale(cur),
              video_filter_cpu_scale(cur), vocab, (double)spr.opacity, (double)spr.size, (double)spr.glow,
+             video_filter_applies_at_scale(cur, gr_scale()), gr_scale(),
              last_kind, broken,
              (unsigned long long)passes, (unsigned long long)fallbacks,
+             (unsigned long long)gl_renderer_video_filter_stood_down(),
              lr[0], lr[1], lr[2], lr[3], lr[4], lr[5], lr[6], lr[7], lr[8], lr[9]);
 }
 

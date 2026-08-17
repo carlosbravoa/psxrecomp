@@ -247,10 +247,17 @@ palette *cycling* (water, energy) is a recolour to the model and needs
 variants; recolour detection in `starter` needs the `.clut` files of a fresh
 dump (`--no-variants` skips it).
 
+## Presenting at S× (B5)
+
+Replacements are only visible at `[video] supersampling` ≥ 2, where the S×
+picture is what gets presented. Video filters at that scale follow
+`VIDEO_FILTERS.md` → *With supersampling*: the pixel-art upscalers stand
+down (they would misread HD art as staircases), the display looks
+(sharp / scanlines / crt) apply at the native line pitch on both backends.
+
 ## Next
 
-DEGRADED logging when a pack entry's native hash no longer matches; bilinear
-pack sampling; SW-vs-GL parity tool; shaded-textured triangles.
+Bilinear pack sampling; SW-vs-GL parity tool; shaded-textured triangles.
 
 ## Files
 

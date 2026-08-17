@@ -4240,6 +4240,7 @@ static int    s_vf_tex_w[2], s_vf_tex_h[2];
 static SDL_GLContext s_vf_fbo_ctx[2];
 static GLuint        s_vf_fbo[2];
 static uint64_t s_vf_passes = 0, s_vf_fallbacks = 0;
+static uint64_t s_vf_stood_down = 0;   /* presents where an upscaler stood down to sharp on a hi-res source */
 static int      s_vf_last_kind = 0;
 static int      s_vf_last_rect[10];                /* rx,ry,rw,rh,native_w,native_h,lx,ly,lw,lh */
 /* One-shot capture of the presented drawable (debug server "present_capture"). */
@@ -4358,10 +4359,9 @@ static void vf_ensure_tex(GLuint *tex, int *cur_w, int *cur_h, int w, int h) {
  * Returns 1 if it drew, 0 if the caller must fall back to the plain present. */
 static int vf_present(GLuint tex, int tex_w, int tex_h, int x, int y, int w, int h,
                       int native_w, int native_h, int lx, int ly, int lw, int lh, int v_flip) {
-    const int kind = video_filter_get();
+    int kind = video_filter_get();
     if (kind == VF_NONE || !v_flip || w <= 0 || h <= 0 || tex_w <= 0 || tex_h <= 0)
         return 0;
-    if (!vf_ensure_programs(kind)) { s_vf_fallbacks++; return 0; }
 
     /* Real texel size of the bound texture (hr textures are s_scale x native). */
     GLint real_w = 0, real_h = 0;
@@ -4372,6 +4372,16 @@ static int vf_present(GLuint tex, int tex_w, int tex_h, int x, int y, int w, int
     if (real_w <= 0 || real_h <= 0) { s_vf_fallbacks++; return 0; }
     const int sx = real_w / tex_w > 0 ? real_w / tex_w : 1;
     const int sy = real_h / tex_h > 0 ? real_h / tex_h : 1;
+    /* Supersampled (hi-res FBO) source: the pixel-art upscalers were designed
+     * for the native pixel grid and misread supersampled / HD-replaced content
+     * as staircases, so they stand down and the picture is fitted sharp
+     * instead (video_filter.h, "supersampled source"). The display looks
+     * (sharp / scanlines / crt) already work at the native line pitch. */
+    if ((sx > 1 || sy > 1) && !video_filter_applies_at_scale(kind, sx > sy ? sx : sy)) {
+        kind = VF_SHARP;
+        s_vf_stood_down++;
+    }
+    if (!vf_ensure_programs(kind)) { s_vf_fallbacks++; return 0; }
     int rx = x * sx, ry = y * sy, rw = w * sx, rh = h * sy;
     if (rx < 0) rx = 0; if (ry < 0) ry = 0;
     if (rx + rw > real_w) rw = real_w - rx;
@@ -4483,6 +4493,7 @@ void gl_renderer_video_filter_diag(int *last_kind, unsigned *broken_mask,
     if (passes)      *passes = s_vf_passes;
     if (fallbacks)   *fallbacks = s_vf_fallbacks;
 }
+uint64_t gl_renderer_video_filter_stood_down(void) { return s_vf_stood_down; }
 
 int gl_renderer_request_present_capture(const char *path) {
     if (!path || !path[0]) return 0;

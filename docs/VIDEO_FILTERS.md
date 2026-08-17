@@ -20,6 +20,27 @@ window with sharp-bilinear (pass B, GL) or SDL's scale mode (software).
 Vulkan does not filter yet (its present is a `vkCmdBlitImage`; the backend is
 hidden/experimental).
 
+## With supersampling (internal scale > 1)
+
+`[video] supersampling` ≥ 2 presents the S× hi-res picture (and, with a
+texture pack, HD art). The pixel-art upscalers were designed for the native
+pixel grid — on supersampled or replaced content they read every S×S block
+or every anti-aliased edge as a staircase to "fix" — so at S > 1 they
+**stand down**: the picture is fitted sharp (GL: pass B alone; software: the
+plain hi-res present) and the ESC menu shows the row as
+`VIDEO FILTER XBR 2X (1X ONLY)`. The display looks keep working at the
+**native line pitch**: `sharp` (identity on the S× picture), `scanlines` and
+`crt` darken the same rows they would at 1× (GL: the shaders already take the
+native height; software: `video_filter_apply_cpu_ss()` applies the 1× row
+profile over the S rows of each native line — S=2 line/gap, S=3 mid/core/gap,
+S=4 mid/core/core/gap — same size as the input). Same rule on both backends;
+`video_filter` (debug) reports `applies_at_scale` / `internal_scale` and the
+GL `stood_down` count; the headless `present_capture` renders the same
+decision (hi-res source + looks). Verified on Mega Man 8 (software 2×,
+weapon menu): xbr2x / scale3x / sharp captures identical to `none`, scanlines
+alternate line/gap rows at native pitch; OpenGL 2×: xbr2x presents fall to
+sharp (`stood_down` counts them, no `.up.png` companion), scanlines applied.
+
 ## Selecting
 
 * Launcher: Settings → Display → **Video filter** (cycles the runtime's

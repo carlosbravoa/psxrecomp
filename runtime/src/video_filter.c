@@ -185,6 +185,47 @@ static void prescale_rows(const uint32_t* src, int sp, int w, int h,
     }
 }
 
+/* Supersampled source: keep the picture size, apply the 1x row-weight profile
+ * (3 rows per native line) over the ss rows of every native line, sampled at
+ * each row's centre: row r takes weight index floor((r + 0.5) * 3 / ss) —
+ * ss=2 -> {mid, gap}, ss=3 -> {mid, core, gap}, ss=4 -> {mid, core, core, gap}. */
+static void mask_rows_ss(const uint32_t* src, int sp, int w, int h,
+                         uint32_t* dst, int dp, const uint32_t* row_w, int ss) {
+    for (int y = 0; y < h; y++) {
+        const uint32_t* s = src + (size_t)y * (size_t)sp;
+        uint32_t* d = dst + (size_t)y * (size_t)dp;
+        int idx = ((2 * (y % ss) + 1) * VF_SW_PRESCALE) / (2 * ss);
+        if (idx > VF_SW_PRESCALE - 1) idx = VF_SW_PRESCALE - 1;
+        const uint32_t wgt = row_w[idx];
+        for (int x = 0; x < w; x++) d[x] = scale_rgb(s[x] & RGB_MASK, wgt) | OPAQUE;
+    }
+}
+
+int video_filter_applies_at_scale(int kind, int ss) {
+    if (!vf_valid(kind) || kind == VF_NONE) return 0;
+    if (ss <= 1) return 1;
+    return !video_filter_is_upscaler(kind);
+}
+
+int video_filter_apply_cpu_ss(int kind, const uint32_t* src, int src_pitch,
+                              int w, int h, uint32_t* dst, int dst_pitch, int ss) {
+    if (ss <= 1) return video_filter_apply_cpu(kind, src, src_pitch, w, h, dst, dst_pitch) > 0;
+    if (!video_filter_applies_at_scale(kind, ss) || !src || !dst || w <= 0 || h <= 0) return 0;
+    if (src_pitch < w || dst_pitch < w) return 0;
+    switch (kind) {
+    case VF_SHARP:       mask_rows_ss(src, src_pitch, w, h, dst, dst_pitch, s_row_w_sharp, ss); break;
+    case VF_SCANLINES: {
+        uint32_t rw[VF_SW_PRESCALE];
+        scanline_row_weights(rw);
+        mask_rows_ss(src, src_pitch, w, h, dst, dst_pitch, rw, ss);
+        break;
+    }
+    case VF_CRT:         mask_rows_ss(src, src_pitch, w, h, dst, dst_pitch, s_row_w_crt, ss); break;
+    default: return 0;
+    }
+    return 1;
+}
+
 /* ---- Scale2x / Scale3x (EPX) --------------------------------------------- */
 
 static void scale2x(const uint32_t* src, int sp, int w, int h, uint32_t* dst, int dp) {

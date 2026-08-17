@@ -52,6 +52,7 @@ void gl_renderer_present_blank(void);
 /* Present-time video filter (video_filter.h) diagnostics: the kind last drawn
  * through the filter path, a bitmask of kinds whose shaders failed this
  * session (those fall back to the plain present), and pass/fallback counters. */
+uint64_t gl_renderer_video_filter_stood_down(void);   /* presents where an upscaler stood down to sharp on a hi-res source */
 void gl_renderer_video_filter_diag(int *last_kind, unsigned *broken_mask,
                                    uint64_t *passes, uint64_t *fallbacks);
 /* Source rect (texels), native size, and letterbox of the last filtered draw. */

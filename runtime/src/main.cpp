@@ -1600,7 +1600,22 @@ static void headless_capture_present(void) {
     std::vector<uint32_t> filtered;
     const int kind = video_filter_get();
     const int n = video_filter_cpu_scale(kind);
-    if (kind != VF_NONE && n > 1) {
+    /* Supersampled present (software hi-res mirror): capture what the windowed
+     * present would show — the S× picture with the display looks in place,
+     * upscalers stood down (video_filter.h, "supersampled source"). */
+    const int ss = (gr_scale() > 1 && !di.depth24) ? gr_scale() : 1;
+    if (ss > 1) {
+        std::vector<uint32_t> hires((size_t)w * ss * (size_t)h * ss);
+        if (gr_render_display_hires(hires.data(), (int)(w * ss * sizeof(uint32_t)),
+                                    (int)di.display_x, (int)di.display_y, w, h) > 0) {
+            src.swap(hires); px = src.data(); ow = w * ss; oh = h * ss;
+            if (video_filter_applies_at_scale(kind, ss)) {
+                filtered.resize((size_t)ow * oh);
+                if (video_filter_apply_cpu_ss(kind, px, ow, ow, oh, filtered.data(), ow, ss))
+                    px = filtered.data();
+            }
+        }
+    } else if (kind != VF_NONE && n > 1) {
         filtered.resize((size_t)w * n * (size_t)h * n);
         if (video_filter_apply_cpu(kind, px, w, w, h, filtered.data(), w * n) == n) {
             px = filtered.data(); ow = w * n; oh = h * n;
@@ -5573,7 +5588,13 @@ static void sysmenu_build_all_rows(char rows[SYSM_COUNT][40]) {
         for (; lab[i] && i + 1 < sizeof up; i++)
             up[i] = (char)((lab[i] >= 'a' && lab[i] <= 'z') ? lab[i] - 32 : lab[i]);
         up[i] = 0;
-        snprintf(rows[SYSM_VIDEO_FILTER], sizeof rows[0], "VIDEO FILTER %s", up);
+        /* At internal scale > 1 the pixel-art upscalers stand down (the
+         * picture is supersampled / HD-replaced); say so on the row. */
+        const int vk = video_filter_get();
+        if (g_video_scale > 1 && vk != VF_NONE && !video_filter_applies_at_scale(vk, g_video_scale))
+            snprintf(rows[SYSM_VIDEO_FILTER], sizeof rows[0], "VIDEO FILTER %s (1X ONLY)", up);
+        else
+            snprintf(rows[SYSM_VIDEO_FILTER], sizeof rows[0], "VIDEO FILTER %s", up);
     }
     {
         /* All three scanline parameters on ONE row, directly under
@@ -7125,13 +7146,30 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Present-time video filter on the software (SDL_Renderer) present: the
      * CPU reference implementation (video_filter.c) expands the native grid
      * N times into its own staging buffer + streaming texture. GL/VK presents
-     * filter on the GPU inside their own present paths; a supersampled
-     * software present is left alone (its hi-res grid is already smooth).
-     * Any allocation failure simply presents unfiltered. */
+     * filter on the GPU inside their own present paths. On a supersampled
+     * software present (active_scale > 1) the pixel-art upscalers stand down
+     * (video_filter.h, "supersampled source") and the display looks
+     * (sharp / scanlines / crt) are applied in place at the native line
+     * pitch, same size as the hi-res picture. Any allocation failure simply
+     * presents unfiltered. */
     const uint32_t* present_px = sdl_pixel_buf;
     SDL_Texture* present_tex = sdl_texture;
     int vf_n = 1;
-    if (!g_gl_active && !g_vk_active && active_scale == 1 &&
+    if (!g_gl_active && !g_vk_active && active_scale > 1 &&
+        video_filter_applies_at_scale(video_filter_get(), active_scale) &&
+        src_w > 0 && src_h > 0 && sdl_renderer) {
+        const size_t cap_px = (size_t)(640 * 4) * (size_t)(512 * 4);
+        if ((size_t)src_w * (size_t)src_h <= cap_px) {
+            if (!sdl_filter_buf) {
+                sdl_filter_buf = (uint32_t*)std::malloc(cap_px * sizeof(uint32_t));
+                sdl_filter_buf_px = sdl_filter_buf ? cap_px : 0;
+            }
+            if (sdl_filter_buf &&
+                video_filter_apply_cpu_ss(video_filter_get(), sdl_pixel_buf, src_w, src_w, src_h,
+                                          sdl_filter_buf, src_w, active_scale))
+                present_px = sdl_filter_buf;          /* same size: the plain hi-res texture path fits it */
+        }
+    } else if (!g_gl_active && !g_vk_active && active_scale == 1 &&
         video_filter_get() != VF_NONE && src_w > 0 && src_h > 0 && sdl_renderer) {
         const int kind = video_filter_get();
         const int n = video_filter_cpu_scale(kind);
