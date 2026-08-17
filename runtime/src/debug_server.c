@@ -6026,6 +6026,27 @@ static void handle_vram_upload_log(int id, const char *json)
     free(buf);
 }
 
+#include "texture_pack.h"
+/* texture_dump: {"cmd":"texture_dump","op":"arm","dir":"/path"} dumps every
+ * distinct texture (id = hash of texels + CLUT) as PNG + textures.tsv;
+ * op=disarm stops; op=stats (default) reports counters. See texture_pack.h. */
+static void handle_texture_dump(int id, const char *json)
+{
+    char op[16] = "stats";
+    json_get_str(json, "op", op, sizeof(op));
+    if (strcmp(op, "arm") == 0) {
+        char dir[1024] = "";
+        json_get_str(json, "dir", dir, sizeof(dir));
+        if (!dir[0]) { send_err(id, "missing dir"); return; }
+        if (!texture_dump_arm(dir)) { send_err(id, "cannot write to dir"); return; }
+    } else if (strcmp(op, "disarm") == 0) {
+        texture_dump_disarm();
+    }
+    char st[512];
+    texture_dump_stats_json(st, sizeof st);
+    send_fmt("{\"id\":%d,\"ok\":true,\"stats\":%s}", id, st);
+}
+
 extern int gpu_get_c0_count(void);
 extern int gpu_get_c0_history(int index, int *x, int *y, int *w, int *h,
                               uint32_t *func, uint32_t *sp, uint32_t *s1,
@@ -13599,6 +13620,7 @@ static const CmdEntry s_commands[] = {
     { "gpu_frame_dump",    handle_gpu_frame_dump },
     { "a0_history",        handle_a0_history },
     { "vram_upload_log",   handle_vram_upload_log },
+    { "texture_dump",      handle_texture_dump },
     { "c0_history",        handle_c0_history },
     { "capture_quads",     handle_capture_quads },
     { "get_quads",         handle_get_quads },

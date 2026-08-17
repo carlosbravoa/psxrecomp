@@ -203,6 +203,14 @@ if(BUILD_TESTING)
     target_link_libraries(disc_tree_test PRIVATE chdr-static)
     add_test(NAME disc_tree_test COMMAND disc_tree_test)
 
+    # Texture identity + dump (docs/TEXTURE_PACKS.md): texel/palette ids are
+    # location-independent, palette variants separate, dump writes PNG + TSV.
+    add_executable(texture_pack_test
+        tests/test_texture_pack.c
+        src/texture_pack.c)
+    target_include_directories(texture_pack_test PRIVATE include src)
+    add_test(NAME texture_pack_test COMMAND texture_pack_test)
+
     add_executable(mod_packages_test
         tests/test_mod_packages.cpp
         src/mod_packages.cpp

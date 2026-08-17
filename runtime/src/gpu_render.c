@@ -10,6 +10,7 @@
  * The software backend table points straight at the existing sw_* functions,
  * so the software path is byte-for-byte unchanged. */
 
+#include "texture_pack.h"
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
 #include <stdio.h>
@@ -94,7 +95,7 @@ void gr_set_backend(GrBackend backend) {
 GrBackend gr_backend(void) { return g_effective; }
 
 /* ---- Dispatch wrappers (one line each; forward to the active backend) ---- */
-void gr_init(uint16_t *vram)                         { g_b->init(vram); }
+void gr_init(uint16_t *vram)                         { texture_pack_set_vram(vram); g_b->init(vram); }
 void gr_set_scale(int scale)                         { g_b->set_scale(scale); }
 int  gr_scale(void)                                  { return g_b->scale(); }
 void gr_set_texture_filter(int bilinear)             { g_b->set_texture_filter(bilinear); }
@@ -124,6 +125,7 @@ void gr_draw_gouraud_triangle(int x0, int y0, uint16_t c0, int x1, int y1, uint1
 void gr_draw_textured_triangle(int x0, int y0, int u0, int v0, int x1, int y1, int u1, int v1,
                                int x2, int y2, int u2, int v2,
                                uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    if (g_texture_pack_active) texture_pack_note_tri(texpage, clut_x, clut_y, u0, v0, u1, v1, u2, v2);
     g_b->draw_textured_triangle(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
                                 clut_x, clut_y, texpage);
 }
@@ -132,16 +134,19 @@ void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c
                                       int x2, int y2, int u2, int v2, uint32_t c2,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw) {
+    if (g_texture_pack_active) texture_pack_note_tri(texpage, clut_x, clut_y, u0, v0, u1, v1, u2, v2);
     g_b->draw_shaded_textured_triangle(x0, y0, u0, v0, c0, x1, y1, u1, v1, c1,
                                        x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw);
 }
 void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) { g_b->draw_flat_rect(x, y, w, h, c); }
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
                            uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    if (g_texture_pack_active) texture_pack_note_rect(texpage, clut_x, clut_y, u, v, w, h);
     g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage);
 }
 void gr_draw_textured_rect_scaled(int x, int y, int w, int h, int u0, int v0, int u1, int v1,
                                   uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    if (g_texture_pack_active) texture_pack_note_rect(texpage, clut_x, clut_y, u0, v0, u1 - u0, v1 - v0);
     g_b->draw_textured_rect_scaled(x, y, w, h, u0, v0, u1, v1, clut_x, clut_y, texpage);
 }
 void gr_draw_line(int x0, int y0, int x1, int y1, uint16_t c) { g_b->draw_line(x0, y0, x1, y1, c); }
