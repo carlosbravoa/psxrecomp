@@ -342,9 +342,40 @@ Mega Man 8 (2×, slots 12 title menu / 1 stage / 3 pause menu / 2): baseline
 SW-vs-GL max 1/255 with 0 px over tolerance, identical with the pack on, pack
 delta 0 — the game repo wraps it as `tools/texpack_parity.sh`.
 
+## Sampling, atlas, 8bpp (B13)
+
+**Pack sampling** — `[video] texture_pack_filter = "auto" | "nearest" |
+"linear"` (default auto): how a pack image is sampled per hi-res pixel.
+*auto* is bilinear unless the image has exactly one pixel per hi-res pixel
+(a 2× pack at supersampling 2 stays pixel-exact — the identity results above
+hold), so a 2× pack at 4× is smoothed instead of blocky and a 4× pack at 2×
+is filtered down; *nearest* keeps the blocks; *linear* always filters.
+Bilinear is alpha-weighted (no dark fringes at cut-outs), clamped inside the
+image, and implemented identically in `rep_sample` (software) and the
+fragment shader (four `texelFetch`, `u_rep_filter` / `u_hr_scale`). Both
+sample at the position the renderer's own texel fetch uses, so *nearest* is
+byte-identical between the backends; *linear* differs by rasterisation
+sub-pixel positions on ~2 % of the pixels the pack changes (Mega Man 8 slot 1
+at 4× with the 2× pack: 2,838 of 1.2 M px over 8/255), which the parity tool
+accepts within its margin.
+
+**On-demand GL atlas** — the atlas is no longer built from the whole pack at
+load (a whole-game pack of 67 k images does not fit 8192², and most of it is
+never on screen). Images are shelf-packed into a 4096² RGBA8 texture the
+first time a primitive draws them (`gl_atlas_place`, `glTexSubImage2D`
+mid-frame); a full atlas flushes the pending batch and starts over (rare —
+a stage keeps ~800 images resident); a pack change resets it. `texture_pack
+stats` reports `gl_atlas: {size, resident, resets, uploads}` (slot 1: 793
+resident, 0 resets) and `filter`.
+
+**8bpp** — the identity, dump (`512-byte .clut`), pack loading, lookup and
+the used-index fit are exercised end to end in `test_texture_pack.c`
+(Mega Man 8 itself is all 4bpp).
+
 ## Next
 
-Bilinear pack sampling; shaded-textured triangles.
+Shaded-textured triangles (3D titles); boss/enemy CLUTs and the enemy
+metasprite groups (Track A) so enemies can be named/covered offline.
 
 ## Files
 

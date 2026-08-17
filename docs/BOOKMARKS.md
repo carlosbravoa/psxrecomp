@@ -1,9 +1,16 @@
-# "Start at" bookmarks
+# "Start at" bookmarks (testing aid)
 
 A bookmark is a savestate the launcher can resume right after boot: a stage
 select that works for every stage of every game without touching game code —
 you take the savestate where you want to start, name it, and it appears in
 the launcher.
+
+**This is a development / testing artifact, not a player feature.** A
+savestate is only valid for the exact disc image + BIOS combination it was
+taken with (the loader checks the BIOS checksum and entry point and refuses
+otherwise), so bookmarks made on one machine do not travel to a different
+dump or BIOS. The row only appears when a `bookmarks/` folder with `.pst`
+files exists, so a normal install never sees it.
 
 ```
 <memcard_dir>/bookmarks/<label>.pst        e.g. saves/bookmarks/01 Tengu Man.pst

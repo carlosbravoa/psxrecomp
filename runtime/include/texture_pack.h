@@ -31,6 +31,11 @@ extern "C" {
 
 extern int g_texture_pack_active;   /* 0 = every note returns immediately (dump) */
 extern int g_texture_pack_replace;  /* 1 = a replacement pack is loaded (B3) */
+/* How pack images are sampled at S x: 0 nearest, 1 linear (bilinear inside the
+ * image, alpha-weighted), 2 auto = linear unless the image has exactly one
+ * pixel per hi-res pixel (an N x pack at supersampling N stays pixel-exact).
+ * [video] texture_pack_filter = "nearest" | "linear" | "auto" (default). */
+extern int g_texture_pack_filter;
 
 /* ---- replacement pack (B3) ----
  * A pack is a directory of <tex_id>.png (any palette) and/or

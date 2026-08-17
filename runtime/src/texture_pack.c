@@ -8,6 +8,7 @@
 
 int g_texture_pack_active = 0;
 int g_texture_pack_replace = 0;
+int g_texture_pack_filter = 2;
 
 static const uint16_t *s_vram = NULL;
 static char s_dir[1024];

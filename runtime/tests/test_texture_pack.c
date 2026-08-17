@@ -204,6 +204,36 @@ int main(void) {
         assert(texture_pack_lookup_rect_mod(tpage(512, 0, 0), 0, 480, 64, 0, 16, 16, m) != NULL);   /* palette A itself */
         texture_pack_unload();
     }
+    /* 8bpp: a 32x8 texture at page (576,0) depth 1 (index = u), CLUT of 256 entries
+     * at (0,481): dump -> 512-byte .clut, load as a pack, lookup finds it with a
+     * 256-entry reference and the used-index fit still works. */
+    {
+        for (int i = 0; i < 256; i++) vram[481 * 1024 + i] = (uint16_t)(0x8000 | ((2 * (i & 15)) << 5) | ((2 * ((i >> 4) & 15)) << 10));
+        for (int y = 0; y < 8; y++) for (int x = 0; x < 32; x++) {
+            uint16_t *hw = &vram[(0 + y) * 1024 + 576 + (x >> 1)];
+            int sh = (x & 1) * 8;
+            *hw = (uint16_t)((*hw & ~(0xFF << sh)) | ((x + 1) << sh));
+        }
+        char d8[300]; snprintf(d8, sizeof d8, "%s/eight", dir);
+        snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", d8, d8); assert(system(cmd) == 0);
+        assert(texture_dump_arm(d8));
+        texture_pack_note_rect(tpage(576, 0, 1), 0, 481, 0, 0, 32, 8);
+        texture_dump_disarm();
+        const uint64_t t8 = texture_pack_hash_rect(tpage(576, 0, 1), 0, 481, 0, 0, 32, 8);
+        const uint64_t p8 = texture_pack_hash_palette(tpage(576, 0, 1), 0, 481);
+        char f8[400];
+        snprintf(f8, sizeof f8, "%s/%016llx-%016llx.clut", d8, (unsigned long long)t8, (unsigned long long)p8);
+        FILE *fc = fopen(f8, "rb"); assert(fc); fseek(fc, 0, SEEK_END); assert(ftell(fc) == 512); fclose(fc);
+        assert(texture_pack_load(d8) == 1);
+        float m8[6];
+        const TexPackImage *i8 = texture_pack_lookup_rect_mod(tpage(576, 0, 1), 0, 481, 0, 0, 32, 8, m8);
+        assert(i8 && i8->ref_n == 256 && i8->w == 32 && i8->h == 8 && m8[0] == 1.0f);
+        /* dim the used entries (1..32) by half -> multiplicative fit ~0.5 */
+        for (int i = 0; i < 256; i++) vram[481 * 1024 + 256 + i] = (uint16_t)(0x8000 | ((i & 15) << 5) | (((i >> 4) & 15) << 10));   /* exactly half */
+        i8 = texture_pack_lookup_rect_mod(tpage(576, 0, 1), 256, 481, 0, 0, 32, 8, m8);
+        assert(i8 && m8[1] > 0.3f && m8[1] < 0.7f);
+        texture_pack_unload();
+    }
     puts("texture_pack_test: OK");
     return 0;
 }

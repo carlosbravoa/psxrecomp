@@ -602,6 +602,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("texture_pack_enabled"))
             rt.video_texture_pack_enabled = toml::find<bool>(video, "texture_pack_enabled");
+        if (video.contains("texture_pack_filter")) {
+            const std::string f = toml::find<std::string>(video, "texture_pack_filter");
+            rt.video_texture_pack_filter = f == "nearest" ? 0 : f == "linear" ? 1 : 2;
+        }
         if (video.contains("fmv_pack")) {
             const std::string fp = toml::find<std::string>(video, "fmv_pack");
             if (!fp.empty()) rt.video_fmv_pack = fs::absolute(root / fp);

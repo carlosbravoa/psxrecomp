@@ -6074,7 +6074,13 @@ static void handle_texture_pack(int id, const char *json)
     }
     char st[512];
     texture_pack_stats_json(st, sizeof st);
-    send_fmt("{\"id\":%d,\"ok\":true,\"stats\":%s}", id, st);
+    {
+        extern void gl_renderer_atlas_stats(int *size, int *placed, int *resets, unsigned long long *uploads);
+        int asz = 0, apl = 0, ars = 0; unsigned long long aup = 0;
+        gl_renderer_atlas_stats(&asz, &apl, &ars, &aup);
+        send_fmt("{\"id\":%d,\"ok\":true,\"stats\":%s,\"filter\":%d,\"gl_atlas\":{\"size\":%d,\"resident\":%d,\"resets\":%d,\"uploads\":%llu}}",
+                 id, st, g_texture_pack_filter, asz, apl, ars, aup);
+    }
 }
 
 /* fmv_pack: {"op":"load","dir":..} | "unload" | "stats" (docs/FMV_PACKS.md). */

@@ -398,7 +398,7 @@ static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
 static GLint s_uAtlas = -1;
 static GLuint s_atlas_tex = 0;   /* texture-pack atlas (built by gl_atlas_sync below) */
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
-static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
+static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1, s_uRepFilter = -1, s_uHrScale = -1;
 static GLint s_uLimits = -1;
 /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
@@ -1015,6 +1015,8 @@ static const char *TEX_FS =
     "flat in vec3 v_rep_off;  /* ... palette fade offset (0 = as authored) */\n"
     "uniform usampler2D u_vram;\n"
     "uniform sampler2D u_atlas; /* texture-pack atlas (RGBA8) */\n"
+    "uniform int u_rep_filter;   /* pack sampling: 0 nearest, 1 linear, 2 auto (linear unless 1 image px per hr px) */\n"
+    "uniform float u_hr_scale;   /* internal-res scale of the FBO */\n"
     "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
@@ -1057,8 +1059,24 @@ static const char *TEX_FS =
     "     * software path. Nearest sample; the image is an integer multiple of the\n"
     "     * texel rect. */\n"
     "    vec2 t = (uv - v_rep_org.xy) / v_rep_org.zw;\n"
-    "    ivec2 ap = ivec2(v_rep_atlas.xy) + clamp(ivec2(floor(t * v_rep_atlas.zw)), ivec2(0), ivec2(v_rep_atlas.zw) - 1);\n"
+    "    vec2 ip = t * v_rep_atlas.zw;                       /* image-space position */\n"
+    "    ivec2 imax = ivec2(v_rep_atlas.zw) - 1;\n"
+    "    ivec2 ap = ivec2(v_rep_atlas.xy) + clamp(ivec2(floor(ip)), ivec2(0), imax);\n"
     "    vec4 rc = texelFetch(u_atlas, ap, 0);\n"
+    "    bool lin = u_rep_filter == 1 || (u_rep_filter == 2 && abs(v_rep_atlas.z / v_rep_org.z - u_hr_scale) > 0.01);\n"
+    "    if (lin) {\n"
+    "      /* bilinear inside the image rect (clamped: no bleeding into atlas neighbours), alpha-weighted */\n"
+    "      vec2 c = ip - 0.5; ivec2 i0 = ivec2(floor(c)); vec2 f = c - vec2(i0);\n"
+    "      ivec2 p00 = clamp(i0, ivec2(0), imax), p11 = clamp(i0 + 1, ivec2(0), imax);\n"
+    "      vec4 c00 = texelFetch(u_atlas, ivec2(v_rep_atlas.xy) + p00, 0);\n"
+    "      vec4 c10 = texelFetch(u_atlas, ivec2(v_rep_atlas.xy) + ivec2(p11.x, p00.y), 0);\n"
+    "      vec4 c01 = texelFetch(u_atlas, ivec2(v_rep_atlas.xy) + ivec2(p00.x, p11.y), 0);\n"
+    "      vec4 c11 = texelFetch(u_atlas, ivec2(v_rep_atlas.xy) + p11, 0);\n"
+    "      float w00 = (1.0 - f.x) * (1.0 - f.y) * c00.a, w10 = f.x * (1.0 - f.y) * c10.a;\n"
+    "      float w01 = (1.0 - f.x) * f.y * c01.a,          w11 = f.x * f.y * c11.a;\n"
+    "      float wa = w00 + w10 + w01 + w11;\n"
+    "      if (wa > 0.0) rc = vec4((c00.rgb * w00 + c10.rgb * w10 + c01.rgb * w01 + c11.rgb * w11) / wa, rc.a);\n"
+    "    }\n"
     "    if (rc.a < 0.5) discard;\n"
     "    int rawn = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
     "    if (rawn == 0) discard;   /* transparency is the native texel's (index 0 / palette faded to 0) */\n"
@@ -1776,6 +1794,8 @@ static void flush_tex_batch(void) {
     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
+    p_glUniform1i(s_uRepFilter, g_texture_pack_filter);
+    p_glUniform1f(s_uHrScale, (float)(s_scale > 0 ? s_scale : 1));
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
@@ -1943,88 +1963,87 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
  * stencil (mask) write value is constant within each pass; the semi pass is
  * also where PS1 blending applies. lim = uv sampling bounds (see
  * tri_uv_limits); NULL computes them from the vertices. */
-/* ---- texture-pack atlas (docs/TEXTURE_PACKS.md, B4) ---------------------
- * The loaded pack images are shelf-packed into one RGBA8 texture whenever the
- * pack generation changes; each image records its atlas placement in
- * TexPackImage.atlas_x/y (-1 = did not fit -> native texels for it). */
+/* ---- texture-pack atlas (docs/TEXTURE_PACKS.md, B4 / B13) ---------------
+ * ON DEMAND: an image is shelf-packed into the RGBA8 atlas the first time a
+ * primitive draws it (TexPackImage.atlas_x/y = placement, -1 = not resident),
+ * so a whole-game pack (tens of thousands of images, most never on screen at
+ * once) costs only what a scene uses. When the atlas is full the pending
+ * batch is flushed and the atlas is reset (every image becomes non-resident,
+ * the current one is placed again) — a rare hitch, never a wrong texture. A
+ * pack generation change resets it likewise. */
 static int      s_atlas_w = 0, s_atlas_h = 0;
 static uint32_t s_atlas_gen = 0xFFFFFFFFu;
-static int      s_atlas_dropped = 0, s_atlas_placed = 0;
+static int      s_atlas_x = 0, s_atlas_y = 0, s_atlas_shelf = 0;   /* shelf packer cursor */
+static int      s_atlas_placed = 0, s_atlas_resets = 0;
+static uint64_t s_atlas_uploads = 0;
 
-typedef struct { TexPackImage **v; int n, cap; } AtlasList;
-static void atlas_collect(TexPackImage *img, void *ctx) {
-    AtlasList *l = (AtlasList *)ctx;
-    if (l->n == l->cap) {
-        int nc = l->cap ? l->cap * 2 : 256;
-        TexPackImage **nv = (TexPackImage **)realloc(l->v, (size_t)nc * sizeof *nv);
-        if (!nv) return;
-        l->v = nv; l->cap = nc;
-    }
-    l->v[l->n++] = img;
+static void atlas_forget(TexPackImage *img, void *ctx) { (void)ctx; img->atlas_x = img->atlas_y = -1; }
+
+static void gl_atlas_reset_placements(void) {
+    texture_pack_for_each(atlas_forget, NULL);
+    s_atlas_x = s_atlas_y = s_atlas_shelf = 0;
+    s_atlas_placed = 0;
 }
-static int atlas_cmp_h(const void *a, const void *b) {
-    const TexPackImage *x = *(TexPackImage *const *)a, *y = *(TexPackImage *const *)b;
-    if (x->h != y->h) return y->h - x->h;
-    return y->w - x->w;
-}
+
 static void gl_atlas_sync(void) {
     const uint32_t gen = texture_pack_generation();
     if (gen == s_atlas_gen) return;
     s_atlas_gen = gen;
-    if (s_atlas_tex) { glDeleteTextures(1, &s_atlas_tex); s_atlas_tex = 0; }
-    s_atlas_placed = s_atlas_dropped = 0;
-    if (!g_texture_pack_replace) return;
-    AtlasList l = {0};
-    texture_pack_for_each(atlas_collect, &l);
-    if (!l.n) { free(l.v); return; }
-    qsort(l.v, (size_t)l.n, sizeof *l.v, atlas_cmp_h);
-    GLint maxsz = 4096;
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxsz);
-    if (maxsz > 8192) maxsz = 8192;
-    /* pick the smallest square that shelf-packs everything (or the max) */
-    int size = 1024;
-    for (;;) {
-        int x = 0, y = 0, shelf = 0, ok = 1;
-        for (int i = 0; i < l.n; i++) {
-            const TexPackImage *im = l.v[i];
-            if (im->w > size || im->h > size) { ok = 0; break; }
-            if (x + im->w > size) { x = 0; y += shelf; shelf = 0; }
-            if (y + im->h > size) { ok = 0; break; }
-            if (im->h > shelf) shelf = im->h;
-            x += im->w;
-        }
-        if (ok || size >= maxsz) break;
-        size *= 2;
+    if (!g_texture_pack_replace) {
+        if (s_atlas_tex) { glDeleteTextures(1, &s_atlas_tex); s_atlas_tex = 0; }
+        s_atlas_x = s_atlas_y = s_atlas_shelf = 0; s_atlas_placed = 0;
+        return;
     }
-    s_atlas_w = s_atlas_h = size;
-    glGenTextures(1, &s_atlas_tex);
-    p_glActiveTexture(PSXGL_TEXTURE0 + 2);
-    glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    {
-        int x = 0, y = 0, shelf = 0;
-        for (int i = 0; i < l.n; i++) {
-            TexPackImage *im = l.v[i];
-            im->atlas_x = im->atlas_y = -1;
-            if (im->w > size || im->h > size) { s_atlas_dropped++; continue; }
-            if (x + im->w > size) { x = 0; y += shelf; shelf = 0; }
-            if (y + im->h > size) { s_atlas_dropped++; continue; }
-            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, im->w, im->h, GL_RGBA, GL_UNSIGNED_BYTE, im->rgba);
-            im->atlas_x = x; im->atlas_y = y; s_atlas_placed++;
-            if (im->h > shelf) shelf = im->h;
-            x += im->w;
-        }
+    if (!s_atlas_tex) {
+        GLint maxsz = 4096;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxsz);
+        int size = 4096;                       /* 64 MB RGBA8: ~16 k 32x32 images resident at once */
+        if (size > maxsz) size = maxsz;
+        s_atlas_w = s_atlas_h = size;
+        glGenTextures(1, &s_atlas_tex);
+        p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+        glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        p_glActiveTexture(PSXGL_TEXTURE0);
     }
-    p_glActiveTexture(PSXGL_TEXTURE0);
-    free(l.v);
-    if (s_atlas_dropped)
-        fprintf(stdout, "psxrecomp: texture pack atlas %dx%d: %d images placed, %d did not fit\n",
-                     size, size, s_atlas_placed, s_atlas_dropped);
+    gl_atlas_reset_placements();
+}
+
+/* Place `im` now (upload its pixels); 0 = cannot (larger than the atlas). */
+static int gl_atlas_place(TexPackImage *im) {
+    if (im->w > s_atlas_w || im->h > s_atlas_h) return 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (s_atlas_x + im->w > s_atlas_w) { s_atlas_x = 0; s_atlas_y += s_atlas_shelf; s_atlas_shelf = 0; }
+        if (s_atlas_y + im->h <= s_atlas_h) {
+            p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+            glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, s_atlas_x, s_atlas_y, im->w, im->h, GL_RGBA, GL_UNSIGNED_BYTE, im->rgba);
+            p_glActiveTexture(PSXGL_TEXTURE0);
+            im->atlas_x = s_atlas_x; im->atlas_y = s_atlas_y;
+            if (im->h > s_atlas_shelf) s_atlas_shelf = im->h;
+            s_atlas_x += im->w;
+            s_atlas_placed++; s_atlas_uploads++;
+            return 1;
+        }
+        /* full: the queued batch still references the old placements — draw it
+         * first, then start over with an empty atlas */
+        flush_tex_batch();
+        gl_atlas_reset_placements();
+        s_atlas_resets++;
+    }
+    return 0;
+}
+
+void gl_renderer_atlas_stats(int *size, int *placed, int *resets, unsigned long long *uploads) {
+    if (size) *size = s_atlas_w;
+    if (placed) *placed = s_atlas_placed;
+    if (resets) *resets = s_atlas_resets;
+    if (uploads) *uploads = s_atlas_uploads;
 }
 /* Fill rep[14] = {u0,v0,w,h, ax,ay,aw,ah, scale rgb, offset rgb (0..1)} for a
  * prim's texel rect; aw = 0 when there is no replacement. */
@@ -2037,8 +2056,9 @@ static void gl_rep_for_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
     gl_atlas_sync();
     if (!s_atlas_tex) return;
     float mod[6];
-    const TexPackImage *im = texture_pack_lookup_rect_mod(texpage, clut_x, clut_y, u, v, w, h, mod);
-    if (!im || im->atlas_x < 0) return;
+    TexPackImage *im = (TexPackImage *)texture_pack_lookup_rect_mod(texpage, clut_x, clut_y, u, v, w, h, mod);
+    if (!im) return;
+    if (im->atlas_x < 0 && !gl_atlas_place(im)) return;
     rep[0] = (float)u; rep[1] = (float)v; rep[2] = (float)w; rep[3] = (float)h;
     rep[4] = (float)im->atlas_x; rep[5] = (float)im->atlas_y; rep[6] = (float)im->w; rep[7] = (float)im->h;
     rep[8] = mod[0]; rep[9] = mod[1]; rep[10] = mod[2];
@@ -2767,6 +2787,8 @@ static int init_gpu_raster(void) {
     s_uTwin     = p_glGetUniformLocation(s_tex_prog, "u_twin");
     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
     s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
+    s_uRepFilter = p_glGetUniformLocation(s_tex_prog, "u_rep_filter");
+    s_uHrScale   = p_glGetUniformLocation(s_tex_prog, "u_hr_scale");
     s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");

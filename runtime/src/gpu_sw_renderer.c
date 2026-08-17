@@ -342,15 +342,41 @@ static float g_rep_mod[6] = {1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f};   /* palette f
  * bit) in *out. */
 static inline int rep_sample(float fu, float fv, uint16_t native_texel, uint16_t *out) {
     float ox = fu - (float)g_rep_u0, oy = fv - (float)g_rep_v0;
-    int rx = (int)(ox * (float)g_rep->w / (float)g_rep_w);
-    int ry = (int)(oy * (float)g_rep->h / (float)g_rep_h);
+    const float sx = (float)g_rep->w / (float)g_rep_w, sy = (float)g_rep->h / (float)g_rep_h;   /* image px per texel */
+    float ipx = ox * sx, ipy = oy * sy;
+    int rx = (int)ipx, ry = (int)ipy;
     if (rx < 0) rx = 0; if (rx >= g_rep->w) rx = g_rep->w - 1;
     if (ry < 0) ry = 0; if (ry >= g_rep->h) ry = g_rep->h - 1;
     const uint8_t *p = g_rep->rgba + ((size_t)ry * g_rep->w + rx) * 4;
     if (p[3] < 128) return 0;
-    int r8 = (int)(p[0] * g_rep_mod[0] + g_rep_mod[3] + 0.5f);
-    int g8 = (int)(p[1] * g_rep_mod[1] + g_rep_mod[4] + 0.5f);
-    int b8 = (int)(p[2] * g_rep_mod[2] + g_rep_mod[5] + 0.5f);
+    float c0 = p[0], c1 = p[1], c2 = p[2];
+    /* bilinear inside the image (texture_pack.h g_texture_pack_filter): linear,
+     * or auto when the image is not exactly 1 px per hi-res pixel */
+    const int lin = g_texture_pack_filter == 1 ||
+                    (g_texture_pack_filter == 2 && (fabsf(sx - (float)g_scale) > 0.01f || fabsf(sy - (float)g_scale) > 0.01f));
+    if (lin) {
+        float cx = ipx - 0.5f, cy = ipy - 0.5f;
+        int x0 = (int)floorf(cx), y0 = (int)floorf(cy);
+        float fx = cx - (float)x0, fy = cy - (float)y0;
+        int x1 = x0 + 1, y1 = y0 + 1;
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 < 0) x1 = 0; if (y1 < 0) y1 = 0;
+        if (x0 >= g_rep->w) x0 = g_rep->w - 1; if (x1 >= g_rep->w) x1 = g_rep->w - 1;
+        if (y0 >= g_rep->h) y0 = g_rep->h - 1; if (y1 >= g_rep->h) y1 = g_rep->h - 1;
+        const uint8_t *p00 = g_rep->rgba + ((size_t)y0 * g_rep->w + x0) * 4;
+        const uint8_t *p10 = g_rep->rgba + ((size_t)y0 * g_rep->w + x1) * 4;
+        const uint8_t *p01 = g_rep->rgba + ((size_t)y1 * g_rep->w + x0) * 4;
+        const uint8_t *p11 = g_rep->rgba + ((size_t)y1 * g_rep->w + x1) * 4;
+        float w00 = (1 - fx) * (1 - fy) * p00[3], w10 = fx * (1 - fy) * p10[3], w01 = (1 - fx) * fy * p01[3], w11 = fx * fy * p11[3];
+        float wa = w00 + w10 + w01 + w11;
+        if (wa > 0.0f) {
+            c0 = (p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11) / wa;
+            c1 = (p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11) / wa;
+            c2 = (p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11) / wa;
+        }
+    }
+    int r8 = (int)(c0 * g_rep_mod[0] + g_rep_mod[3] + 0.5f);
+    int g8 = (int)(c1 * g_rep_mod[1] + g_rep_mod[4] + 0.5f);
+    int b8 = (int)(c2 * g_rep_mod[2] + g_rep_mod[5] + 0.5f);
     if (r8 > 255) r8 = 255; if (g8 > 255) g8 = 255; if (b8 > 255) b8 = 255;
     if (r8 < 0) r8 = 0; if (g8 < 0) g8 = 0; if (b8 < 0) b8 = 0;
     uint16_t c = (uint16_t)((r8 >> 3) | ((g8 >> 3) << 5) | ((b8 >> 3) << 10));

@@ -456,6 +456,10 @@ struct RuntimeConfig {
     // overrides). Present-time only; byte-identical when off.
     std::filesystem::path video_fmv_pack;
     bool                  video_fmv_pack_enabled = true;
+    // texture_pack_filter: how pack images are sampled at S x — "auto" (default:
+    // bilinear unless the image is exactly 1 px per hi-res pixel), "nearest",
+    // "linear". docs/TEXTURE_PACKS.md B13.
+    int                   video_texture_pack_filter = 2;
 
     // fmv_skip_*: per-game FMV instant-skip via the game's own end-of-movie path.
     // Some players (Tomba) end a movie when the streamed frame number reaches that

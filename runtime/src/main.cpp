@@ -11432,6 +11432,7 @@ int main(int argc, char** argv) {
             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
             g_texture_pack_dir = gc.runtime.video_texture_pack.string();
             g_texture_pack_enabled = gc.runtime.video_texture_pack_enabled ? 1 : 0;
+            g_texture_pack_filter = gc.runtime.video_texture_pack_filter;
             g_fmv_pack_dir = gc.runtime.video_fmv_pack.string();
             g_fmv_pack_enabled = gc.runtime.video_fmv_pack_enabled ? 1 : 0;
             if (!g_fmv_pack_dir.empty()) {
