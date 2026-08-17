@@ -61,18 +61,55 @@ Typical use: run through the game once (or a scripted headless route), then
 group the TSV by `tex_id` to see the asset set, pick the canonical palette per
 texel id, and hand artists one PNG per id.
 
-## Next (B3+): replacement
+## Replacement — software renderer (B3)
 
-* Load `<pack>/<tex_id>[-<pal_id>].png` at integer scale N; index by texel id.
-* Software renderer: at S× (`sw_renderer_set_scale`), the textured rect /
-  triangle rasterisers sample the replacement instead of VRAM when the id is
-  present, keeping semi-transparency, modulation and STP semantics; native
-  texels otherwise (partial packs work). Then a GL twin + parity tool, coverage
-  stats, DEGRADED logging when a pack entry's native hash no longer matches.
+```
+{"cmd":"texture_pack","op":"load","dir":"/abs/pack"}     debug server; "unload"; "stats"
+PSX_TEXTURE_PACK=/abs/pack                                environment (loaded on first use)
+```
+
+A pack is a directory of `<tex_id>.png` (any palette) and/or
+`<tex_id>-<pal_id>.png` (that palette only), each an **integer multiple N of
+the native texel rectangle** it replaces (a dump directory is therefore a
+valid 1× pack). Lookup: exact palette variant first, then the palette-agnostic
+file; images whose size is not a whole multiple of the rectangle are ignored.
+
+Where it draws: the software renderer's **hi-res mirror and native-wide
+surface only** (`[video] supersampling` ≥ 2, `renderer = "software"`; the
+present path shows the hi-res surface). `sw_draw_textured_rect / _scaled /
+_triangle` identify the primitive (same texel id as the dump), fetch the
+replacement, and the S× rasterisers sample it at the primitive's texel
+coordinates instead of VRAM. Per pixel: replacement alpha < 128 → nothing is
+drawn; else its 15-bit colour, with the **native texel's STP bit** so
+semi-transparency behaves as on PSX; colour modulation, mask bits and blend
+modes are the existing `put_textured` path. Native VRAM (`t->s == 1`) never
+sees the pack, so VRAM→CPU reads, savestates, netplay digests and the 1×
+picture are byte-identical (verified: `screenshot` equal with/without the
+pack, `screenshot_hires` differs).
+
+Verified on Mega Man 8 (software, 2×): a 776-image pack made from the dump
+(sepia + bicubic 2× as a stand-in for real art) replaces the background,
+HUD and tiles it covers; uncovered ids fall back to native texels; 17,780
+lookups → 15,715 hits over ~90 frames (~200 lookups/frame; each is one hash
+of a 16×16 rect).
+
+Not yet: shaded-textured triangles (3D titles), the GL renderer (B4), a
+`[video] texture_pack` key + launcher row (B7), fade handling (a
+palette-agnostic replacement shows at full brightness during a palette fade —
+supply `<tex>-<pal>.png` variants for the settled palette, or wait for B9's
+palette-aware modulation), coverage tooling.
+
+## Next (B4+)
+
+GL twin of the sampler (atlas from the pack, same lookup) + parity tool;
+DEGRADED logging when a pack entry's native hash no longer matches;
+coverage stats per stage.
 
 ## Files
 
-`runtime/include/texture_pack.h`, `runtime/src/texture_pack.c`,
-`runtime/src/gpu_render.c` (hooks), `runtime/src/png_write.h`
-(`png_write_rgba`), `runtime/src/debug_server.c` (`texture_dump`),
-`runtime/tests/test_texture_pack.c`.
+`runtime/include/texture_pack.h`, `runtime/src/texture_pack.c` (identity,
+dump, pack loading — private static `stb_image` PNG decoder),
+`runtime/src/gpu_render.c` (identity hooks), `runtime/src/gpu_sw_renderer.c`
+(replacement sampling in the S× rasterisers), `runtime/src/png_write.h`
+(`png_write_rgba`), `runtime/src/debug_server.c` (`texture_dump`,
+`texture_pack`; `screenshot_hires` pitch fix), `runtime/tests/test_texture_pack.c`.
