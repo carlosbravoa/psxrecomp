@@ -5985,6 +5985,47 @@ static void handle_a0_history(int id, const char *json)
     free(buf);
 }
 
+#include "vram_upload_log.h"
+/* vram_upload_log: {"cmd":"vram_upload_log","op":"arm","dir":"/path"} starts
+ * dumping every CPU->VRAM payload into dir (op=disarm stops); op=list returns
+ * the retained entries (optionally "since":<seq>); op=clear resets. */
+static void handle_vram_upload_log(int id, const char *json)
+{
+    char op[16] = "list";
+    json_get_str(json, "op", op, sizeof(op));
+    if (strcmp(op, "arm") == 0) {
+        char dir[1024] = "";
+        json_get_str(json, "dir", dir, sizeof(dir));
+        if (!dir[0]) { send_err(id, "missing dir"); return; }
+        if (!vram_upload_log_arm(dir)) { send_err(id, "cannot write to dir"); return; }
+        send_fmt("{\"id\":%d,\"ok\":true,\"dir\":\"%s\"}", id, dir);
+        return;
+    }
+    if (strcmp(op, "disarm") == 0) { vram_upload_log_arm(NULL); send_ok(id); return; }
+    if (strcmp(op, "clear") == 0)  { vram_upload_log_clear(); send_ok(id); return; }
+    const uint32_t since = (uint32_t)json_get_int(json, "since", 0);
+    const uint32_t n = vram_upload_log_count();
+    const int bufsz = 4 * 1024 * 1024;
+    char *buf = (char*)malloc(bufsz);
+    if (!buf) { send_err(id, "OOM"); return; }
+    int pos = snprintf(buf, bufsz, "{\"id\":%d,\"ok\":true,\"total\":%u,\"retained\":%u,\"dir\":\"%s\",\"uploads\":[",
+                       id, vram_upload_log_total(), n, vram_upload_log_dir());
+    int first = 1;
+    for (uint32_t i = 0; i < n && pos < bufsz - 256; i++) {
+        const VramUploadEntry *e = vram_upload_log_get(i);
+        if (!e || e->seq < since) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+            "%s{\"seq\":%u,\"frame\":%u,\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u,\"crc\":\"%08x\","
+            "\"fw\":[\"%08x\",\"%08x\",\"%08x\",\"%08x\"]}",
+            first ? "" : ",", e->seq, e->frame, e->x, e->y, e->w, e->h, e->crc,
+            e->first_words[0], e->first_words[1], e->first_words[2], e->first_words[3]);
+        first = 0;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
+}
+
 extern int gpu_get_c0_count(void);
 extern int gpu_get_c0_history(int index, int *x, int *y, int *w, int *h,
                               uint32_t *func, uint32_t *sp, uint32_t *s1,
@@ -13557,6 +13598,7 @@ static const CmdEntry s_commands[] = {
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },
     { "a0_history",        handle_a0_history },
+    { "vram_upload_log",   handle_vram_upload_log },
     { "c0_history",        handle_c0_history },
     { "capture_quads",     handle_capture_quads },
     { "get_quads",         handle_get_quads },

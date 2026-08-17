@@ -11,6 +11,7 @@
  */
 
 #include "gpu.h"
+#include "vram_upload_log.h"
 #include "mod_memory.h"
 #include "gpu_primitive_reject.h"
 #include "gpu_sw_renderer.h"
@@ -2133,6 +2134,8 @@ static void gp0_commit_cpu_to_vram(void) {
                      ((vram_write_x + col) & 1023u)];
     gr_vram_transfer_in(vram_write_x, vram_write_y,
                         vram_write_w, vram_write_h, vram_write_pixels);
+    vram_upload_log_note(vram_write_x, vram_write_y, vram_write_w, vram_write_h,
+                         vram_write_pixels, (uint32_t)s_frame_count);
     depth24_note_upload(vram_write_x, vram_write_y, vram_write_w, vram_write_h);
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
