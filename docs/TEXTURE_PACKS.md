@@ -162,6 +162,7 @@ texpack.py starter  DUMPDIR PACKDIR --scale N   one <tex_id>.png (+ .clut) per t
                                                 plus <tex_id>-<pal_id>.png (+ .clut) for genuine recolours;
                                                 --palette common (default, most-drawn palette per pairs.tsv)
                                                 | first | last | all | <pal_id>; --no-variants
+texpack.py merge    OUTDUMP DUMP...              union of dumps (first PNG/.clut per pair, draw counts summed)
 texpack.py coverage PACKDIR TSV...              covered texel ids / exact-palette pairs, --missing out.tsv
 texpack.py validate PACKDIR [--tsv TSV]         names, alpha channel, integer-multiple sizes, .clut sizes
 texpack.py sheet    DIR OUT.png                 contact sheet of a dump or a pack
@@ -254,6 +255,41 @@ picture is what gets presented. Video filters at that scale follow
 `VIDEO_FILTERS.md` → *With supersampling*: the pixel-art upscalers stand
 down (they would misread HD art as staircases), the display looks
 (sharp / scanlines / crt) apply at the native line pitch on both backends.
+
+## Whole-game coverage (B10)
+
+A pack is only as complete as the dumps behind it. Two sources compose:
+
+* **Play-through dumps** — `texture_dump` armed while the game runs (scripted
+  savestate loads / warps headless, or `PSX_TEXTURE_DUMP=<dir>` while a
+  person plays). Sprites, HUD, menus, effects only come from here.
+* **Offline dumps from the game's own asset files** — anything drawn from a
+  fixed table (tile pipelines: a tile definition = a 16×16 cell of a page +
+  a CLUT) can be hashed exactly like the runtime does (`fnv1a` over the
+  indices + size + depth, palette over the CLUT halfwords) without playing,
+  and written in dump layout (`<tex>-<pal>.png`, `.clut`, `textures.tsv`,
+  `pairs.tsv` with `draws` = map references). Mega Man 8 does this in its
+  `tools/pac_texpack.py` for all 31 tile-pipeline PACs (37,621 texel ids
+  — every background tile of every stage, menu, demo and ending; the
+  intro-stage tiles of a real dump match it pair for pair, which is the
+  proof the hashes agree).
+
+`texpack.py merge OUT DUMP...` unions any number of dumps (first PNG/`.clut`
+per pair wins, `pairs.tsv` draw counts summed) so `starter` builds one pack
+from all of them. `starter` treats a palette as a fade of the common one only
+below 0.75 levels rms (the runtime approximates up to 2 — see B9): palettes
+the game really uses that are *near* but not fades get exact variants, so an
+identity starter stays pixel-identical.
+
+Mega Man 8's `tools/texdump_sweep.sh` is the reproducible recipe: offline
+PACs + headless dumps (title/menus, developer-warp stages 00–03 with a
+walk/jump/shoot loop, every savestate slot) → merge → starter → coverage.
+Result: 38,644 texel ids, 46,716 images at 2× (8,072 recolour variants,
+364 MB); pixel-identical to native on the stage, pause-menu and title-menu
+savestates with 100 % of lookups hitting. Loading is parallel (8 threads:
+~1.2 s for 46 k images, +215 MB RSS); the GL atlas (8192², ~64 M px) holds
+this pack at 2× — larger packs (or 4×) exceed it and the overflow falls back
+to native texels (a lazy / tiled atlas is B13).
 
 ## Software ↔ OpenGL parity (B11)
 

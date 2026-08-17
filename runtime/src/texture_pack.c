@@ -318,49 +318,113 @@ void texture_pack_unload(void) {
     s_pack_gen++;
 }
 
+/* Loading: the directory listing is gathered first, then decoded by a few
+ * worker threads (a whole-game pack is tens of thousands of small PNGs — one
+ * thread took ~10 s for 46 k images, the pool a fraction of that), then the
+ * entries are linked into the index on the calling thread. */
+#ifdef _WIN32
+#include <windows.h>
+typedef HANDLE tp_thread_t;
+static volatile LONG s_load_next;
+static long tp_fetch_add(void) { return InterlockedIncrement(&s_load_next) - 1; }
+#else
+#include <pthread.h>
+typedef pthread_t tp_thread_t;
+static pthread_mutex_t s_load_lock = PTHREAD_MUTEX_INITIALIZER;
+static long s_load_next;
+static long tp_fetch_add(void) { pthread_mutex_lock(&s_load_lock); long v = s_load_next++; pthread_mutex_unlock(&s_load_lock); return v; }
+#endif
+typedef struct { char *name; PackEntry *e; } LoadItem;
+static LoadItem *s_load_items; static long s_load_n; static const char *s_load_dir;
+
+static void load_one(LoadItem *it) {
+    const char *n = it->name;
+    size_t len = strlen(n);
+    uint64_t tex, pal = 0;
+    if (len == 20) { if (!parse_hex16(n, &tex)) return; }
+    else if (!parse_hex16(n, &tex) || !parse_hex16(n + 17, &pal)) return;
+    char path[1400];
+    snprintf(path, sizeof path, "%s/%s", s_load_dir, n);
+    int w = 0, h = 0, comp = 0;
+    unsigned char *px = stbi_load(path, &w, &h, &comp, 4);
+    if (!px || w <= 0 || h <= 0) { if (px) stbi_image_free(px); return; }
+    PackEntry *e = (PackEntry*)calloc(1, sizeof *e);
+    if (!e) { stbi_image_free(px); return; }
+    e->tex = tex; e->pal = pal; e->img.w = w; e->img.h = h; e->img.rgba = px;
+    e->img.atlas_x = e->img.atlas_y = -1;
+    e->img.ref_n = 0; e->img.hits = 0;
+    /* <tex>.clut / <tex>-<pal>.clut: the CLUT this image was authored against */
+    snprintf(path, sizeof path, "%s/%.*s.clut", s_load_dir, (int)(len - 4), n);
+    FILE *cf = fopen(path, "rb");
+    if (cf) {
+        uint8_t raw[512];
+        size_t got = fread(raw, 1, sizeof raw, cf);
+        fclose(cf);
+        if (got == 32 || got == 512) {
+            e->img.ref_n = (int)(got / 2);
+            for (int i = 0; i < e->img.ref_n; i++) e->img.ref_clut[i] = (uint16_t)(raw[i * 2] | (raw[i * 2 + 1] << 8));
+        }
+    }
+    it->e = e;
+}
+#ifdef _WIN32
+static DWORD WINAPI load_worker(LPVOID arg) { (void)arg; for (;;) { long i = tp_fetch_add(); if (i >= s_load_n) return 0; load_one(&s_load_items[i]); } }
+#else
+static void *load_worker(void *arg) { (void)arg; for (;;) { long i = tp_fetch_add(); if (i >= s_load_n) return NULL; load_one(&s_load_items[i]); } }
+#endif
+
 int texture_pack_load(const char *dir) {
     texture_pack_unload();
     if (!dir || !dir[0]) return 0;
     DIR *d = opendir(dir);
     if (!d) return 0;
     struct dirent *de;
+    long cap = 1024, n = 0;
+    LoadItem *items = (LoadItem*)malloc((size_t)cap * sizeof *items);
+    if (!items) { closedir(d); return 0; }
     while ((de = readdir(d)) != NULL) {
-        const char *n = de->d_name;
-        size_t len = strlen(n);
-        uint64_t tex, pal = 0;
-        if (len == 20 && strcmp(n + 16, ".png") == 0) {            /* <tex>.png */
-            if (!parse_hex16(n, &tex)) continue;
-        } else if (len == 37 && n[16] == '-' && strcmp(n + 33, ".png") == 0) {   /* <tex>-<pal>.png */
-            if (!parse_hex16(n, &tex) || !parse_hex16(n + 17, &pal)) continue;
-        } else continue;
-        char path[1400];
-        snprintf(path, sizeof path, "%s/%s", dir, n);
-        int w = 0, h = 0, comp = 0;
-        unsigned char *px = stbi_load(path, &w, &h, &comp, 4);
-        if (!px || w <= 0 || h <= 0) { if (px) stbi_image_free(px); continue; }
-        PackEntry *e = (PackEntry*)calloc(1, sizeof *e);
-        if (!e) { stbi_image_free(px); break; }
-        e->tex = tex; e->pal = pal; e->img.w = w; e->img.h = h; e->img.rgba = px;
-        e->img.atlas_x = e->img.atlas_y = -1;
-        e->img.ref_n = 0; e->img.hits = 0;
-        {
-            /* <tex>.clut / <tex>-<pal>.clut: the CLUT this image was authored against */
-            snprintf(path, sizeof path, "%s/%.*s.clut", dir, (int)(len - 4), n);
-            FILE *cf = fopen(path, "rb");
-            if (cf) {
-                uint8_t raw[512];
-                size_t got = fread(raw, 1, sizeof raw, cf);
-                fclose(cf);
-                if (got == 32 || got == 512) {
-                    e->img.ref_n = (int)(got / 2);
-                    for (int i = 0; i < e->img.ref_n; i++) e->img.ref_clut[i] = (uint16_t)(raw[i * 2] | (raw[i * 2 + 1] << 8));
-                }
-            }
+        const char *nm = de->d_name;
+        size_t len = strlen(nm);
+        if (!((len == 20 && strcmp(nm + 16, ".png") == 0) ||
+              (len == 37 && nm[16] == '-' && strcmp(nm + 33, ".png") == 0))) continue;
+        if (n == cap) {
+            LoadItem *grown = (LoadItem*)realloc(items, (size_t)cap * 2 * sizeof *items);
+            if (!grown) break;
+            items = grown; cap *= 2;
         }
-        unsigned b = (unsigned)(tex ^ (tex >> 23)) & (PACK_BUCKETS - 1);
-        e->next = s_pack[b]; s_pack[b] = e; s_pack_n++;
+        items[n].name = strdup(nm); items[n].e = NULL;
+        if (items[n].name) n++;
     }
     closedir(d);
+    s_load_items = items; s_load_n = n; s_load_dir = dir; s_load_next = 0;
+    enum { NT = 8 };
+    tp_thread_t th[NT]; int live = 0;
+    if (n >= 64) {
+        for (int i = 0; i < NT; i++) {
+#ifdef _WIN32
+            th[i] = CreateThread(NULL, 0, load_worker, NULL, 0, NULL); if (th[i]) live++;
+#else
+            if (pthread_create(&th[i], NULL, load_worker, NULL) == 0) live++; else th[i] = 0;
+#endif
+        }
+    }
+    if (!live) load_worker(NULL);
+    for (int i = 0; i < live; i++) {
+#ifdef _WIN32
+        WaitForSingleObject(th[i], INFINITE); CloseHandle(th[i]);
+#else
+        pthread_join(th[i], NULL);
+#endif
+    }
+    for (long i = 0; i < n; i++) {
+        PackEntry *e = items[i].e;
+        free(items[i].name);
+        if (!e) continue;
+        unsigned b = (unsigned)(e->tex ^ (e->tex >> 23)) & (PACK_BUCKETS - 1);
+        e->next = s_pack[b]; s_pack[b] = e; s_pack_n++;
+    }
+    free(items);
+    s_load_items = NULL; s_load_n = 0;
     snprintf(s_pack_dir, sizeof s_pack_dir, "%s", dir);
     g_texture_pack_replace = s_pack_n > 0;
     s_pack_gen++;

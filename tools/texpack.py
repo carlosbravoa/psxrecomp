@@ -9,6 +9,8 @@ A dump directory (runtime `texture_dump`) holds <tex_id>-<pal_id>.png files
     texpack.py starter  DUMPDIR PACKDIR --scale N      one <tex_id>.png (+ .clut sidecar) per texel id, plus
                         [--palette common|first|last|all|<pal_id>]  <tex_id>-<pal_id>.png for genuine recolours;
                         [--no-variants]                 N x nearest: the pixel-identical skeleton artists repaint
+    texpack.py merge    OUTDUMP DUMP [DUMP...]         union of dumps (first PNG/.clut per pair wins,
+                                                      pairs.tsv draw counts summed) -> one dump to build from
     texpack.py coverage PACKDIR TSV [TSV...]           which dumped textures the pack covers
     texpack.py validate PACKDIR [--tsv TSV]            filenames / sizes / alpha sanity
     texpack.py sheet    DIR OUT.png [--cols 48]        contact sheet of a dump or pack
@@ -21,7 +23,9 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -75,11 +79,15 @@ def read_clut(path: Path):
     return [int.from_bytes(b[i:i + 2], "little") for i in range(0, len(b), 2)]
 
 
-def fade_fits(ref, live):
+def fade_fits(ref, live, tol=0.75):
     """Mirror of texture_pack_palette_mod (runtime/src/texture_pack.c): is `live`
     a uniform fade of `ref` — multiplicative (cur = ref*k) or subtractive
-    (cur = clamp(ref - d)) per channel, rms residual < 2 levels — or a genuine
-    recolour? Keep in sync with the C."""
+    (cur = clamp(ref - d)) per channel — or a genuine recolour? Keep the model
+    in sync with the C. The runtime accepts a fit below 2 levels rms (it then
+    APPROXIMATES the colours, better than falling back to native art); the
+    starter uses a tighter 0.75 so that palettes the game really uses which are
+    not exact fades get their own exact variant and the skeleton stays
+    pixel-identical (a true PSX fade fits with rms 0 / <= 0.5)."""
     import math
     idx = [i for i in range(len(ref)) if ref[i] & 0x7FFF]
     if not idx:
@@ -103,7 +111,7 @@ def fade_fits(ref, live):
             m += 1
     if not m:
         return True
-    return min(math.sqrt(err_mul / m), math.sqrt(err_sub / m)) < 2.0
+    return min(math.sqrt(err_mul / m), math.sqrt(err_sub / m)) < tol
 
 
 def cmd_starter(a):
@@ -168,6 +176,63 @@ def cmd_starter(a):
             if clut.exists():
                 (out / (name[:-4] + ".clut")).write_bytes(clut.read_bytes())
     print(f"starter pack: {n} images at {a.scale}x -> {out}" + (f" ({nvar} recolour variants)" if nvar else ""))
+    return 0
+
+
+def cmd_merge(a):
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    seen: dict = {}
+    draws = collections.Counter()
+    header = None
+    rows_out = []
+    for d in a.dumps:
+        d = Path(d)
+        tsv = d / "textures.tsv"
+        if not tsv.exists():
+            print(f"skip {d}: no textures.tsv", file=sys.stderr)
+            continue
+        with open(tsv, newline="") as f:
+            rd = csv.DictReader(f, delimiter="\t")
+            header = header or rd.fieldnames
+            n_new = 0
+            for r in rd:
+                key = (r["tex_id"].lower(), r["pal_id"].lower())
+                if key in seen:
+                    continue
+                src = d / f"{r['tex_id']}-{r['pal_id']}.png"
+                if not src.exists():
+                    continue
+                seen[key] = d
+                rows_out.append(r)
+                n_new += 1
+                dst = out / src.name
+                if not dst.exists():
+                    try:
+                        os.link(src, dst)
+                    except OSError:
+                        shutil.copyfile(src, dst)
+                clut = src.with_suffix(".clut")
+                if clut.exists() and not (out / clut.name).exists():
+                    try:
+                        os.link(clut, out / clut.name)
+                    except OSError:
+                        shutil.copyfile(clut, out / clut.name)
+        pairs = d / "pairs.tsv"
+        if pairs.exists():
+            for r in read_tsv(pairs):
+                draws[(r["tex_id"].lower(), r["pal_id"].lower())] += int(r["draws"])
+        print(f"{d}: {n_new} new pairs")
+    with open(out / "textures.tsv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header or ["tex_id", "pal_id", "w", "h", "bpp", "texpage_x", "texpage_y", "clut_x", "clut_y", "u", "v", "first_frame"], delimiter="\t")
+        w.writeheader()
+        for r in rows_out:
+            w.writerow(r)
+    with open(out / "pairs.tsv", "w") as f:
+        f.write("tex_id\tpal_id\tdraws\n")
+        for (t, p), n in draws.items():
+            f.write(f"{t}\t{p}\t{n}\n")
+    print(f"merged: {len(rows_out)} pairs, {len({t for t, _ in seen})} texel ids -> {out}")
     return 0
 
 
@@ -272,6 +337,7 @@ def main():
     p.add_argument("--palette", default="common", help="common (most-drawn palette + genuine recolour variants, needs pairs.tsv; default) | first | last | all | <pal_id>")
     p.add_argument("--no-variants", action="store_true", help="with --palette common: do not emit <tex>-<pal>.png recolour variants")
     p.set_defaults(fn=cmd_starter)
+    p = sub.add_parser("merge"); p.add_argument("out"); p.add_argument("dumps", nargs="+"); p.set_defaults(fn=cmd_merge)
     p = sub.add_parser("coverage"); p.add_argument("pack"); p.add_argument("tsv", nargs="+")
     p.add_argument("--missing", help="write the uncovered texel ids to this TSV"); p.set_defaults(fn=cmd_coverage)
     p = sub.add_parser("validate"); p.add_argument("pack"); p.add_argument("--tsv"); p.set_defaults(fn=cmd_validate)
