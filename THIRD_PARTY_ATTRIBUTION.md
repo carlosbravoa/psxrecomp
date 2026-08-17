@@ -57,3 +57,22 @@ engine-agnostic pieces originally authored by Jrickey in
 - The tap plumbing in `runtime/src/spu.c` and `runtime/include/spu.h`.
 
 All reuse keeps the original copyright and dual MIT/Apache-2.0 license.
+
+## Video filters — algorithm provenance
+
+`runtime/src/video_filter.c` / `runtime/src/gpu_gl_filter_shaders.h`
+(see `docs/VIDEO_FILTERS.md`):
+
+- **Scale2x / Scale3x (EPX)** — algorithm by Eric Johnston (LucasArts) and
+  Andrea Mazzoleni (AdvanceMAME). Independent implementation; the AdvanceMAME
+  code (GPL) was not used.
+- **2xSaI / Super 2xSaI / Super Eagle** — algorithms by Derek Liauw Kie Fa
+  ("Kreed"). Independent implementation from the published rules; the original
+  code (GPL) was not used.
+- **xBR level 2** — Hyllian (2011). The per-output-pixel formulation follows
+  Hyllian's `xbr-lv2` shader from libretro `glsl-shaders`, **MIT** licence,
+  Copyright (c) 2011-2016 Hyllian.
+- **CRT look** — modelled on Timothy Lottes' CRT shader, released into the
+  **public domain** by its author.
+- **Sharp bilinear** — the public-domain "sharp-bilinear-simple" formula
+  (integer prescale + linear finish).

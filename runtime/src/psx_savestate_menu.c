@@ -55,6 +55,17 @@ static const uint8_t FONT8[59][8] = {
 };
 
 static int s_open;
+/* 0 = none, 1 = confirming a SAVE, 2 = confirming a LOAD. */
+static int s_confirm;
+/* System menu (ESC). It shares this module's panel and the three compositing
+ * sites that already blit it, so adding it here costs nothing in the GL, VK and
+ * software present paths. Only one of the two can be open at a time. */
+#define SYS_MENU_MAX   12
+#define SYS_MENU_LABEL_CAP 40
+static int  s_sys_open;
+static int  s_sys_sel;
+static int  s_sys_count;
+static char s_sys_label[SYS_MENU_MAX][SYS_MENU_LABEL_CAP];
 static int s_selected;
 static int s_dirty = 1;
 static uint32_t s_panel[SSM_W * SSM_H];
@@ -220,6 +231,53 @@ static void refresh_thumbs(void)
     }
 }
 
+/* Overwriting a save or throwing away progress are both one keystroke away, and
+ * S and L sit next to each other on the keyboard — so both are confirmed. The
+ * banner states the ACTION and the SLOT, because picking the wrong slot is the
+ * other half of the mistake. */
+static void draw_confirm_banner(void)
+{
+    char msg[64];
+    if (!s_confirm) return;
+    fill_rect(s_panel, 0, SSM_H - 92, SSM_W, 92, 0xFF2A1A1Au);
+    fill_rect(s_panel, 0, SSM_H - 92, SSM_W, 4,
+              s_confirm == 1 ? 0xFFFFD24Du : 0xFF6FD3FFu);
+    snprintf(msg, sizeof msg, "%s SLOT %d ?",
+             s_confirm == 1 ? "SAVE TO" : "LOAD FROM", s_selected + 1);
+    draw_text(s_panel, 28, SSM_H - 70, msg, 0xFFFFFFFFu, 2);
+    draw_text(s_panel, 28, SSM_H - 34,
+              "ENTER CONFIRMS      ESC CANCELS", 0xFFC8D2E4u, 1);
+}
+
+static void rasterize_system_panel(void)
+{
+    int i;
+    const int n = s_sys_count > 0 ? s_sys_count : 0;
+    const int row_h = 34;
+    const int top = 62;
+
+    for (i = 0; i < SSM_W * SSM_H; i++)
+        s_panel[i] = 0xFF0F1118u;
+
+    fill_rect(s_panel, 0, 0, SSM_W, 46, 0xFF171B25u);
+    draw_text(s_panel, 24, 14, "SYSTEM", 0xFFFFD24Du, 2);
+    draw_text(s_panel, SSM_W - 336, 18, "ESC CLOSES", 0xFF8894A8u, 1);
+
+    for (i = 0; i < n; i++) {
+        const int y = top + i * row_h;
+        const int sel = (i == s_sys_sel);
+        fill_rect(s_panel, 60, y, SSM_W - 120, row_h - 6,
+                  sel ? 0xFF243044u : 0xFF161A22u);
+        if (sel)
+            fill_rect(s_panel, 60, y, 6, row_h - 6, 0xFFFFD24Du);
+        draw_text(s_panel, 96, y + 7, s_sys_label[i],
+                  sel ? 0xFFFFFFFFu : 0xFFA8B2C4u, 2);
+    }
+    draw_text(s_panel, 60, top + n * row_h + 18,
+              "UP DOWN MOVE   LEFT RIGHT ADJUST   ENTER CONFIRM",
+              0xFF8894A8u, 1);
+}
+
 static void rasterize_panel(void)
 {
     int i, first;
@@ -299,6 +357,42 @@ void psx_savestate_menu_set_state(int open, int selected_slot)
     s_selected = selected_slot;
 }
 
+/* The caller owns the menu's content: it formats each row (including live
+ * values like "VOLUME  75%") and hands the strings over. Keeping the panel dumb
+ * means adding an entry never touches this file. */
+void psx_system_menu_set_items(int open, int selected,
+                               const char *const *labels, int count)
+{
+    int i;
+    if (count < 0) count = 0;
+    if (count > SYS_MENU_MAX) count = SYS_MENU_MAX;
+    if (selected < 0) selected = 0;
+    if (count > 0 && selected >= count) selected = count - 1;
+
+    s_dirty = 1;              /* labels carry live values; always re-rasterize */
+    s_sys_open = open ? 1 : 0;
+    s_sys_sel = selected;
+    s_sys_count = count;
+    for (i = 0; i < count; i++) {
+        const char *src = labels && labels[i] ? labels[i] : "";
+        snprintf(s_sys_label[i], SYS_MENU_LABEL_CAP, "%s", src);
+    }
+}
+
+void psx_system_menu_set_state(int open, int selected)
+{
+    psx_system_menu_set_items(open, selected,
+                              (const char *const *)s_sys_label, s_sys_count);
+}
+
+int psx_system_menu_item_count(void) { return s_sys_count; }
+
+void psx_savestate_menu_set_confirm(int mode)
+{
+    if (s_confirm != mode) s_dirty = 1;
+    s_confirm = mode;
+}
+
 void psx_savestate_menu_note_slots_changed(void)
 {
     s_dirty = 1;
@@ -306,19 +400,26 @@ void psx_savestate_menu_note_slots_changed(void)
 
 int psx_savestate_menu_needs_present(void)
 {
-    return s_open;
+    return s_open || s_sys_open;
 }
 
 int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
 {
-    if (!s_open) {
+    if (!s_open && !s_sys_open) {
         if (pixels) *pixels = NULL;
         if (w) *w = 0;
         if (h) *h = 0;
         return 0;
     }
-    if (s_dirty)
-        rasterize_panel();
+    if (s_dirty) {
+        if (s_sys_open) {
+            rasterize_system_panel();
+        } else {
+            rasterize_panel();
+            draw_confirm_banner();
+        }
+        s_dirty = 0;
+    }
     if (pixels) *pixels = s_panel;
     if (w) *w = SSM_W;
     if (h) *h = SSM_H;

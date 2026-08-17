@@ -91,6 +91,10 @@ void debug_server_get_status(int *listening, int *port, int *error);
  * Call once per vblank. */
 void debug_server_poll(void);
 
+/* Run one command line in-process (emu thread) and return its response text
+ * (malloc'd; caller frees). Works without a listener. NULL on re-entry. */
+char *debug_server_run_local(const char *line);
+
 /* FMV quiet mode suppresses high-frequency trace rings while MDEC video is
  * active. The TCP command pump stays live; expensive per-dispatch/per-frame
  * recording backs off so debug builds can still play FMVs at speed. */

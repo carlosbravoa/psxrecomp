@@ -744,9 +744,17 @@ void dirty_ram_text_guard_resync_after_restore(void) {
     g_text_diverged_pages = 0;
 }
 
-void overlay_watch_invalidate_after_ram_restore(void) {
+/* The page-generation half of the restore resync, callable on its own.
+ * Split out so a bulk RAM replacement that is NOT a savestate restore (a game
+ * streaming a new overlay over an old one) can be attributed to one specific
+ * step rather than to the whole bundle. */
+void overlay_watch_bump_all_page_gen(void) {
     for (uint32_t pg = 0; pg < DIRTY_RAM_PAGE_COUNT; pg++)
         overlay_page_gen[pg]++;
+}
+
+void overlay_watch_invalidate_after_ram_restore(void) {
+    overlay_watch_bump_all_page_gen();
     extern void overlay_loader_note_code_write(void);
     extern void overlay_loader_resync_validation_after_restore(void);
     overlay_loader_note_code_write();

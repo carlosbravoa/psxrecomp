@@ -365,7 +365,7 @@ void savestate_get_integrity(uint32_t* bios_checksum, uint32_t* entry_pc) {
 
 int savestate_slot_path(int slot, char* out, size_t cap) {
     if (!s_configured || !out || cap == 0) return 0;
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_SLOT_TOTAL) return 0;
     /* Keyed by entry_pc so slots from different games in a shared dir never
      * collide; boot_state_load also rejects a mismatched entry_pc internally. */
     snprintf(out, cap, "%s%sstate_%08X_slot%02d.pst",
@@ -375,7 +375,7 @@ int savestate_slot_path(int slot, char* out, size_t cap) {
 
 static int savestate_thumb_path(int slot, char* out, size_t cap) {
     if (!s_configured || !out || cap == 0) return 0;
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_SLOT_TOTAL) return 0;
     snprintf(out, cap, "%s%sstate_%08X_slot%02d.thumb",
              s_dir, (s_dir[0] ? "/" : ""), (unsigned)s_entry_pc, slot);
     return 1;
@@ -582,7 +582,7 @@ static int netplay_user_blocked(void) {
 
 static int request_save_inner(int slot) {
     if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return 0; }
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_SLOT_TOTAL) return 0;
     s_save_failed = 0;
     s_last_save_pc = 0; /* block netplay transfer until this write stamps a PC */
     s_save_defer_slot = -1;
@@ -592,7 +592,7 @@ static int request_save_inner(int slot) {
 
 static int request_load_inner(int slot) {
     if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return 0; }
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (slot < 0 || slot >= SAVESTATE_SLOT_TOTAL) return 0;
     if (!psx_hle_scheduler_enabled()) {
         /* LLE (host-fiber) mode: the restore longjmp target lives on the
          * scheduler fiber; cross-fiber unwind is unsafe. HLE is the default. */
@@ -609,6 +609,21 @@ static int request_load_inner(int slot) {
 int savestate_request_save(int slot) {
     if (netplay_user_blocked()) return 0;
     return request_save_inner(slot);
+}
+
+/* Bug-report bundles: a slot-less save straight to `path` (no thumb, not part
+ * of the UI slot set). Same staging/safe-point rules as a slot save. */
+static char s_save_path_pending[600];
+int savestate_request_save_path(const char* path) {
+    if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return 0; }
+    if (!path || !path[0] || strlen(path) >= sizeof(s_save_path_pending)) return 0;
+    if (netplay_user_blocked()) return 0;
+    strncpy(s_save_path_pending, path, sizeof(s_save_path_pending) - 1);
+    s_save_path_pending[sizeof(s_save_path_pending) - 1] = 0;
+    s_save_failed = 0;
+    s_save_defer_slot = -1;
+    s_save_pending = SAVESTATE_SLOT_TOTAL;   /* sentinel: path save */
+    return 1;
 }
 
 int savestate_request_load(int slot) {
@@ -719,7 +734,12 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                         "pc=0x%08X\n",
                         slot, (unsigned)pc);
             }
-            if (savestate_slot_path(slot, path, sizeof(path))) {
+            const int path_save = (slot == SAVESTATE_SLOT_TOTAL);
+            int have_path = path_save
+                ? (snprintf(path, sizeof(path), "%s", s_save_path_pending) > 0)
+                : savestate_slot_path(slot, path, sizeof(path));
+            if (path_save) s_save_path_pending[0] = 0;
+            if (have_path) {
                 /* Save the exact resume PC (cpu->pc is 0 mid-block; resume_pc is
                  * the block leader the interrupt path would resume at). */
                 CPUState snap = *cpu;
@@ -728,7 +748,7 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                 if (ok) {
                     s_last_save_pc = pc;
                     s_save_failed = 0;
-                    (void)savestate_capture_thumb(slot);
+                    if (!path_save) (void)savestate_capture_thumb(slot);
                 } else {
                     s_last_save_pc = 0;
                     s_save_failed = 1;

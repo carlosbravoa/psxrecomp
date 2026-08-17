@@ -38,6 +38,10 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
+#include "video_filter.h"
+#include "png_write.h"
+#include "bug_report.h"
+#include "psx_script.h"
 #include "gpu_vk_renderer.h"
 #include "frame_pacing.h"
 #include "latency_ring.h"
@@ -319,6 +323,18 @@ SDL_Window* sdl_window = nullptr;
 }
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
+/* Software-present video filter (video_filter.h): the CPU-filtered frame is
+ * N times the native grid, so it streams through its own texture; sized on
+ * first use for the selected factor. NULL while the filter is off. */
+static SDL_Texture*  sdl_filter_texture = nullptr;
+static int           sdl_filter_texture_n = 0;
+static uint32_t*     sdl_filter_buf = nullptr;
+static size_t        sdl_filter_buf_px = 0;
+/* Software-present capture (debug "present_capture" on the SDL_Renderer path):
+ * the buffer handed to SDL_UpdateTexture — post-filter — dumped as PNG. */
+static char          s_sw_capture_path[512];
+static int           s_sw_capture_pending = 0;
+static int           s_sw_capture_result = 0;
 /* Per-player input device routing (PSX ports 1 & 2). Seeded from the
  * [controller] settings the launcher writes; the runtime opens the matching
  * SDL controller (or uses the keyboard) and feeds each PSX pad slot. */
@@ -407,6 +423,7 @@ static bool     s_force_present_after_load = false;
 static int s_sw_hold_valid = 0;
 static SDL_Rect s_sw_hold_src;
 static SDL_Rect s_sw_hold_dst;
+static SDL_Texture* s_sw_hold_tex = nullptr;   /* texture the last present drew (filter or plain) */
 /* After LOADED: optional freeze probe (PSX_POST_LOAD_PROBE=1). Off by default. */
 static int      s_post_load_probe_enabled = -1; /* -1 = unread env */
 static int      s_post_load_probe_left = 0;
@@ -927,6 +944,10 @@ static void savestate_input_guard_arm(void);
 extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) {
     char buf[64];
     const int disp = slot + 1;
+    if (!is_load && slot >= SAVESTATE_SLOT_TOTAL) {   /* bug-report path save */
+        bug_report_on_state_saved(ok);
+        return;
+    }
     if (!is_load && ok)
         psx_savestate_menu_note_slots_changed();
     if (is_load && ok)
@@ -1104,6 +1125,8 @@ static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
+static int           g_video_filter   = 0;  /* VideoFilterKind (video_filter.h); 0 = none */
+static VideoScanlineParams g_scan = { VF_SCAN_OPACITY_DEFAULT, VF_SCAN_SIZE_DEFAULT, VF_SCAN_GLOW_DEFAULT };
 static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_audio_freq     = 44100; /* host device request */
@@ -1245,6 +1268,25 @@ extern "C" int psx_mod_set_adaptive_display_aspect(
         (unsigned)max_numerator, (unsigned)max_denominator);
     return 1;
 }
+
+/* Mod-selected present-time video filter (video_filter.h). Presentation only:
+ * never touches VRAM, digests or oracle frames. Applied immediately; the
+ * launcher/settings value it overrides is not persisted. */
+extern "C" int psx_mod_set_video_filter(const char* name) {
+    int kind = 0;
+    if (!name || !video_filter_from_name(name, &kind)) {
+        std::fprintf(stderr, "psxrecomp: mod rejected unknown video filter \"%s\"\n",
+                     name ? name : "(null)");
+        return 0;
+    }
+    g_video_filter = kind;
+    video_filter_set(kind);
+    gl_renderer_invalidate_present();
+    std::fprintf(stdout, "psxrecomp: mod selected video filter %s\n",
+                 video_filter_name(kind));
+    return 1;
+}
+
 
 extern "C" int psx_mod_set_native_vblank_rate(
     uint32_t frames_per_second) {
@@ -1514,6 +1556,93 @@ static bool          g_vk_active = false;    /* Vulkan context live -> VK presen
  * to force the software readout path instead — a diagnostic/fallback that also
  * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
 static int           g_gl_fbo_present = 1;
+
+/* Debug-server "present_capture": route to the live present path. GL captures
+ * the drawable (post-filter, pre-OSD) plus source/reference companions; the
+ * software present dumps the exact buffer it uploads to SDL. */
+extern "C" int psx_present_request_capture(const char* path) {
+    if (!path || !path[0]) return 0;
+    if (g_gl_active) return gl_renderer_request_present_capture(path);
+    std::strncpy(s_sw_capture_path, path, sizeof s_sw_capture_path - 1);
+    s_sw_capture_path[sizeof s_sw_capture_path - 1] = 0;
+    s_sw_capture_result = 0;
+    s_sw_capture_pending = 1;
+    return 1;
+}
+extern "C" int psx_present_capture_result(void) {
+    if (g_gl_active) return gl_renderer_present_capture_result();
+    return s_sw_capture_pending ? 0 : s_sw_capture_result;
+}
+
+/* Headless present capture: scanout -> CPU video filter -> PNG (no window).
+ * Same result the software present would upload to SDL. */
+static void headless_capture_present(void) {
+    s_sw_capture_pending = 0;
+    s_sw_capture_result = -1;
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    if (di.disabled || di.width == 0 || di.height == 0) return;
+    const int w = (int)(di.width > 640 ? 640 : di.width);
+    const int h = (int)(di.height > 512 ? 512 : di.height);
+    std::vector<uint32_t> src((size_t)w * h);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            src[(size_t)y * w + x] = gpu_display_pixel_argb(&di, (uint32_t)x, (uint32_t)y);
+    const uint32_t* px = src.data();
+    int ow = w, oh = h;
+    std::vector<uint32_t> filtered;
+    const int kind = video_filter_get();
+    const int n = video_filter_cpu_scale(kind);
+    if (kind != VF_NONE && n > 1) {
+        filtered.resize((size_t)w * n * (size_t)h * n);
+        if (video_filter_apply_cpu(kind, px, w, w, h, filtered.data(), w * n) == n) {
+            px = filtered.data(); ow = w * n; oh = h * n;
+        }
+    }
+    std::vector<uint8_t> rgb((size_t)ow * oh * 3);
+    for (size_t i = 0; i < (size_t)ow * oh; i++) {
+        rgb[i * 3] = (uint8_t)(px[i] >> 16); rgb[i * 3 + 1] = (uint8_t)(px[i] >> 8); rgb[i * 3 + 2] = (uint8_t)px[i];
+    }
+    if (FILE* f = std::fopen(s_sw_capture_path, "wb")) {
+        s_sw_capture_result = png_write_rgb(f, rgb.data(), (uint32_t)ow, (uint32_t)oh) ? 1 : -1;
+        std::fclose(f);
+    }
+}
+
+extern "C" int g_turbo_loads_enabled;
+/* Host half of a bug-report bundle (bug_report.h): the settings and window
+ * facts main.cpp owns, as a JSON object body. */
+extern "C" int psx_host_report_json(char* buf, int cap) {
+    if (!buf || cap <= 0) return 0;
+    int ww = 0, wh = 0, dw = 0, dh = 0;
+    if (sdl_window) {
+        SDL_GetWindowSize(sdl_window, &ww, &wh);
+        SDL_GL_GetDrawableSize(sdl_window, &dw, &dh);
+    }
+    const char* rend = g_gl_active ? "opengl" : (g_vk_active ? "vulkan" : "software");
+    return std::snprintf(buf, (size_t)cap,
+        "\"platform\":\"%s\",\"build\":\"%s\",\"renderer\":\"%s\","
+        "\"supersampling\":%d,\"antialiasing\":%s,\"texture_filter\":\"%s\","
+        "\"screen_kind\":%d,\"video_filter\":\"%s\",\"scanline\":[%.2f,%.2f,%.2f],\"aspect\":\"%d:%d\","
+        "\"widescreen_engaged\":%s,\"fullscreen_mode\":%d,"
+        "\"window\":[%d,%d],\"drawable\":[%d,%d],\"vsync\":%d,"
+        "\"frame_interpolation\":%s,\"low_latency_input\":%s,"
+        "\"bios_hle\":%s,\"auto_skip_fmv\":%s,\"turbo_loads\":%s",
+        SDL_GetPlatform(),
+#if defined(NDEBUG)
+        "release",
+#else
+        "debug",
+#endif
+        rend, g_video_scale, g_video_aa ? "true" : "false",
+        g_video_texfilter ? "bilinear" : "nearest", g_video_screen,
+        video_filter_name(video_filter_get()), (double)g_scan.opacity, (double)g_scan.size, (double)g_scan.glow,
+        g_video_aspect_num, g_video_aspect_den,
+        g_ws_engaged ? "true" : "false", g_fullscreen, ww, wh, dw, dh, g_video_vsync,
+        g_frame_interpolation ? "true" : "false", g_low_latency_input ? "true" : "false",
+        psx_bios_hle_enabled() ? "true" : "false", g_auto_skip_fmv ? "true" : "false",
+        g_turbo_loads_enabled ? "true" : "false");
+}
 
 /* Cleared on lobby soft-return so rematch can re-arm CPU-auth GPU lock. */
 static int s_netplay_sw_gpu_locked;
@@ -2475,6 +2604,8 @@ static void teardown_game_session_keep_lobby(void) {
         gl_renderer_shutdown();
         g_gl_active = false;
     }
+    if (sdl_filter_texture) { SDL_DestroyTexture(sdl_filter_texture); sdl_filter_texture = nullptr; }
+    sdl_filter_texture_n = 0; s_sw_hold_tex = nullptr;
     if (sdl_texture) { SDL_DestroyTexture(sdl_texture); sdl_texture = nullptr; }
     if (sdl_renderer) { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
     if (sdl_window) { SDL_DestroyWindow(sdl_window); sdl_window = nullptr; }
@@ -4962,7 +5093,8 @@ static void netplay_hold_last_present_tick(void) {
     } else if (!g_vk_active && sdl_renderer && sdl_texture && s_sw_hold_valid) {
         SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
         SDL_RenderClear(sdl_renderer);
-        SDL_RenderCopy(sdl_renderer, sdl_texture, &s_sw_hold_src, &s_sw_hold_dst);
+        SDL_RenderCopy(sdl_renderer, s_sw_hold_tex ? s_sw_hold_tex : sdl_texture,
+                       &s_sw_hold_src, &s_sw_hold_dst);
         host_osd_draw_sdl(sdl_renderer);
         SDL_RenderPresent(sdl_renderer);
         did = 1;
@@ -5305,11 +5437,18 @@ static int savestate_menu_slot = 0;
 static int savestate_menu_ignore_toggle_release = 0;
 static SDL_Keycode savestate_menu_open_key = 0;
 
+/* Pending confirmation: 0 none, 1 save, 2 load. S and L are adjacent keys and
+ * both actions are destructive in opposite directions (clobber a save vs throw
+ * away play), so neither fires on a single keystroke. */
+static int savestate_menu_confirm = 0;
+
 static void savestate_menu_sync_overlay(void) {
     psx_savestate_menu_set_state(savestate_menu_open, savestate_menu_slot);
+    psx_savestate_menu_set_confirm(savestate_menu_open ? savestate_menu_confirm : 0);
 }
 
 static void savestate_menu_close(void) {
+    savestate_menu_confirm = 0;
     savestate_menu_open = 0;
     savestate_menu_sync_overlay();
     host_osd_push("Save states closed", 800);
@@ -5326,6 +5465,288 @@ static void savestate_menu_toggle(SDL_Keycode opened_by_key) {
     savestate_menu_ignore_toggle_release = 1;
     savestate_menu_open_key = opened_by_key;
     savestate_menu_sync_overlay();
+}
+
+/* ---- system menu (ESC) -------------------------------------------------
+ * Resume / save states / rewind / fullscreen / volume / FPS / filter /
+ * restart / quit. Shares the save-state overlay panel, so it needs no new
+ * compositing path in the GL, Vulkan or software renderers.
+ *
+ * Every entry here is something the runtime already exposes as a hotkey or a
+ * config value; the menu exists so a player who launched the game directly does
+ * not have to know the hotkeys, and so the video filter can be compared live
+ * instead of by restarting with a different config. */
+enum {
+    SYSM_RESUME = 0,
+    SYSM_SKIP_GOTO,
+    SYSM_SKIP_SET,
+    SYSM_SAVESTATES,
+    SYSM_REWIND,
+    SYSM_FULLSCREEN,
+    SYSM_VOLUME,
+    SYSM_FPS,
+    SYSM_FILTER,
+    SYSM_VIDEO_FILTER,
+    SYSM_SCAN_OPACITY,
+    SYSM_SCAN_SIZE,
+    SYSM_SCAN_GLOW,
+    SYSM_RESTART,
+    SYSM_QUIT,
+    SYSM_COUNT
+};
+
+static int  g_sysmenu_open = 0;
+static int  g_sysmenu_sel  = 0;
+static char *g_saved_argv[64];
+static int   g_saved_argc = 0;
+
+static int sysmenu_is_fullscreen(void) {
+    return sdl_window &&
+           (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_FULLSCREEN) ? 1 : 0;
+}
+
+static void sysmenu_set_fullscreen(int on) {
+    if (!sdl_window) return;
+    if (!on) {
+        SDL_SetWindowFullscreen(sdl_window, 0);
+        return;
+    }
+    /* Same fallback the hotkey uses: a configured mode of "off" still needs
+     * something to switch INTO. */
+    Uint32 target = psx_fullscreen_flag_for_mode(g_fullscreen);
+    if (target == 0) target = SDL_WINDOW_FULLSCREEN_DESKTOP;
+    SDL_SetWindowFullscreen(sdl_window, target);
+}
+
+static void sysmenu_build_rows(char rows[SYSM_COUNT][40]) {
+    const int have_skip = savestate_slot_exists(SAVESTATE_SLOT_SKIP_POINT);
+    snprintf(rows[SYSM_RESUME],     sizeof rows[0], "RESUME");
+    snprintf(rows[SYSM_SKIP_GOTO],  sizeof rows[0], "GO TO SKIP POINT%s",
+             have_skip ? "" : "   (NONE SET)");
+    snprintf(rows[SYSM_SKIP_SET],   sizeof rows[0], "SET SKIP POINT HERE");
+    snprintf(rows[SYSM_SAVESTATES], sizeof rows[0], "SAVE STATES");
+    snprintf(rows[SYSM_REWIND],     sizeof rows[0], "REWIND");
+    snprintf(rows[SYSM_FULLSCREEN], sizeof rows[0], "FULLSCREEN   %s",
+             sysmenu_is_fullscreen() ? "ON" : "OFF");
+    snprintf(rows[SYSM_VOLUME],     sizeof rows[0], "VOLUME       %d%%",
+             host_volume_get());
+    snprintf(rows[SYSM_FPS],        sizeof rows[0], "FPS DISPLAY  %s",
+             fps_telemetry_enabled() ? "ON" : "OFF");
+    snprintf(rows[SYSM_FILTER],     sizeof rows[0], "FILTER       %s",
+             gr_texture_filter() ? "BILINEAR" : "NEAREST");
+    {
+        /* Present-time video filter (video_filter.h): upper-cased label so it
+         * matches the menu's font/case; left/right cycle, Enter advances. */
+        char up[24];
+        const char* lab = video_filter_label(video_filter_get());
+        size_t i = 0;
+        for (; lab[i] && i + 1 < sizeof up; i++)
+            up[i] = (char)((lab[i] >= 'a' && lab[i] <= 'z') ? lab[i] - 32 : lab[i]);
+        up[i] = 0;
+        snprintf(rows[SYSM_VIDEO_FILTER], sizeof rows[0], "VIDEO FILTER %s", up);
+    }
+    {
+        VideoScanlineParams sp; video_filter_scanline_get(&sp);
+        snprintf(rows[SYSM_SCAN_OPACITY], sizeof rows[0], "SCANLINE DARK %d%%", (int)(sp.opacity * 100.f + 0.5f));
+        snprintf(rows[SYSM_SCAN_SIZE],    sizeof rows[0], "SCANLINE SIZE %d%%", (int)(sp.size * 100.f + 0.5f));
+        snprintf(rows[SYSM_SCAN_GLOW],    sizeof rows[0], "SCANLINE GLOW %d%%", (int)(sp.glow * 100.f + 0.5f));
+    }
+    snprintf(rows[SYSM_RESTART],    sizeof rows[0], "RESTART GAME");
+    snprintf(rows[SYSM_QUIT],       sizeof rows[0], "QUIT");
+}
+
+static void sysmenu_sync(void) {
+    char rows[SYSM_COUNT][40];
+    const char *ptrs[SYSM_COUNT];
+    sysmenu_build_rows(rows);
+    for (int i = 0; i < SYSM_COUNT; ++i) ptrs[i] = rows[i];
+    psx_system_menu_set_items(g_sysmenu_open, g_sysmenu_sel, ptrs, SYSM_COUNT);
+}
+
+/* The overlay is composited in the present path, not into VRAM, so `screenshot`
+ * cannot see this menu and Wayland blocks synthetic keypresses. Exposing the
+ * rows the menu WOULD draw is the only way to assert its contents (and the live
+ * values in them) from a test. */
+extern "C" int psx_system_menu_debug_rows(char *out, int cap) {
+    char rows[SYSM_COUNT][40];
+    int n = 0;
+    sysmenu_build_rows(rows);
+    for (int i = 0; i < SYSM_COUNT && n < cap - 2; ++i)
+        n += snprintf(out + n, (size_t)(cap - n), "%s%s",
+                      i ? "|" : "", rows[i]);
+    return SYSM_COUNT;
+}
+
+static void sysmenu_quit(void) {
+    psx_crash_trace_set_exit_origin("system_menu_quit");
+    shutdown_runtime();
+    std::exit(0);
+}
+
+extern "C" void psx_frontend_request_quit(int exit_code) {
+    psx_crash_trace_set_exit_origin(exit_code ? "script_fail" : "script_quit");
+    shutdown_runtime();
+    std::exit(exit_code);
+}
+
+/* Re-exec ourselves with the original argv. A full in-place machine reset does
+ * not exist in this runtime, and synthesising one would have to unwind the
+ * recompiled BIOS, the overlay loader and every device — re-exec is the honest
+ * way to get a guaranteed-clean boot. */
+/* Restart the GAME, not the process: restore this session's power-on snapshot.
+ * The machine goes back to boot with the window, audio device and launcher
+ * session all untouched — re-execing instead would tear the process down and
+ * drop the player back at the launcher, which is not what "restart" means here.
+ * Falls back to a re-exec only if no usable snapshot exists (very early in a
+ * session, before the capture point). */
+static void sysmenu_restart(void) {
+    if (savestate_slot_exists(SAVESTATE_SLOT_POWERON) &&
+        savestate_slot_compatible(SAVESTATE_SLOT_POWERON, NULL, 0) &&
+        savestate_request_load(SAVESTATE_SLOT_POWERON)) {
+        host_osd_push("Restarting", 1200);
+        return;
+    }
+    host_osd_push("Restart unavailable yet", 1800);
+}
+
+static void sysmenu_close(void) {
+    g_sysmenu_open = 0;
+    sysmenu_sync();
+}
+
+/* delta: -1 left, +1 right, 0 = Enter. Rows that are actions ignore left/right. */
+static void persist_video_filter_setting(int kind);   /* defined with the settings path */
+static void persist_scanline_settings(void);
+static void sysmenu_activate(int delta) {
+    switch (g_sysmenu_sel) {
+    case SYSM_RESUME:
+        if (delta == 0) sysmenu_close();
+        break;
+    /* Skip point: a reserved snapshot outside the player's 12 slots. Take it at
+     * the title (or the stage select) once, then a later run jumps straight
+     * there instead of sitting through the intro. Deliberately manual — it is
+     * never applied at boot, so it can't silently change how the game starts. */
+    case SYSM_SKIP_GOTO:
+        if (delta == 0) {
+            if (!savestate_slot_exists(SAVESTATE_SLOT_SKIP_POINT)) {
+                host_osd_push("No skip point set", 1500);
+            } else {
+                char why[96];
+                if (!savestate_slot_compatible(SAVESTATE_SLOT_SKIP_POINT,
+                                               why, sizeof why)) {
+                    /* Stale after a rebuild: say so instead of restoring a state
+                     * this binary cannot honour. */
+                    host_osd_push("Skip point is from another build", 2500);
+                } else {
+                    sysmenu_close();
+                    savestate_request_load(SAVESTATE_SLOT_SKIP_POINT);
+                }
+            }
+        }
+        break;
+    case SYSM_SKIP_SET:
+        if (delta == 0) {
+            sysmenu_close();
+            savestate_request_save(SAVESTATE_SLOT_SKIP_POINT);
+            host_osd_push("Skip point set", 1500);
+        }
+        break;
+    case SYSM_SAVESTATES:
+        if (delta == 0) { sysmenu_close(); savestate_menu_toggle(0); }
+        break;
+    case SYSM_REWIND:
+        if (delta == 0) { sysmenu_close(); psx_rewind_toggle(); }
+        break;
+    case SYSM_FULLSCREEN:
+        sysmenu_set_fullscreen(!sysmenu_is_fullscreen());
+        sysmenu_sync();
+        break;
+    case SYSM_VOLUME:
+        host_volume_adjust(delta == 0 ? +5 : delta * 5);
+        sysmenu_sync();
+        break;
+    case SYSM_FPS:
+        fps_telemetry_toggle();
+        sysmenu_sync();
+        break;
+    case SYSM_FILTER:
+        g_video_texfilter = gr_texture_filter() ? 0 : 1;
+        gr_set_texture_filter(g_video_texfilter);
+        sysmenu_sync();
+        break;
+    case SYSM_SCAN_OPACITY:
+    case SYSM_SCAN_SIZE:
+    case SYSM_SCAN_GLOW: {
+        VideoScanlineParams sp; video_filter_scanline_get(&sp);
+        const float step = (delta < 0 ? -0.05f : 0.05f);
+        float* v = g_sysmenu_sel == SYSM_SCAN_OPACITY ? &sp.opacity
+                 : g_sysmenu_sel == SYSM_SCAN_SIZE ? &sp.size : &sp.glow;
+        *v += step;
+        video_filter_scanline_set(&sp);
+        video_filter_scanline_get(&g_scan);
+        gl_renderer_invalidate_present();
+        persist_scanline_settings();
+        sysmenu_sync();
+        break;
+    }
+    case SYSM_VIDEO_FILTER: {
+        int k = video_filter_get() + (delta < 0 ? -1 : 1);
+        if (k < 0) k = VF_COUNT - 1;
+        if (k >= VF_COUNT) k = 0;
+        g_video_filter = k;
+        video_filter_set(k);
+        gl_renderer_invalidate_present();
+        persist_video_filter_setting(k);
+        sysmenu_sync();
+        break;
+    }
+    case SYSM_RESTART:
+        if (delta == 0) sysmenu_restart();
+        break;
+    case SYSM_QUIT:
+        if (delta == 0) sysmenu_quit();
+        break;
+    default:
+        break;
+    }
+}
+
+/* Returns 1 when the key was consumed. While the menu is open it swallows every
+ * key, so stray input cannot reach the game behind it. */
+static int system_menu_handle_key(SDL_Keycode key) {
+    if (!g_sysmenu_open) {
+        if (key != SDLK_ESCAPE) return 0;
+        if (savestate_menu_open || psx_rewind_is_open()) return 0;
+        g_sysmenu_open = 1;
+        g_sysmenu_sel = 0;
+        sysmenu_sync();
+        return 1;
+    }
+    switch (key) {
+    case SDLK_ESCAPE:
+        sysmenu_close();
+        return 1;
+    case SDLK_UP:
+        g_sysmenu_sel = (g_sysmenu_sel + SYSM_COUNT - 1) % SYSM_COUNT;
+        sysmenu_sync();
+        return 1;
+    case SDLK_DOWN:
+        g_sysmenu_sel = (g_sysmenu_sel + 1) % SYSM_COUNT;
+        sysmenu_sync();
+        return 1;
+    case SDLK_LEFT:
+        sysmenu_activate(-1);
+        return 1;
+    case SDLK_RIGHT:
+        sysmenu_activate(+1);
+        return 1;
+    case SDLK_RETURN:
+    case SDLK_SPACE:
+        sysmenu_activate(0);
+        return 1;
+    default:
+        return 1;
+    }
 }
 
 static void savestate_menu_move(int delta) {
@@ -5363,11 +5784,32 @@ static int savestate_submit_slot(int slot, int save) {
     return 1;
 }
 
+/* Arm the confirmation instead of acting. A load from an EMPTY slot is rejected
+ * up front — there is nothing to confirm, and the "Slot N is empty" toast is
+ * more useful than a prompt. */
+static void savestate_menu_request(int save) {
+    if (!save && !savestate_slot_exists(savestate_menu_slot)) {
+        char msg[32];
+        snprintf(msg, sizeof(msg), "Slot %d is empty", savestate_menu_slot + 1);
+        host_osd_push(msg, 1200);
+        return;
+    }
+    savestate_menu_confirm = save ? 1 : 2;
+    savestate_menu_sync_overlay();
+}
+
+static void savestate_menu_cancel_confirm(void) {
+    if (!savestate_menu_confirm) return;
+    savestate_menu_confirm = 0;
+    savestate_menu_sync_overlay();
+}
+
 static void savestate_menu_submit(int save) {
+    savestate_menu_confirm = 0;
     if (savestate_submit_slot(savestate_menu_slot, save) && savestate_menu_open) {
         savestate_menu_open = 0;
-        savestate_menu_sync_overlay();
     }
+    savestate_menu_sync_overlay();
 }
 
 static int savestate_menu_slot_from_key(SDL_Keycode key) {
@@ -5388,6 +5830,17 @@ static void savestate_menu_handle_key(SDL_Keycode key, int mod, int repeat) {
         return;
     if (savestate_menu_open_key && key == savestate_menu_open_key)
         return;
+    /* While a confirmation is up it owns the keyboard: only yes/no. Changing the
+     * slot underneath a "SAVE TO SLOT 3?" prompt would be the exact mistake this
+     * is here to prevent. */
+    if (savestate_menu_confirm) {
+        if (key == SDLK_RETURN || key == SDLK_SPACE || key == SDLK_y) {
+            savestate_menu_submit(savestate_menu_confirm == 1);
+        } else {
+            savestate_menu_cancel_confirm();
+        }
+        return;
+    }
     slot = savestate_menu_slot_from_key(key);
     if (slot >= 0) {
         savestate_menu_slot = slot;
@@ -5402,11 +5855,11 @@ static void savestate_menu_handle_key(SDL_Keycode key, int mod, int repeat) {
     } else if (key == SDLK_RIGHT || key == SDLK_DOWN) {
         savestate_menu_move(+1);
     } else if (key == SDLK_s) {
-        savestate_menu_submit(1);
+        savestate_menu_request(1);
     } else if (key == SDLK_l) {
-        savestate_menu_submit(0);
+        savestate_menu_request(0);
     } else if (key == SDLK_RETURN || key == SDLK_SPACE) {
-        savestate_menu_submit((mod & KMOD_SHIFT) != 0);
+        savestate_menu_request((mod & KMOD_SHIFT) != 0);
     }
 }
 
@@ -5446,12 +5899,21 @@ static void savestate_menu_poll_nav(uint32_t now_ms) {
     }
     prev_toggle = toggle;
 
-    if (load && !prev_load)
-        savestate_menu_submit(0);
-    if (save && !prev_save)
-        savestate_menu_submit(1);
-    if (cancel && !prev_cancel)
-        savestate_menu_close();
+    /* Pad goes through the same confirmation as the keyboard: A and X are just as
+     * easy to mix up as S and L. While a prompt is up, A confirms and X cancels. */
+    if (savestate_menu_confirm) {
+        if (load && !prev_load)
+            savestate_menu_submit(savestate_menu_confirm == 1);
+        else if ((save && !prev_save) || (cancel && !prev_cancel))
+            savestate_menu_cancel_confirm();
+    } else {
+        if (load && !prev_load)
+            savestate_menu_request(0);
+        if (save && !prev_save)
+            savestate_menu_request(1);
+        if (cancel && !prev_cancel)
+            savestate_menu_close();
+    }
     prev_load = load;
     prev_save = save;
     prev_cancel = cancel;
@@ -5545,8 +6007,8 @@ static void rewind_pause_present(void) {
         SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
         SDL_RenderClear(sdl_renderer);
         if (sdl_texture && s_sw_hold_valid)
-            SDL_RenderCopy(sdl_renderer, sdl_texture, &s_sw_hold_src,
-                           &s_sw_hold_dst);
+            SDL_RenderCopy(sdl_renderer, s_sw_hold_tex ? s_sw_hold_tex : sdl_texture,
+                           &s_sw_hold_src, &s_sw_hold_dst);
         host_osd_draw_sdl(sdl_renderer);
         SDL_RenderPresent(sdl_renderer);
     }
@@ -5667,12 +6129,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Check debug server input override. */
     int override = debug_server_get_input_override();
 #else
-    /* Production: skip debug server. Still need to advance frame counter
-     * locally so anything else that reads it continues to work. */
+    /* Production: no listener. Still advance the frame counter locally, and
+     * still honour the input override — the built-in session script
+     * (psx_script.c) drives "press" through the same handler in release. */
     extern uint64_t s_frame_count;
     s_frame_count++;
-    int override = -1;
+    int override = debug_server_get_input_override();
 #endif
+    /* Built-in session script: one step per vblank at this safe point. */
+    psx_script_poll();
 
     runtime_perf_frame_begin();
     RuntimePerfFrameScope runtime_perf_frame_scope;
@@ -5830,7 +6295,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                     netplay_soft_exit("netplay_escape");
                     return ep;
                 }
-                if (!key_repeat &&
+                if (!key_repeat && system_menu_handle_key(key)) {
+                    /* consumed by the ESC system menu */
+                }
+                else if (!key_repeat &&
                     host_keymap_match(HOST_KEYMAP_REWIND, (int)key, (int)mod)) {
                     psx_rewind_toggle();
                 }
@@ -5848,6 +6316,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                          host_keymap_match(HOST_KEYMAP_DISPLAY_PERF, (int)key,
                                            (int)mod)) {
                     fps_telemetry_toggle();
+                }
+                else if (!key_repeat &&
+                         host_keymap_match(HOST_KEYMAP_BUG_REPORT, (int)key,
+                                           (int)mod)) {
+                    if (!bug_report_capture("hotkey"))
+                        host_osd_push("Bug report: cannot write bundle", 2500);
                 }
                 /* Host volume: config.ini [KeyMap] VolumeUp/VolumeDown
                  * (defaults: keypad +/-). 5% steps; shows right-side bar. */
@@ -6013,6 +6487,24 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      *    entry is touched (via the movie-id byte), so nothing else is disturbed.
      *  - no table configured (generic): hold START so a movie whose handler polls
      *    the pad aborts itself (can't reach unskippable movies). */
+    /* Power-on snapshot for the system menu's Restart. Taken a couple of seconds
+     * in — late enough that the machine is past its most volatile setup and a
+     * save is accepted at a safe block boundary, early enough that restoring it
+     * is indistinguishable from a fresh boot. Once per session; never while
+     * another save/load is staged, and never under netplay (where state moves
+     * are host-coordinated). */
+    {
+        static int s_poweron_frames = 0;
+        static int s_poweron_saved  = 0;
+        if (!s_poweron_saved && !psx_netplay_active() &&
+            !psx_selfcheck_resim_active()) {
+            if (++s_poweron_frames > 120 && !savestate_pending()) {
+                if (savestate_request_save(SAVESTATE_SLOT_POWERON))
+                    s_poweron_saved = 1;
+            }
+        }
+    }
+
     int fmv_skip_active = 0;
     /* Never inject START / poke movie totals under netplay — host-side skip
      * forks peers (and stomps SIO after sealed publish during resim). */
@@ -6059,6 +6551,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 
     if (g_headless) {
         ep.skip_pace = 1;
+        /* Windowless present capture (bug_report screen.png / present_capture):
+         * resolve the scanout the software present would show, run the CPU
+         * video filter on it, and write the PNG — the same buffer contract as
+         * the SDL path minus the window. */
+        if (s_sw_capture_pending) headless_capture_present();
         return ep;
     }
 
@@ -6562,6 +7059,54 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 #ifndef PSX_SDL_NO_RENDER
     int src_w = (int)present_w * active_scale;
     int src_h = (int)h * active_scale;
+    /* Present-time video filter on the software (SDL_Renderer) present: the
+     * CPU reference implementation (video_filter.c) expands the native grid
+     * N times into its own staging buffer + streaming texture. GL/VK presents
+     * filter on the GPU inside their own present paths; a supersampled
+     * software present is left alone (its hi-res grid is already smooth).
+     * Any allocation failure simply presents unfiltered. */
+    const uint32_t* present_px = sdl_pixel_buf;
+    SDL_Texture* present_tex = sdl_texture;
+    int vf_n = 1;
+    if (!g_gl_active && !g_vk_active && active_scale == 1 &&
+        video_filter_get() != VF_NONE && src_w > 0 && src_h > 0 && sdl_renderer) {
+        const int kind = video_filter_get();
+        const int n = video_filter_cpu_scale(kind);
+        const size_t cap_px = (size_t)(640 * 4) * (size_t)(512 * 4);
+        const size_t need = (size_t)src_w * n * (size_t)src_h * n;
+        if (n > 1 && need <= cap_px) {
+            if (!sdl_filter_buf) {
+                sdl_filter_buf = (uint32_t*)std::malloc(cap_px * sizeof(uint32_t));
+                sdl_filter_buf_px = sdl_filter_buf ? cap_px : 0;
+            }
+            if (sdl_filter_texture && sdl_filter_texture_n != n) {
+                SDL_DestroyTexture(sdl_filter_texture);
+                sdl_filter_texture = nullptr;
+                sdl_filter_texture_n = 0;
+            }
+            if (!sdl_filter_texture) {
+                sdl_filter_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                                       SDL_TEXTUREACCESS_STREAMING,
+                                                       640 * n, 512 * n);
+                sdl_filter_texture_n = sdl_filter_texture ? n : 0;
+            }
+            if (sdl_filter_buf && sdl_filter_texture &&
+                video_filter_apply_cpu(kind, sdl_pixel_buf, src_w, src_w, src_h,
+                                       sdl_filter_buf, src_w * n) == n) {
+                present_px = sdl_filter_buf;
+                present_tex = sdl_filter_texture;
+                vf_n = n;
+                src_w *= n;
+                src_h *= n;
+                /* Final fit: the sharp/scanline/CRT prescales are defined as
+                 * "nearest prescale, then linear"; upscaled art follows the
+                 * player's Linear-filter switch like the plain present. */
+                SDL_SetTextureScaleMode(sdl_filter_texture,
+                                        (video_filter_is_upscaler(kind) && !g_video_aa)
+                                            ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
+            }
+        }
+    }
     if (g_gl_active) {
         /* OpenGL present: upload the active display rect and draw a full-screen
          * quad. SDL_GL_SwapWindow handles vsync; the wall-clock pacer above
@@ -6578,14 +7123,31 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     if (!sdl_renderer || !sdl_texture)
         return ep;
     SDL_Rect src = { 0, 0, src_w, src_h };
-    SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
+    if (s_sw_capture_pending) {
+        s_sw_capture_pending = 0;
+        s_sw_capture_result = -1;
+        uint8_t* rgb = (uint8_t*)std::malloc((size_t)src_w * src_h * 3);
+        if (rgb) {
+            for (size_t i = 0; i < (size_t)src_w * src_h; i++) {
+                rgb[i * 3]     = (uint8_t)(present_px[i] >> 16);
+                rgb[i * 3 + 1] = (uint8_t)(present_px[i] >> 8);
+                rgb[i * 3 + 2] = (uint8_t)present_px[i];
+            }
+            if (FILE* f = std::fopen(s_sw_capture_path, "wb")) {
+                s_sw_capture_result = png_write_rgb(f, rgb, (uint32_t)src_w, (uint32_t)src_h) ? 1 : -1;
+                std::fclose(f);
+            }
+            std::free(rgb);
+        }
+    }
+    SDL_UpdateTexture(present_tex, &src, present_px,
                       (int)(src_w * sizeof(uint32_t)));
     /* Short FMV bands only update [0..src_h). Linear sampling at the bottom
      * edge blends with uninitialized texels below (X11 SDL backends often
      * show that as a thin white strip; Wayland may not). Pad one black row
      * so any residual linear fringe is black, matching the letterbox. */
     const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-    const int tex_h = 512 * tex_scale;
+    const int tex_h = 512 * tex_scale * vf_n;
     if (src_w > 0 && src_h > 0 && src_h < tex_h) {
         static uint32_t s_black_pad[640 * 4]; /* covers g_video_scale <= 4 */
         const int pad_cap = (int)(sizeof(s_black_pad) / sizeof(s_black_pad[0]));
@@ -6593,7 +7155,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         for (int i = 0; i < pad_w; i++)
             s_black_pad[i] = 0xFF000000u;
         SDL_Rect pad = { 0, src_h, pad_w, 1 };
-        SDL_UpdateTexture(sdl_texture, &pad, s_black_pad,
+        SDL_UpdateTexture(present_tex, &pad, s_black_pad,
                           (int)(pad_w * sizeof(uint32_t)));
     }
 
@@ -6628,11 +7190,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * bands flashed as a bright strip on some X11 SDL drivers. */
     SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
     SDL_RenderClear(sdl_renderer);
-    SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
+    SDL_RenderCopy(sdl_renderer, present_tex, &src, &dst);
     host_osd_draw_sdl(sdl_renderer);
     /* §33: remember active rect for resim hold-last (not full 640x512). */
     s_sw_hold_src = src;
     s_sw_hold_dst = dst;
+    s_sw_hold_tex = present_tex;
     s_sw_hold_valid = 1;
 
     /* Vsync self-heal. The renderer is created with PRESENTVSYNC for
@@ -8541,6 +9104,33 @@ namespace {
         PSXRecompV4::save_user_settings(g_lnch_settings_path, settings);
     }
 
+}  // namespace (reopened below)
+
+/* ESC-menu video filter change: persist like the launcher does, so the pick
+ * survives a restart. Silent when no settings.toml path is known. */
+static void persist_video_filter_setting(int kind) {
+    if (g_lnch_settings_path.empty()) return;
+    PSXRecompV4::UserSettings settings =
+        PSXRecompV4::load_user_settings(g_lnch_settings_path);
+    if (settings.parse_error) return;
+    settings.video_filter = video_filter_name(kind);
+    settings.has_video_filter = true;
+    (void)PSXRecompV4::save_user_settings(g_lnch_settings_path, settings);
+}
+
+static void persist_scanline_settings(void) {
+    if (g_lnch_settings_path.empty()) return;
+    PSXRecompV4::UserSettings settings =
+        PSXRecompV4::load_user_settings(g_lnch_settings_path);
+    if (settings.parse_error) return;
+    VideoScanlineParams sp; video_filter_scanline_get(&sp);
+    settings.scanline_opacity = sp.opacity; settings.has_scanline_opacity = true;
+    settings.scanline_size    = sp.size;    settings.has_scanline_size = true;
+    settings.scanline_glow    = sp.glow;    settings.has_scanline_glow = true;
+    (void)PSXRecompV4::save_user_settings(g_lnch_settings_path, settings);
+}
+
+namespace {
     void ae_np_set_lobby_url(void*, const char* url) {
         g_lnch_lobby_url = url && url[0] ? url : psx_lobby_default_url();
         ae_np_save_identity(nullptr, g_lnch_lobby_url.c_str());
@@ -10011,6 +10601,17 @@ namespace {
         gi->has_turbo_loads = turbo_loads_offered_b ? 1 : 0;
         gi->has_geometry_precision = 1;
         gi->has_rewind_depth = 1;
+#if defined(RECOMP_LAUNCHER_HAS_VIDEO_FILTER)
+        /* Present-time video filter cycle: the runtime owns the vocabulary
+         * (video_filter.h kinds, in enum order, index == kind). */
+        {
+            static const char* labels[VF_COUNT];
+            for (int k = 0; k < VF_COUNT; k++) labels[k] = video_filter_label(k);
+            gi->has_video_filter = 1;
+            gi->video_filter_names = labels;
+            gi->video_filter_count = VF_COUNT;
+        }
+#endif
         if (language_labels && num_languages > 0) {
             gi->language_labels = language_labels;
             gi->num_languages = num_languages;
@@ -10047,6 +10648,10 @@ namespace {
 #endif
 
 int main(int argc, char** argv) {
+    /* Kept for the ESC menu's Restart, which re-execs this process. */
+    g_saved_argc = argc < 63 ? argc : 63;
+    for (int i = 0; i < g_saved_argc; ++i) g_saved_argv[i] = argv[i];
+    g_saved_argv[g_saved_argc] = nullptr;
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
@@ -10140,6 +10745,10 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--headless") == 0) {
             g_headless = 1;
             force_no_launcher = true;
+        } else if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
+            psx_script_set(argv[++i]);
+        } else if (std::strcmp(argv[i], "--script-file") == 0 && i + 1 < argc) {
+            psx_script_set_file(argv[++i]);
         } else if (std::strcmp(argv[i], "--netplay") == 0) {
             net_cfg.enabled = 1;
         } else if (std::strcmp(argv[i], "--net-slot") == 0 && i + 1 < argc) {
@@ -10182,6 +10791,9 @@ int main(int argc, char** argv) {
             force_no_launcher = true;
         }
     }
+    (void)psx_script_init_from_env();
+    /* A script implies no launcher: it drives the session itself. */
+    if (psx_script_active()) force_no_launcher = true;
 
     std::string default_game_config_storage;
     if (!game_config_path) {
@@ -10378,6 +10990,18 @@ int main(int argc, char** argv) {
                 gc.runtime.video_perspective_texturing ? 1 : 0;
             g_video_renderer   = gc.runtime.video_renderer;
             g_video_screen     = gc.runtime.video_screen_kind;
+            if (!gc.runtime.video_filter.empty()) {
+                int k = 0;
+                if (video_filter_from_name(gc.runtime.video_filter.c_str(), &k))
+                    g_video_filter = k;
+                else
+                    std::fprintf(stdout,
+                                 "psxrecomp: [video] filter \"%s\" is not a known filter — ignored\n",
+                                 gc.runtime.video_filter.c_str());
+            }
+            if (gc.runtime.video_scanline_opacity >= 0) g_scan.opacity = (float)gc.runtime.video_scanline_opacity;
+            if (gc.runtime.video_scanline_size >= 0)    g_scan.size    = (float)gc.runtime.video_scanline_size;
+            if (gc.runtime.video_scanline_glow >= 0)    g_scan.glow    = (float)gc.runtime.video_scanline_glow;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
@@ -10733,6 +11357,13 @@ int main(int argc, char** argv) {
         if (us.has_perspective_texturing)
             g_video_perspective_texturing = us.perspective_texturing ? 1 : 0;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
+        if (us.has_video_filter) {
+            int k = 0;
+            if (video_filter_from_name(us.video_filter.c_str(), &k)) g_video_filter = k;
+        }
+        if (us.has_scanline_opacity) g_scan.opacity = (float)us.scanline_opacity;
+        if (us.has_scanline_size)    g_scan.size    = (float)us.scanline_size;
+        if (us.has_scanline_glow)    g_scan.glow    = (float)us.scanline_glow;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
         /* turbo_loads is deliberately NOT restored from settings.toml. It is a
          * write-only latch: the launcher stopped drawing a Turbo loads row when
@@ -10890,6 +11521,11 @@ int main(int argc, char** argv) {
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = std::getenv("PSX_VIDEO_FILTER")) {
+        int k = 0;
+        if (video_filter_from_name(e, &k)) g_video_filter = k;
+        else std::fprintf(stdout, "psxrecomp: PSX_VIDEO_FILTER=\"%s\" is not a known filter — ignored\n", e);
+    }
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
         psx_smooth_60fps_set(atoi(e) ? 1 : 0);
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
@@ -11159,6 +11795,7 @@ int main(int argc, char** argv) {
             seed.perspective_texturing = (g_video_perspective_texturing != 0);
             seed.has_perspective_texturing = true;
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
+            seed.video_filter = video_filter_name(g_video_filter); seed.has_video_filter = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);
             seed.has_auto_skip_fmv = skip_fmv_offered;
             seed.turbo_loads = (g_turbo_loads_enabled != 0);
@@ -11329,6 +11966,9 @@ int main(int argc, char** argv) {
             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
             ls.screen_kind        = seed.screen_kind;
+#if defined(RECOMP_LAUNCHER_HAS_VIDEO_FILTER)
+            ls.video_filter       = g_video_filter;
+#endif
             ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
             ls.frame_interp_fps   = seed.frame_interpolation_fps;
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
@@ -11564,6 +12204,11 @@ int main(int argc, char** argv) {
                 seed.perspective_texturing = ls.perspective_texturing != 0;
                 seed.has_perspective_texturing = true;
                 seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
+#if defined(RECOMP_LAUNCHER_HAS_VIDEO_FILTER)
+                g_video_filter = (ls.video_filter >= 0 && ls.video_filter < VF_COUNT)
+                                     ? ls.video_filter : VF_NONE;
+                seed.video_filter = video_filter_name(g_video_filter); seed.has_video_filter = true;
+#endif
                 seed.frame_interpolation   = ls.frame_interp != 0;     seed.has_frame_interpolation   = true;
                 seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
                 seed.audio_freq            = ls.audio_freq;            seed.has_audio_freq            = true;
@@ -12139,6 +12784,13 @@ session_reboot:
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);
+    /* Present-time video filter (video_filter.h). Default none = the
+     * historical present path, untouched. */
+    video_filter_set(g_video_filter);
+    video_filter_scanline_set(&g_scan);
+    video_filter_scanline_get(&g_scan);   /* clamped */
+    if (g_video_filter != VF_NONE)
+        std::fprintf(stdout, "psxrecomp: video filter %s\n", video_filter_name(g_video_filter));
     if (g_video_scale > 1 || g_video_texfilter)
         std::fprintf(stdout,
                      "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",
@@ -13073,6 +13725,7 @@ session_reboot:
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();
     if (g_vk_active) vk_renderer_shutdown();
+    SDL_DestroyTexture(sdl_filter_texture); /* NULL-safe */
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);
@@ -13122,6 +13775,9 @@ soft_return_lobby:
         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
         ls.screen_kind = g_video_screen;
+#if defined(RECOMP_LAUNCHER_HAS_VIDEO_FILTER)
+        ls.video_filter = g_video_filter;
+#endif
         ls.frame_interp = g_frame_interpolation ? 1 : 0;
         ls.frame_interp_fps = g_frame_interpolation_fps;
         ls.spu_hq = g_audio_spu_hq ? 1 : 0;
@@ -13377,6 +14033,11 @@ soft_return_lobby:
                 us.has_perspective_texturing = true;
                 us.screen_kind = ls.screen_kind;
                 us.has_screen_kind = true;
+#if defined(RECOMP_LAUNCHER_HAS_VIDEO_FILTER)
+                us.video_filter = video_filter_name(
+                    (ls.video_filter >= 0 && ls.video_filter < VF_COUNT) ? ls.video_filter : VF_NONE);
+                us.has_video_filter = true;
+#endif
                 us.frame_interpolation = ls.frame_interp != 0;
                 us.has_frame_interpolation = true;
                 us.frame_interpolation_fps = ls.frame_interp_fps;
@@ -13429,6 +14090,17 @@ soft_return_lobby:
             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;
             g_video_screen = ls.screen_kind;
+#if defined(RECOMP_LAUNCHER_HAS_VIDEO_FILTER)
+            {
+                const int vf = (ls.video_filter >= 0 && ls.video_filter < VF_COUNT)
+                                   ? ls.video_filter : VF_NONE;
+                if (vf != g_video_filter) {
+                    g_video_filter = vf;
+                    video_filter_set(vf);
+                    gl_renderer_invalidate_present();
+                }
+            }
+#endif
             /* Load acceleration and FMV skipping are mod-owned on PSX, and the
              * launcher struct these come from was snapshotted BEFORE
              * mod_runtime_activate_plugins() ran. Applying them here would

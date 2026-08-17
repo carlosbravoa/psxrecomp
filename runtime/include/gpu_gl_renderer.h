@@ -49,6 +49,24 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 
+/* Present-time video filter (video_filter.h) diagnostics: the kind last drawn
+ * through the filter path, a bitmask of kinds whose shaders failed this
+ * session (those fall back to the plain present), and pass/fallback counters. */
+void gl_renderer_video_filter_diag(int *last_kind, unsigned *broken_mask,
+                                   uint64_t *passes, uint64_t *fallbacks);
+/* Source rect (texels), native size, and letterbox of the last filtered draw. */
+void gl_renderer_video_filter_last_rect(int out[10]);
+
+/* One-shot capture of the next presented drawable (post-filter, pre-OSD) to a
+ * PNG at `path`. Returns 1 if queued. Poll gl_renderer_present_capture_result():
+ * 0 = still pending / nothing queued, 1 = written, -1 = failed. Used by the
+ * debug server's "present_capture" for filter parity checks. */
+int gl_renderer_request_present_capture(const char *path);
+int gl_renderer_present_capture_result(void);
+/* Whether a capture also writes the .src/.up/.ref parity companions
+ * (default on; bug-report bundles turn it off for a plain screen.png). */
+void gl_renderer_present_capture_companions(int on);
+
 /* §33: re-present the last Live frame captured before Swap (or from a VRAM
  * snapshot when interpolation owned the last present). Used during rollback
  * resim so the window keeps a wall-clock present cadence without reading

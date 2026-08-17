@@ -96,6 +96,15 @@ int psx_mod_set_fixed_display_aspect(uint32_t numerator,
 int psx_mod_set_adaptive_display_aspect(uint32_t max_numerator,
                                         uint32_t max_denominator);
 /*
+ * Select a present-time video filter by its config token ("none", "sharp",
+ * "scale2x", "scale3x", "2xsai", "super2xsai", "supereagle", "xbr2x",
+ * "xbr3x", "xbr4x", "scanlines", "crt" — see runtime/include/video_filter.h).
+ * Presentation only (never touches VRAM, digests or oracle frames); applies
+ * immediately and overrides the launcher/settings value for the session.
+ * Returns 1 on success, 0 for an unknown token.
+ */
+int psx_mod_set_video_filter(const char* name);
+/*
  * Set the wall-clock cadence of simulated guest VBlanks. A value of zero
  * removes frontend pacing; 60 and higher request that many native guest
  * update opportunities per host second. This intentionally changes whole-

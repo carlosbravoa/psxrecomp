@@ -290,6 +290,16 @@ if(BUILD_TESTING)
     target_include_directories(gpu_sw_edges_test PRIVATE src)
     add_test(NAME gpu_sw_edges_test COMMAND gpu_sw_edges_test)
 
+    # Present-time video filters: the CPU reference the GL shaders are held to.
+    add_executable(video_filter_test
+        tests/test_video_filter.c
+        src/video_filter.c)
+    target_include_directories(video_filter_test PRIVATE include)
+    if(NOT WIN32)
+        target_link_libraries(video_filter_test PRIVATE m)
+    endif()
+    add_test(NAME video_filter_test COMMAND video_filter_test)
+
     add_executable(gpu_vk_upload_alignment_test
         tests/test_gpu_vk_upload_alignment.c)
     target_include_directories(gpu_vk_upload_alignment_test PRIVATE src)

@@ -23,6 +23,19 @@ extern "C" {
  */
 
 #define SAVESTATE_SLOTS 12
+/* One reserved slot BEYOND the user's 12, addressable by the same slot API but
+ * never listed by the save-state browser: the system menu's "skip point", a
+ * scratch snapshot for jumping past the intro on a test run. Keeping it out of
+ * the 12 means a developer shortcut can never quietly overwrite a player's save.
+ * Bounds checks use SAVESTATE_SLOT_TOTAL; anything that ENUMERATES slots for the
+ * UI still uses SAVESTATE_SLOTS. */
+#define SAVESTATE_SLOT_SKIP_POINT 12
+/* Second reserved slot: a snapshot of this session taken shortly after boot, so
+ * "Restart Game" can put the machine back to power-on WITHOUT killing the
+ * process (a re-exec drops the player back to the launcher). Refreshed every
+ * launch, so it always matches the running build. */
+#define SAVESTATE_SLOT_POWERON    13
+#define SAVESTATE_SLOT_TOTAL      14
 #define SAVESTATE_THUMB_W 128
 #define SAVESTATE_THUMB_H 96
 
@@ -84,6 +97,9 @@ int savestate_slot_compatible(int slot, char* reason, size_t reason_cap);
  * netplay guest — only the match host may initiate user save/load). */
 int savestate_request_save(int slot);
 int savestate_request_load(int slot);
+/* Slot-less save to an explicit file (bug-report bundles): same safe-point
+ * staging as a slot save, no thumbnail, never shown in the slot UI. */
+int savestate_request_save_path(const char* path);
 
 /* Netplay follow-host sync only. Bypasses the guest user-initiation guard so
  * the guest can write/apply the host-authoritative slot during probe/transfer. */

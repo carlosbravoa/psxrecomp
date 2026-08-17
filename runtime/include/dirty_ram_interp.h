@@ -140,6 +140,7 @@ void     dirty_ram_reset_for_boot(void);
  * so native overlays re-hash against restored bytes; also drop sticky
  * text_diverged/modified bitmaps (host-only — restored RAM may match ref). */
 void     overlay_watch_invalidate_after_ram_restore(void);
+void     overlay_watch_bump_all_page_gen(void);
 void     dirty_ram_text_guard_resync_after_restore(void);
 void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,

@@ -72,6 +72,8 @@
 #include "host_time.h"
 #include "latency_ring.h"
 #include "psx_rewind.h"
+#include "video_filter.h"
+#include "png_write.h"
 
 #include "psx_sdl.h"
 #if defined(PSX_SDL3)
@@ -147,6 +149,8 @@ typedef void   (APIENTRY *PFN_glUniform1f)(GLint, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform4i)(GLint, GLint, GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
+typedef void   (APIENTRY *PFN_glUniform2f)(GLint, GLfloat, GLfloat);
+typedef void   (APIENTRY *PFN_glUniform3f)(GLint, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendColor)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
 typedef void   (APIENTRY *PFN_glBlendEquationSeparate)(GLenum, GLenum);
@@ -212,6 +216,8 @@ static PFN_glUniform1f         p_glUniform1f;
 static PFN_glUniform2i         p_glUniform2i;
 static PFN_glUniform4i         p_glUniform4i;
 static PFN_glUniform4f         p_glUniform4f;
+static PFN_glUniform2f         p_glUniform2f;
+static PFN_glUniform3f         p_glUniform3f;
 static PFN_glBlendColor        p_glBlendColor;
 static PFN_glBlendFuncSeparate p_glBlendFuncSeparate;
 static PFN_glBlendEquationSeparate p_glBlendEquationSeparate;
@@ -269,6 +275,8 @@ static int load_modern_gl(void) {
     LOAD(p_glUniform1f, "glUniform1f");
     LOAD(p_glUniform2i, "glUniform2i"); LOAD(p_glUniform4i, "glUniform4i");
     LOAD(p_glUniform4f, "glUniform4f");
+    LOAD(p_glUniform2f, "glUniform2f");
+    LOAD(p_glUniform3f, "glUniform3f");
     LOAD(p_glBlendColor, "glBlendColor");
     LOAD(p_glBlendFuncSeparate, "glBlendFuncSeparate");
     LOAD(p_glBlendEquationSeparate, "glBlendEquationSeparate");
@@ -765,7 +773,19 @@ static void letterbox_rect_aspect(int ww, int wh, int num, int den,
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h);
 static void present_target_quad(GLuint tex, int tex_w, int tex_h,
                                 int x, int y, int w, int h, int linear,
-                                int lx, int ly, int lw, int lh, int v_flip);
+                                int lx, int ly, int lw, int lh, int v_flip,
+                                int native_w, int native_h);
+/* Present-time video filter helpers (defined next to present_target_quad). */
+static void   vf_reset_gl_state(void);
+static int    vf_ensure_programs(int kind);
+static GLuint vf_fbo_for_current_context(void);
+static void   vf_ensure_tex(GLuint *tex, int *cur_w, int *cur_h, int w, int h);
+static int    vf_present(GLuint tex, int tex_w, int tex_h, int x, int y, int w, int h,
+                         int native_w, int native_h, int lx, int ly, int lw, int lh, int v_flip);
+static void   vf_capture_drawable_if_pending(void);
+static void   vf_capture_source(GLuint tex, int rx, int ry, int rw, int rh, int kind);
+static GLuint s_vf_blend_tex;                      /* interp blend target */
+static int    s_vf_blend_w, s_vf_blend_h;
 
 static void coh_record(int kind, int x0, int y0, int x1, int y1) {
     GlCohEvent *e = &s_coh_ring[s_coh_seq % GL_COH_RING_CAP];
@@ -2823,6 +2843,7 @@ void gl_renderer_shutdown(void) {
     s_osd_tex = 0;
     s_osd_tw = 0;
     s_osd_th = 0;
+    vf_reset_gl_state();
     s_depth24_skip_up = 0;
     rect_clear(&s_d24_skip_fb);
     hold_invalidate();
@@ -2877,6 +2898,23 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
     upload_present_tex(pixels, src_w, src_h, linear);
+    /* Opt-in video filter: same rect semantics as the plain draw below (the
+     * cropped width, when any, is the visible content). */
+    if (video_filter_get() != VF_NONE && src_w > 0 && src_h > 0) {
+        const int vw = crop ? content_w : src_w;
+        if (vf_present(s_present_tex, src_w, src_h, 0, 0, vw, src_h, vw, src_h,
+                       lx, ly, lw, lh, 1)) {
+            pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
+            hold_capture_drawable();
+            latency_ring_mark(LAT_SWAP_BEGIN);
+            gl_swap_with_osd();
+            latency_ring_mark(LAT_SWAP_END);
+            s_probe_swap++;
+            present_force_consumed();
+            s_last_present_path = GL_PRES_CPU;
+            return;
+        }
+    }
     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
     if (crop) {
         /* Cropped present keeps left-aligned content; still inset so linear
@@ -3749,8 +3787,32 @@ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
         p_glWaitSync(s_interp_fence[prev], 0, PSXGL_TIMEOUT_IGNORED);
     if (s_interp_fence[curr])
         p_glWaitSync(s_interp_fence[curr], 0, PSXGL_TIMEOUT_IGNORED);
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
-    glViewport(lx, ly, lw, lh);
+    /* Opt-in video filter: blend prev/curr into an offscreen texture at the
+     * history resolution, then run the same filtered present on it. Falls
+     * back to the direct blend below on any failure. */
+    int vf_target = 0;
+    GLuint vf_fbo = 0;
+    if (video_filter_get() != VF_NONE && s_interp_w > 0 && s_interp_h > 0 &&
+        vf_ensure_programs(video_filter_get())) {
+        vf_fbo = vf_fbo_for_current_context();
+        if (vf_fbo) {
+            vf_ensure_tex(&s_vf_blend_tex, &s_vf_blend_w, &s_vf_blend_h, s_interp_w, s_interp_h);
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, vf_fbo);
+            p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                     s_vf_blend_tex, 0);
+            if (p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER) == PSXGL_FRAMEBUFFER_COMPLETE) {
+                vf_target = 1;
+                glDisable(GL_SCISSOR_TEST);
+                glViewport(0, 0, s_interp_w, s_interp_h);
+            } else {
+                p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+            }
+        }
+    }
+    if (!vf_target) {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+        glViewport(lx, ly, lw, lh);
+    }
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_interp_tex[prev]);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, s_interp_linear ? GL_LINEAR : GL_NEAREST);
@@ -3764,12 +3826,34 @@ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
     p_glUniform1i(s_interp_uCurr, 1);
     p_glUniform1f(s_interp_uAlpha, alpha);
     p_glUniform1i(s_interp_uBlendMode, s_interp_blend_mode);
-    p_glUniform4f(s_interp_uUvRect, 0.f, 0.f, 1.f, 1.f);
+    /* Offscreen blend: keep the history orientation (row 0 = top) so the
+     * filtered present can treat it like every other picture source. */
+    if (vf_target) p_glUniform4f(s_interp_uUvRect, 0.f, 1.f, 1.f, 0.f);
+    else           p_glUniform4f(s_interp_uUvRect, 0.f, 0.f, 1.f, 1.f);
     p_glBindVertexArray(s_interp_thread_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
     p_glActiveTexture(PSXGL_TEXTURE0);
+    if (vf_target) {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+        const int S = s_scale > 0 ? s_scale : 1;
+        if (!vf_present(s_vf_blend_tex, s_interp_w, s_interp_h, 0, 0, s_interp_w, s_interp_h,
+                        s_interp_w / S, s_interp_h / S, lx, ly, lw, lh, 1)) {
+            /* Filter refused after the blend: draw the blend texture plainly. */
+            glViewport(lx, ly, lw, lh);
+            glBindTexture(GL_TEXTURE_2D, s_vf_blend_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, s_interp_linear ? GL_LINEAR : GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, s_interp_linear ? GL_LINEAR : GL_NEAREST);
+            p_glUseProgram(s_present_prog);
+            p_glUniform1i(s_present_uTex, 0);
+            p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
+            p_glBindVertexArray(s_interp_thread_vao);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            p_glBindVertexArray(0);
+            p_glUseProgram(0);
+        }
+    }
 }
 
 static int interp_present(void) {
@@ -3923,6 +4007,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
 
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
 static void gl_swap_with_osd(void) {
+    vf_capture_drawable_if_pending();
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -3961,10 +4046,375 @@ static void gl_swap_with_osd(void) {
     SDL_GL_SwapWindow(s_win);
 }
 
+/* ---- present-time video filters (video_filter.h) ---------------------------
+ *
+ * Two GPU passes at most, both fed by the CPU reference's contract:
+ *   pass A (upscalers only): source rect -> s_vf_tex at (w*N, h*N) texels via
+ *          the per-kind fragment shader (gpu_gl_filter_shaders.h);
+ *   pass B (always): VF_FINAL_FS draws either s_vf_tex (mode sharp) or the
+ *          source rect (sharp / scanlines / crt) into the letterbox viewport.
+ * VF_NONE never enters here — the caller keeps the historical present path,
+ * so the default is byte-identical to a build without the feature. Any
+ * shader-compile failure marks that kind broken for the session and the
+ * caller falls back to the plain present (recorded in the diag counters,
+ * readable through the debug server; nothing is retried per frame). */
+#include "gpu_gl_filter_shaders.h"
+
+static GLuint s_vf_up_prog[VF_COUNT];              /* per-kind upscaler programs (xBR shared) */
+static GLint  s_vf_up_uTex[VF_COUNT], s_vf_up_uRect[VF_COUNT], s_vf_up_uScale[VF_COUNT];
+static GLuint s_vf_final_prog = 0;
+static GLint  s_vf_f_uTex = -1, s_vf_f_uRect = -1, s_vf_f_uTexSize = -1, s_vf_f_uOut = -1,
+              s_vf_f_uNative = -1, s_vf_f_uMode = -1, s_vf_f_uUvRect = -1, s_vf_f_uScan = -1;
+static uint32_t s_vf_broken = 0;                   /* bit per kind: shader failed */
+/* Pass-A output, one per GL context (main / interp thread) — container objects
+ * (FBOs) are per-context anyway and a texture resized from two contexts at
+ * once would race; index = the same slot vf_fbo_slot() hands out. */
+static GLuint s_vf_tex[2];
+static int    s_vf_tex_w[2], s_vf_tex_h[2];
+/* FBOs are per-context objects: one for the main context, one for the interp thread. */
+static SDL_GLContext s_vf_fbo_ctx[2];
+static GLuint        s_vf_fbo[2];
+static uint64_t s_vf_passes = 0, s_vf_fallbacks = 0;
+static int      s_vf_last_kind = 0;
+static int      s_vf_last_rect[10];                /* rx,ry,rw,rh,native_w,native_h,lx,ly,lw,lh */
+/* One-shot capture of the presented drawable (debug server "present_capture"). */
+static char s_vf_capture_path[512];
+static int  s_vf_capture_pending = 0;
+static int  s_vf_capture_result = 0;   /* 0 idle/none, 1 ok, -1 failed */
+static int  s_vf_capture_companions = 1;   /* also write .src/.up/.ref companions */
+
+static void vf_reset_gl_state(void) {
+    for (int k = 0; k < VF_COUNT; k++) s_vf_up_prog[k] = 0;
+    s_vf_final_prog = 0;
+    s_vf_broken = 0;
+    for (int i = 0; i < 2; i++) { s_vf_tex[i] = 0; s_vf_tex_w[i] = s_vf_tex_h[i] = 0; }
+    s_vf_blend_tex = 0; s_vf_blend_w = s_vf_blend_h = 0;
+    for (int i = 0; i < 2; i++) { s_vf_fbo_ctx[i] = NULL; s_vf_fbo[i] = 0; }
+}
+
+static const char *vf_up_source(int kind) {
+    switch (kind) {
+    case VF_SCALE2X:     return VF_SCALE2X_FS;
+    case VF_SCALE3X:     return VF_SCALE3X_FS;
+    case VF_SAI2X:       return VF_SAI2X_FS;
+    case VF_SUPER_SAI2X: return VF_SUPER_SAI2X_FS;
+    case VF_SUPER_EAGLE: return VF_SUPER_EAGLE_FS;
+    case VF_XBR2X: case VF_XBR3X: case VF_XBR4X: return VF_XBR_FS;
+    default: return NULL;
+    }
+}
+
+/* Lazily build the programs `kind` needs. Returns 0 (and marks the kind
+ * broken) if a shader fails, so the caller falls back to the plain present. */
+static int vf_ensure_programs(int kind) {
+    if (kind <= VF_NONE || kind >= VF_COUNT) return 0;
+    if (s_vf_broken & (1u << kind)) return 0;
+    if (!s_vf_final_prog) {
+        s_vf_final_prog = build_program(PRESENT_VS, VF_FINAL_FS);
+        if (!s_vf_final_prog) { s_vf_broken |= ~0u; return 0; }
+        s_vf_f_uTex     = p_glGetUniformLocation(s_vf_final_prog, "u_tex");
+        s_vf_f_uRect    = p_glGetUniformLocation(s_vf_final_prog, "u_rect");
+        s_vf_f_uTexSize = p_glGetUniformLocation(s_vf_final_prog, "u_texsize");
+        s_vf_f_uOut     = p_glGetUniformLocation(s_vf_final_prog, "u_out");
+        s_vf_f_uNative  = p_glGetUniformLocation(s_vf_final_prog, "u_native");
+        s_vf_f_uMode    = p_glGetUniformLocation(s_vf_final_prog, "u_mode");
+        s_vf_f_uUvRect  = p_glGetUniformLocation(s_vf_final_prog, "u_uv_rect");
+        s_vf_f_uScan    = p_glGetUniformLocation(s_vf_final_prog, "u_scan");
+    }
+    if (video_filter_is_upscaler(kind) && !s_vf_up_prog[kind]) {
+        /* xBR 2x/3x/4x share one program (u_scale). */
+        int share = (kind == VF_XBR3X || kind == VF_XBR4X) ? VF_XBR2X : kind;
+        if (!s_vf_up_prog[share]) {
+            const char *src = vf_up_source(share);
+            GLuint p = src ? build_program(VF_UP_VS, src) : 0;
+            if (!p) { s_vf_broken |= (1u << kind); return 0; }
+            s_vf_up_prog[share]   = p;
+            s_vf_up_uTex[share]   = p_glGetUniformLocation(p, "u_tex");
+            s_vf_up_uRect[share]  = p_glGetUniformLocation(p, "u_rect");
+            s_vf_up_uScale[share] = p_glGetUniformLocation(p, "u_scale");
+        }
+        s_vf_up_prog[kind]   = s_vf_up_prog[share];
+        s_vf_up_uTex[kind]   = s_vf_up_uTex[share];
+        s_vf_up_uRect[kind]  = s_vf_up_uRect[share];
+        s_vf_up_uScale[kind] = s_vf_up_uScale[share];
+    }
+    return 1;
+}
+
+/* Slot (0/1) of the current GL context's FBO + pass-A texture; -1 if none free. */
+static int vf_slot_for_current_context(void) {
+    SDL_GLContext cur = SDL_GL_GetCurrentContext();
+    for (int i = 0; i < 2; i++)
+        if (s_vf_fbo_ctx[i] == cur && s_vf_fbo[i]) return i;
+    for (int i = 0; i < 2; i++) {
+        if (!s_vf_fbo[i]) {
+            p_glGenFramebuffers(1, &s_vf_fbo[i]);
+            s_vf_fbo_ctx[i] = cur;
+            return i;
+        }
+    }
+    return -1;
+}
+static GLuint vf_fbo_for_current_context(void) {
+    const int slot = vf_slot_for_current_context();
+    return slot < 0 ? 0 : s_vf_fbo[slot];
+}
+
+static GLuint vf_current_vao(void) {
+    if (s_interp_ctx && SDL_GL_GetCurrentContext() == s_interp_ctx && s_interp_thread_vao)
+        return s_interp_thread_vao;
+    return s_present_vao;
+}
+
+static void vf_ensure_tex(GLuint *tex, int *cur_w, int *cur_h, int w, int h) {
+    if (!*tex) {
+        glGenTextures(1, tex);
+        glBindTexture(GL_TEXTURE_2D, *tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        *cur_w = *cur_h = 0;
+    } else {
+        glBindTexture(GL_TEXTURE_2D, *tex);
+    }
+    if (*cur_w != w || *cur_h != h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        *cur_w = w; *cur_h = h;
+    }
+}
+
+/* Draw the filtered present of (tex, rect) into the letterbox viewport.
+ *   tex_w/tex_h : the texture size the caller reasons in (may be the native
+ *                 VRAM size while the texture is s_scale times larger — the
+ *                 real size is queried, and the rect scaled to real texels);
+ *   x,y,w,h     : source rect in the caller's units; native_w/native_h : the
+ *                 unscaled PS1 size of that rect (scanline pitch);
+ *   v_flip      : 1 = texel row 0 is the top of the picture (every source we
+ *                 filter), 0 = bottom-up (screen captures — never filtered).
+ * Returns 1 if it drew, 0 if the caller must fall back to the plain present. */
+static int vf_present(GLuint tex, int tex_w, int tex_h, int x, int y, int w, int h,
+                      int native_w, int native_h, int lx, int ly, int lw, int lh, int v_flip) {
+    const int kind = video_filter_get();
+    if (kind == VF_NONE || !v_flip || w <= 0 || h <= 0 || tex_w <= 0 || tex_h <= 0)
+        return 0;
+    if (!vf_ensure_programs(kind)) { s_vf_fallbacks++; return 0; }
+
+    /* Real texel size of the bound texture (hr textures are s_scale x native). */
+    GLint real_w = 0, real_h = 0;
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &real_w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &real_h);
+    if (real_w <= 0 || real_h <= 0) { s_vf_fallbacks++; return 0; }
+    const int sx = real_w / tex_w > 0 ? real_w / tex_w : 1;
+    const int sy = real_h / tex_h > 0 ? real_h / tex_h : 1;
+    int rx = x * sx, ry = y * sy, rw = w * sx, rh = h * sy;
+    if (rx < 0) rx = 0; if (ry < 0) ry = 0;
+    if (rx + rw > real_w) rw = real_w - rx;
+    if (ry + rh > real_h) rh = real_h - ry;
+    if (rw <= 0 || rh <= 0) { s_vf_fallbacks++; return 0; }
+    if (native_w <= 0) native_w = w;
+    if (native_h <= 0) native_h = h;
+    vf_capture_source(tex, rx, ry, rw, rh, kind);
+
+    GLuint final_tex = tex;
+    int f_tw = real_w, f_th = real_h;
+    int f_rx = rx, f_ry = ry, f_rw = rw, f_rh = rh;
+    const int N = video_filter_scale(kind);
+    if (N > 1) {
+        const int ow = rw * N, oh = rh * N;
+        if (ow > 8192 || oh > 8192) { s_vf_fallbacks++; return 0; }
+        const int slot = vf_slot_for_current_context();
+        if (slot < 0) { s_vf_fallbacks++; return 0; }
+        GLuint fbo = s_vf_fbo[slot];
+        vf_ensure_tex(&s_vf_tex[slot], &s_vf_tex_w[slot], &s_vf_tex_h[slot], ow, oh);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_vf_tex[slot], 0);
+        if (p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER) != PSXGL_FRAMEBUFFER_COMPLETE) {
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+            s_vf_broken |= (1u << kind); s_vf_fallbacks++; return 0;
+        }
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_BLEND);
+        glViewport(0, 0, ow, oh);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        p_glUseProgram(s_vf_up_prog[kind]);
+        p_glUniform1i(s_vf_up_uTex[kind], 0);
+        p_glUniform4i(s_vf_up_uRect[kind], rx, ry, rw, rh);
+        p_glUniform1i(s_vf_up_uScale[kind], N);
+        p_glBindVertexArray(vf_current_vao());
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        p_glBindVertexArray(0);
+        if (s_vf_capture_pending && s_vf_capture_companions) {
+            /* Diagnostic companion: the raw upscaler output before the final
+             * fit (`<path>.up.png`), so pass A and pass B can be blamed apart. */
+            uint8_t *rgb = (uint8_t *)malloc((size_t)ow * oh * 3);
+            if (rgb) {
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glReadPixels(0, 0, ow, oh, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+                char path[560];
+                snprintf(path, sizeof path, "%s.up.png", s_vf_capture_path);
+                FILE *f = fopen(path, "wb");
+                if (f) { png_write_rgb(f, rgb, (uint32_t)ow, (uint32_t)oh); fclose(f); }
+                free(rgb);
+            }
+        }
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+        final_tex = s_vf_tex[slot];
+        f_tw = ow; f_th = oh; f_rx = 0; f_ry = 0; f_rw = ow; f_rh = oh;
+    }
+
+    /* Pass B: final draw into the letterbox rect. */
+    int mode = 0;
+    if (kind == VF_SCANLINES) mode = 1;
+    else if (kind == VF_CRT) mode = 2;
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    glViewport(lx, ly, lw, lh);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, final_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    p_glUseProgram(s_vf_final_prog);
+    p_glUniform1i(s_vf_f_uTex, 0);
+    p_glUniform4f(s_vf_f_uRect, (float)f_rx, (float)f_ry, (float)f_rw, (float)f_rh);
+    p_glUniform2f(s_vf_f_uTexSize, (float)f_tw, (float)f_th);
+    p_glUniform2f(s_vf_f_uOut, (float)lw, (float)lh);
+    p_glUniform2f(s_vf_f_uNative, (float)native_w, (float)native_h);
+    p_glUniform1i(s_vf_f_uMode, mode);
+    {
+        VideoScanlineParams sp;
+        video_filter_scanline_get(&sp);
+        p_glUniform3f(s_vf_f_uScan, sp.opacity, sp.size, sp.glow);
+    }
+    /* Row 0 = top: PRESENT_VS maps the top of the quad to v = u_uv_rect.y. */
+    p_glUniform4f(s_vf_f_uUvRect, 0.f, 0.f, 1.f, 1.f);
+    p_glBindVertexArray(vf_current_vao());
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    /* Leave the source texture on the caller's filter expectation (nearest is
+     * the historical default; the plain path re-sets it every draw anyway). */
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    s_vf_passes++;
+    s_vf_last_kind = kind;
+    s_vf_last_rect[0] = rx; s_vf_last_rect[1] = ry; s_vf_last_rect[2] = rw; s_vf_last_rect[3] = rh;
+    s_vf_last_rect[4] = native_w; s_vf_last_rect[5] = native_h;
+    s_vf_last_rect[6] = lx; s_vf_last_rect[7] = ly; s_vf_last_rect[8] = lw; s_vf_last_rect[9] = lh;
+    return 1;
+}
+
+void gl_renderer_video_filter_last_rect(int out[10]) {
+    for (int i = 0; i < 10; i++) out[i] = s_vf_last_rect[i];
+}
+
+void gl_renderer_video_filter_diag(int *last_kind, unsigned *broken_mask,
+                                   uint64_t *passes, uint64_t *fallbacks) {
+    if (last_kind)   *last_kind = s_vf_last_kind;
+    if (broken_mask) *broken_mask = s_vf_broken;
+    if (passes)      *passes = s_vf_passes;
+    if (fallbacks)   *fallbacks = s_vf_fallbacks;
+}
+
+int gl_renderer_request_present_capture(const char *path) {
+    if (!path || !path[0]) return 0;
+    strncpy(s_vf_capture_path, path, sizeof s_vf_capture_path - 1);
+    s_vf_capture_path[sizeof s_vf_capture_path - 1] = 0;
+    s_vf_capture_result = 0;
+    s_vf_capture_pending = 1;
+    return 1;
+}
+
+int gl_renderer_present_capture_result(void) {
+    return s_vf_capture_pending ? 0 : s_vf_capture_result;
+}
+
+/* Companion files of a pending present_capture: the exact source rect the
+ * filter consumed (`<path>.src.png`, native texels, top-down) and, for the
+ * upscalers, the CPU reference of that same input (`<path>.ref.png`) — the
+ * pixel-parity oracle for the shader path. Called from vf_present with the
+ * source texture bound and its real-texel rect resolved. */
+void gl_renderer_present_capture_companions(int on) { s_vf_capture_companions = on ? 1 : 0; }
+
+static void vf_capture_source(GLuint tex, int rx, int ry, int rw, int rh, int kind) {
+    if (!s_vf_capture_pending || !s_vf_capture_companions) return;
+    GLuint fbo = vf_fbo_for_current_context();
+    if (!fbo || rw <= 0 || rh <= 0) return;
+    uint32_t *argb = (uint32_t *)malloc((size_t)rw * rh * sizeof(uint32_t));
+    uint8_t  *rgb  = (uint8_t *)malloc((size_t)rw * rh * 3);
+    if (!argb || !rgb) { free(argb); free(rgb); return; }
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, fbo);
+    p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(rx, ry, rw, rh, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+    p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    char path[560];
+    snprintf(path, sizeof path, "%s.src.png", s_vf_capture_path);
+    FILE *f = fopen(path, "wb");
+    if (f) { png_write_rgb(f, rgb, (uint32_t)rw, (uint32_t)rh); fclose(f); }
+    const int N = video_filter_scale(kind);
+    if (N > 1) {
+        for (size_t i = 0; i < (size_t)rw * rh; i++)
+            argb[i] = 0xFF000000u | ((uint32_t)rgb[i * 3] << 16) |
+                      ((uint32_t)rgb[i * 3 + 1] << 8) | rgb[i * 3 + 2];
+        uint32_t *out = (uint32_t *)malloc((size_t)rw * N * rh * N * sizeof(uint32_t));
+        uint8_t  *orgb = (uint8_t *)malloc((size_t)rw * N * rh * N * 3);
+        if (out && orgb &&
+            video_filter_apply_cpu(kind, argb, rw, rw, rh, out, rw * N) == N) {
+            for (size_t i = 0; i < (size_t)rw * N * rh * N; i++) {
+                orgb[i * 3]     = (uint8_t)(out[i] >> 16);
+                orgb[i * 3 + 1] = (uint8_t)(out[i] >> 8);
+                orgb[i * 3 + 2] = (uint8_t)out[i];
+            }
+            snprintf(path, sizeof path, "%s.ref.png", s_vf_capture_path);
+            f = fopen(path, "wb");
+            if (f) { png_write_rgb(f, orgb, (uint32_t)(rw * N), (uint32_t)(rh * N)); fclose(f); }
+        }
+        free(out); free(orgb);
+    }
+    free(argb); free(rgb);
+}
+
+/* Read the just-drawn default framebuffer (before OSD / swap) into a PNG. */
+static void vf_capture_drawable_if_pending(void) {
+    if (!s_vf_capture_pending) return;
+    s_vf_capture_pending = 0;
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww < 1 || wh < 1) { s_vf_capture_result = -1; return; }
+    uint8_t *rgb = (uint8_t *)malloc((size_t)ww * wh * 3);
+    uint8_t *row = (uint8_t *)malloc((size_t)ww * 3);
+    if (!rgb || !row) { free(rgb); free(row); s_vf_capture_result = -1; return; }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, ww, wh, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+    /* GL rows are bottom-up; PNG wants top-down. */
+    for (int y = 0; y < wh / 2; y++) {
+        uint8_t *a = rgb + (size_t)y * ww * 3, *b = rgb + (size_t)(wh - 1 - y) * ww * 3;
+        memcpy(row, a, (size_t)ww * 3); memcpy(a, b, (size_t)ww * 3); memcpy(b, row, (size_t)ww * 3);
+    }
+    FILE *f = fopen(s_vf_capture_path, "wb");
+    int ok = 0;
+    if (f) { ok = png_write_rgb(f, rgb, (uint32_t)ww, (uint32_t)wh); fclose(f); }
+    free(rgb); free(row);
+    s_vf_capture_result = ok ? 1 : -1;
+}
+
 static void present_target_quad(GLuint tex, int tex_w, int tex_h,
                                 int x, int y, int w, int h, int linear,
-                                int lx, int ly, int lw, int lh, int v_flip) {
+                                int lx, int ly, int lw, int lh, int v_flip,
+                                int native_w, int native_h) {
     float u0, v0, u1, v1;
+    /* Opt-in video filter (VF_NONE = the historical path below, untouched).
+     * Only picture-oriented sources are filtered (v_flip=1); a re-presented
+     * drawable capture is already filtered screen content. */
+    if (v_flip && video_filter_get() != VF_NONE &&
+        vf_present(tex, tex_w, tex_h, x, y, w, h, native_w, native_h, lx, ly, lw, lh, v_flip))
+        return;
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
@@ -4035,15 +4485,18 @@ int gl_renderer_present_hold_last(void) {
         }
         /* v_flip=0: drawable capture is already screen-oriented. */
         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
-                            0, 0, s_hold_tw, s_hold_th, 0, lx, ly, lw, lh, 0);
+                            0, 0, s_hold_tw, s_hold_th, 0, lx, ly, lw, lh, 0, 0, 0);
     } else {
         if (s_hold_force_4_3)
             letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
         else
             letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
-        present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
-                            0, 0, s_hold_tw, s_hold_th, s_hold_linear,
-                            lx, ly, lw, lh, 1);
+        {
+            const int S = s_scale > 0 ? s_scale : 1;
+            present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
+                                0, 0, s_hold_tw, s_hold_th, s_hold_linear,
+                                lx, ly, lw, lh, 1, s_hold_tw / S, s_hold_th / S);
+        }
         /* Upgrade to drawable after letterboxing once. Live+interp leaves
          * HOLD_NATIVE (no Swap on main); drawable path is the soak-proven
          * full-window image (GL without interp). */
@@ -4104,7 +4557,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         return;
     }
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
-                        disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
+                        disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1, w, h);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     hold_capture_drawable();
     latency_ring_mark(LAT_SWAP_BEGIN);
@@ -4205,7 +4658,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         return 1;
     }
     present_target_quad(tex, g_wide_w, VRAM_H,
-                        0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1);
+                        0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1,
+                        g_wide_w, disp_h);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
     hold_capture_drawable();
     latency_ring_mark(LAT_SWAP_BEGIN);

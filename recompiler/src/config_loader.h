@@ -414,6 +414,20 @@ struct RuntimeConfig {
     // PSX_SCREEN env var overrides this at runtime (debug path).
     int                   video_screen_kind = 0;
 
+    // filter: present-time video filter (runtime/include/video_filter.h). A
+    // token such as "none" (default; the historical present, untouched),
+    // "sharp", "scale2x", "scale3x", "2xsai", "super2xsai", "supereagle",
+    // "xbr2x", "xbr3x", "xbr4x", "scanlines", "crt". Kept as the raw string —
+    // the runtime owns the vocabulary (video_filter_from_name) and rejects
+    // unknown tokens at startup. PSX_VIDEO_FILTER env overrides at runtime.
+    std::string           video_filter;
+    // scanline_opacity / scanline_size / scanline_glow: parameters of the
+    // "scanlines" video filter (video_filter.h VideoScanlineParams). <0 = unset
+    // (runtime defaults 0.60 / 0.35 / 0.50).
+    double                video_scanline_opacity = -1.0;
+    double                video_scanline_size = -1.0;
+    double                video_scanline_glow = -1.0;
+
     // auto_skip_fmv: when true, full-motion videos (streaming XA audio + MDEC
     // video) are skipped the instant they're detected — presentation + pacing are
     // suppressed and audio muted for the duration, so an FMV ends in a fraction of
@@ -1063,6 +1077,10 @@ struct UserSettings {
     bool has_geometry_correction   = false; bool geometry_correction   = false;
     bool has_perspective_texturing = false; bool perspective_texturing = false;
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
+    bool has_video_filter   = false; std::string video_filter; // video_filter.h token
+    bool has_scanline_opacity = false; double scanline_opacity = 0.60;
+    bool has_scanline_size    = false; double scanline_size    = 0.35;
+    bool has_scanline_glow    = false; double scanline_glow    = 0.50;
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
     // [video] turbo_loads: DEPRECATED AND IGNORED — the legacy home of the
     // generic Turbo loads switch, back when the launcher drew a row for it.

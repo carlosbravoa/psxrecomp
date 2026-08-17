@@ -43,6 +43,7 @@
 #include "card_data_writes.h"
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
+#include "video_filter.h"
 #include "lockstep.h"
 
 #include <stdio.h>
@@ -7944,6 +7945,55 @@ static void handle_mmx6_freshfix(int id, const char *json)
  * {"cmd":"savestate","op":"save"|
  * "load","slot":N}. The request is staged and runs at the next block boundary
  * (savestate_poll); a load unwinds the guest, so the ack is sent before it. */
+/* overlay_resync: run one step of the post-bulk-RAM-write resync bundle.
+ *
+ * A savestate restore replaces RAM wholesale and then calls
+ * overlay_watch_invalidate_after_ram_restore(), which does five distinct
+ * things. A game that streams a new overlay over an old one performs the same
+ * shape of bulk replacement through the normal store path, and if any of those
+ * five is load-bearing there too, the symptom is native code validated against
+ * bytes that are no longer present. This command runs the steps individually so
+ * a live repro can be attributed to exactly one of them instead of the bundle.
+ *
+ * {"cmd":"overlay_resync","what":"gen"|"notecode"|"textguard"|"bless"|
+ *                                "validation"|"all"}
+ */
+/* system_menu: drive the ESC system-menu overlay without a keyboard.
+ * Wayland blocks synthetic key injection, so this is the only way to verify the
+ * panel renders. It drives the OVERLAY only — the real key handling lives in
+ * main.cpp and still needs a human pressing ESC.
+ * {"cmd":"system_menu","open":0|1,"sel":0..2} */
+static void handle_system_menu(int id, const char *json)
+{
+    extern void psx_system_menu_set_state(int open, int selected);
+    extern int  psx_system_menu_item_count(void);
+    extern int psx_system_menu_debug_rows(char *out, int cap);
+    int open = json_get_int(json, "open", 1);
+    int sel  = json_get_int(json, "sel", 0);
+    char rows[768];
+    int n = psx_system_menu_debug_rows(rows, (int)sizeof rows);
+    psx_system_menu_set_state(open, sel);
+    send_fmt("{\"id\":%d,\"ok\":true,\"open\":%d,\"sel\":%d,\"items\":%d,"
+             "\"rows\":\"%s\"}", id, open ? 1 : 0, sel, n, rows);
+}
+
+static void handle_overlay_resync(int id, const char *json)
+{
+    char what[24];
+    if (!json_get_str(json, "what", what, sizeof(what))) {
+        send_err(id, "missing what (gen|notecode|textguard|bless|validation|all)");
+        return;
+    }
+    if (!strcmp(what, "gen"))             overlay_watch_bump_all_page_gen();
+    else if (!strcmp(what, "notecode"))   overlay_loader_note_code_write();
+    else if (!strcmp(what, "textguard"))  dirty_ram_text_guard_resync_after_restore();
+    else if (!strcmp(what, "bless"))      psx_kernel_bless_resync_after_restore();
+    else if (!strcmp(what, "validation")) overlay_loader_resync_validation_after_restore();
+    else if (!strcmp(what, "all"))        overlay_watch_invalidate_after_ram_restore();
+    else { send_err(id, "what must be gen|notecode|textguard|bless|validation|all"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"what\":\"%s\"}", id, what);
+}
+
 static void handle_savestate(int id, const char *json)
 {
     extern int savestate_request_save(int slot);
@@ -7952,13 +8002,40 @@ static void handle_savestate(int id, const char *json)
     extern int psx_netplay_is_host(void);
     extern int psx_netplay_request_save(int slot);
     extern int psx_netplay_request_load(int slot);
-    int slot = json_get_int(json, "slot", -1);
-    if (slot < 0) { send_err(id, "missing slot"); return; }
     char op[16];
     if (!json_get_str(json, "op", op, sizeof(op))) { send_err(id, "missing op"); return; }
+    /* Path-based variants (bug-report bundles): save_path writes a slot-less
+     * .pst; load_path stages any .pst file as an in-memory blob load. */
+    if (!strcmp(op, "save_path") || !strcmp(op, "load_path")) {
+        extern int savestate_request_save_path(const char *path);
+        extern int savestate_request_load_blob_protocol(const void *data, size_t size);
+        char path[512];
+        if (!json_get_str(json, "path", path, sizeof(path))) { send_err(id, "missing path"); return; }
+        if (psx_netplay_active()) { send_err(id, "refused during netplay"); return; }
+        int staged_p = 0;
+        if (!strcmp(op, "save_path")) {
+            staged_p = savestate_request_save_path(path);
+        } else {
+            FILE *f = fopen(path, "rb");
+            if (!f) { send_err(id, "cannot open path"); return; }
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            uint8_t *blob = (n > 0) ? (uint8_t *)malloc((size_t)n) : NULL;
+            if (blob && fread(blob, 1, (size_t)n, f) == (size_t)n)
+                staged_p = savestate_request_load_blob_protocol(blob, (size_t)n);
+            free(blob);
+            fclose(f);
+        }
+        if (!staged_p) { send_err(id, "savestate path request refused"); return; }
+        send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"path\":\"%s\"}", id, op, path);
+        return;
+    }
+    int slot = json_get_int(json, "slot", -1);
+    if (slot < 0) { send_err(id, "missing slot"); return; }
     int staged;
     if (strcmp(op, "save") && strcmp(op, "load")) {
-        send_err(id, "op must be save|load");
+        send_err(id, "op must be save|load|save_path|load_path");
         return;
     }
     if (psx_netplay_active()) {
@@ -8759,6 +8836,112 @@ static void handle_wide_shot(int id, const char *json)
  * this command unconditionally through handle_screenshot_file silently omits
  * precisely the reveal margins that widescreen diagnostics need to inspect.
  * Keep screenshot_file as the explicit canonical-VRAM probe. */
+/* bug_report: write a diagnostics bundle (bug_report.h) exactly as the F9
+ * hotkey does. {"cmd":"bug_report"} or {"cmd":"bug_report","trigger":"x"}. */
+static void handle_bug_report(int id, const char *json)
+{
+    extern int bug_report_capture(const char *trigger);
+    extern const char *bug_report_last_dir(void);
+    char trig[32];
+    if (!json_get_str(json, "trigger", trig, sizeof(trig))) strcpy(trig, "debug");
+    if (!bug_report_capture(trig)) { send_err(id, "bug_report: could not create the bundle folder"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"dir\":\"%s\"}", id, bug_report_last_dir());
+}
+
+/* video_filter: query or switch the present-time video filter (video_filter.h).
+ *   {"cmd":"video_filter"}                 -> current kind + vocabulary + GL diag
+ *   {"cmd":"video_filter","name":"xbr2x"}  -> select (presentation only) then report
+ * Selecting invalidates the GL present latch so the change lands next vblank
+ * even if VRAM is static. Unknown names are an error, nothing changes. */
+static void handle_video_filter(int id, const char *json)
+{
+    char name[64];
+    if (json_get_str(json, "name", name, sizeof(name))) {
+        int kind = 0;
+        if (!video_filter_from_name(name, &kind)) {
+            send_err(id, "unknown video filter name");
+            return;
+        }
+        video_filter_set(kind);
+        gl_renderer_invalidate_present();
+    }
+    {
+        /* Optional scanline parameters: scan_opacity / scan_size / scan_glow. */
+        char v[32];
+        VideoScanlineParams sp; video_filter_scanline_get(&sp);
+        int any = 0;
+        if (json_get_str(json, "scan_opacity", v, sizeof v)) { sp.opacity = (float)atof(v); any = 1; }
+        if (json_get_str(json, "scan_size", v, sizeof v))    { sp.size = (float)atof(v); any = 1; }
+        if (json_get_str(json, "scan_glow", v, sizeof v))    { sp.glow = (float)atof(v); any = 1; }
+        if (any) { video_filter_scanline_set(&sp); gl_renderer_invalidate_present(); }
+    }
+    int last_kind = 0; unsigned broken = 0; uint64_t passes = 0, fallbacks = 0;
+    gl_renderer_video_filter_diag(&last_kind, &broken, &passes, &fallbacks);
+    char vocab[512]; int n = 0;
+    vocab[0] = 0;
+    for (int k = 0; k < VF_COUNT; k++)
+        n += snprintf(vocab + n, sizeof(vocab) - (size_t)n, "%s\"%s\"", k ? "," : "",
+                      video_filter_name(k));
+    const int cur = video_filter_get();
+    VideoScanlineParams spr; video_filter_scanline_get(&spr);
+    int lr[10] = {0};
+    gl_renderer_video_filter_last_rect(lr);
+    send_fmt("{\"id\":%d,\"ok\":true,\"filter\":\"%s\",\"kind\":%d,\"scale\":%d,"
+             "\"cpu_scale\":%d,\"names\":[%s],\"scanline\":{\"opacity\":%.2f,\"size\":%.2f,\"glow\":%.2f},"
+             "\"gl\":{\"last_kind\":%d,\"broken_mask\":%u,\"passes\":%llu,\"fallbacks\":%llu,"
+             "\"last_rect\":[%d,%d,%d,%d],\"last_native\":[%d,%d],\"last_letterbox\":[%d,%d,%d,%d]}}",
+             id, video_filter_name(cur), cur, video_filter_scale(cur),
+             video_filter_cpu_scale(cur), vocab, (double)spr.opacity, (double)spr.size, (double)spr.glow,
+             last_kind, broken,
+             (unsigned long long)passes, (unsigned long long)fallbacks,
+             lr[0], lr[1], lr[2], lr[3], lr[4], lr[5], lr[6], lr[7], lr[8], lr[9]);
+}
+
+/* window_size: {"cmd":"window_size","w":640,"h":480} resizes the game window
+ * (logical size; the drawable may differ under HiDPI) — used to pin an exact
+ * integer present scale for filter parity checks. Without w/h just reports.
+ * Always answers with the current window and drawable (pixel) sizes. */
+static void handle_window_size(int id, const char *json)
+{
+    extern SDL_Window* sdl_window;
+    if (!sdl_window) { send_err(id, "no window"); return; }
+    int w = json_get_int(json, "w", 0), h = json_get_int(json, "h", 0);
+    if (w > 0 && h > 0) SDL_SetWindowSize(sdl_window, w, h);
+    int ww = 0, wh = 0, dw = 0, dh = 0;
+    SDL_GetWindowSize(sdl_window, &ww, &wh);
+    SDL_GL_GetDrawableSize(sdl_window, &dw, &dh);
+    send_fmt("{\"id\":%d,\"ok\":true,\"window\":[%d,%d],\"drawable\":[%d,%d]}",
+             id, ww, wh, dw, dh);
+}
+
+/* present_capture: write the NEXT presented frame to a PNG.
+ * {"cmd":"present_capture","path":"x.png"} queues it (returns queued:true);
+ * {"cmd":"present_capture"} without a path reports the last request's state:
+ * pending / written / failed. OpenGL: the drawable after the video filter and
+ * before the OSD, plus `<path>.src.png` (the exact source rect the filter
+ * consumed), `<path>.up.png` (raw upscaler output) and `<path>.ref.png` (CPU
+ * reference of that input) for the upscalers. Software present: the exact
+ * post-filter buffer handed to SDL (which IS the CPU reference). */
+static void handle_present_capture(int id, const char *json)
+{
+    extern int psx_present_request_capture(const char* path);
+    extern int psx_present_capture_result(void);
+    char path[512];
+    if (json_get_str(json, "path", path, sizeof(path))) {
+        extern void gl_renderer_present_capture_companions(int on);
+        gl_renderer_present_capture_companions(json_get_int(json, "companions", 1));
+        if (!psx_present_request_capture(path)) {
+            send_err(id, "present_capture: bad path");
+            return;
+        }
+        send_fmt("{\"id\":%d,\"ok\":true,\"queued\":true,\"path\":\"%s\"}", id, path);
+        return;
+    }
+    const int r = psx_present_capture_result();
+    send_fmt("{\"id\":%d,\"ok\":true,\"state\":\"%s\"}", id,
+             r > 0 ? "written" : (r < 0 ? "failed" : "pending"));
+}
+
 static void handle_present_screenshot(int id, const char *json)
 {
     extern int gr_wide_supported(void);
@@ -13338,6 +13521,8 @@ static const CmdEntry s_commands[] = {
     { "input_route_stop",  handle_input_route_stop },
     { "input_route_status",handle_input_route_status },
     { "savestate",         handle_savestate },
+    { "overlay_resync",       handle_overlay_resync },
+    { "system_menu",          handle_system_menu },
     { "turbo",             handle_turbo },
     { "turbo_state",       handle_turbo_state },
     { "pause",             handle_pause },
@@ -13356,6 +13541,10 @@ static const CmdEntry s_commands[] = {
     { "set_snapshot",      handle_set_snapshot },
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_present_screenshot },
+    { "video_filter",      handle_video_filter },
+    { "bug_report",        handle_bug_report },
+    { "present_capture",   handle_present_capture },
+    { "window_size",       handle_window_size },
     { "screenshot_file",   handle_screenshot_file },
     { "screenshot_hires",  handle_screenshot_hires },
     { "display_ring_get",  handle_display_ring_get },
@@ -14026,6 +14215,35 @@ void debug_server_poll(void)
     SDL_UnlockMutex(s_io_mutex);
 }
 
+/* Run one command line in-process on the emu thread and hand back its
+ * response text (malloc'd, newline-terminated JSON lines; caller frees).
+ * Independent of the TCP listener, so bundle writers (bug_report.c) can reuse
+ * every handler in release builds too. Returns NULL if re-entered or if the
+ * server state was never initialised. */
+char *debug_server_run_local(const char *line)
+{
+    if (!line || !line[0]) return NULL;
+    /* Nested use (a handler such as bug_report calling other handlers): park
+     * the outer response buffer, run with a fresh one, then restore. */
+    char  *saved_buf = s_resp_buf; size_t saved_len = s_resp_len, saved_cap = s_resp_cap;
+    int    saved_in = s_in_command, saved_ovf = s_resp_overflow;
+    s_resp_buf = NULL; s_resp_len = 0; s_resp_cap = 0; s_resp_overflow = 0;
+    s_in_command = 1;
+    process_command(line);
+    char *out;
+    if (!s_resp_buf || s_resp_len == 0) {
+        out = (char *)malloc(1);
+        if (out) out[0] = 0;
+    } else {
+        out = (char *)malloc(s_resp_len + 1);
+        if (out) memcpy(out, s_resp_buf, s_resp_len + 1);
+    }
+    free(s_resp_buf);
+    s_resp_buf = saved_buf; s_resp_len = saved_len; s_resp_cap = saved_cap;
+    s_in_command = saved_in; s_resp_overflow = saved_ovf;
+    return out;
+}
+
 void debug_server_record_frame(void)
 {
     if (s_fmv_quiet) {
@@ -14149,6 +14367,16 @@ void debug_server_shutdown(void)
      * blocking accept(), then join. */
     s_io_running = 0;
     if (s_listen != SOCK_INVALID) {
+        /* On Linux/BSD, close() does NOT wake a thread blocked in accept() on
+         * that socket (the descriptor is released, the wait continues), so
+         * the join below used to hang every windowed quit on a debug build.
+         * shutdown(SHUT_RDWR) fails the pending accept first; Windows wakes it
+         * on closesocket() and returns ENOTSOCK-style from shutdown, harmless. */
+#ifdef _WIN32
+        shutdown(s_listen, SD_BOTH);
+#else
+        shutdown(s_listen, SHUT_RDWR);
+#endif
         sock_close(s_listen);
         s_listen = SOCK_INVALID;
     }

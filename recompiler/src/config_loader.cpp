@@ -581,6 +581,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 "[video] crt_filter must be \"raw\"|\"crt\"|\"composite\"|\"trinitron\": {}",
                 mode));
         }
+        if (video.contains("filter")) {
+            rt.video_filter = toml::find<std::string>(video, "filter");
+        }
+        if (video.contains("scanline_opacity"))
+            rt.video_scanline_opacity = toml::find<double>(video, "scanline_opacity");
+        if (video.contains("scanline_size"))
+            rt.video_scanline_size = toml::find<double>(video, "scanline_size");
+        if (video.contains("scanline_glow"))
+            rt.video_scanline_glow = toml::find<double>(video, "scanline_glow");
         if (video.contains("auto_skip_fmv")) {
             rt.video_auto_skip_fmv = toml::find<bool>(video, "auto_skip_fmv");
         }
@@ -2165,6 +2174,18 @@ UserSettings load_user_settings(const fs::path& path) {
             else if (m == "composite") { s.screen_kind = 2; s.has_screen_kind = true; }
             else if (m == "trinitron") { s.screen_kind = 3; s.has_screen_kind = true; }
         });
+        if (v.contains("filter")) try_get([&]{
+            s.video_filter = toml::find<std::string>(v, "filter"); s.has_video_filter = true;
+        });
+        if (v.contains("scanline_opacity")) try_get([&]{
+            s.scanline_opacity = toml::find<double>(v, "scanline_opacity"); s.has_scanline_opacity = true;
+        });
+        if (v.contains("scanline_size")) try_get([&]{
+            s.scanline_size = toml::find<double>(v, "scanline_size"); s.has_scanline_size = true;
+        });
+        if (v.contains("scanline_glow")) try_get([&]{
+            s.scanline_glow = toml::find<double>(v, "scanline_glow"); s.has_scanline_glow = true;
+        });
         if (v.contains("auto_skip_fmv")) try_get([&]{
             s.auto_skip_fmv = toml::find<bool>(v, "auto_skip_fmv"); s.has_auto_skip_fmv = true;
         });
@@ -2469,6 +2490,11 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
                       : s.screen_kind == 3 ? "trinitron" : "raw";
         f << "crt_filter        = \"" << k << "\"\n";
     }
+    if (s.has_video_filter)
+        f << "filter            = \"" << s.video_filter << "\"\n";
+    if (s.has_scanline_opacity) f << "scanline_opacity  = " << s.scanline_opacity << "\n";
+    if (s.has_scanline_size)    f << "scanline_size     = " << s.scanline_size << "\n";
+    if (s.has_scanline_glow)    f << "scanline_glow     = " << s.scanline_glow << "\n";
     if (s.has_auto_skip_fmv)
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
     /* turbo_loads is deliberately NOT written back: it is deprecated and no
