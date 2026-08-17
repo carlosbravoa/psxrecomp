@@ -138,13 +138,18 @@ static inline uint32_t texel(uint16_t texpage, int depth, int u, int v) {
  * id (CLUT contents; 0 for 15bpp). A replacement pack keys on the texel id and
  * may carry per-palette variants; palette fades / flashes therefore do not
  * multiply the asset set. */
-static void hash_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
-                      int u, int v, int w, int h, int depth, uint64_t *tex, uint64_t *pal) {
+static void hash_rect_used(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
+                           int u, int v, int w, int h, int depth, uint64_t *tex, uint64_t *pal,
+                           uint64_t used[4]) {
     uint64_t hh = 0xcbf29ce484222325ull;
     hh = fnv1a(hh, (uint32_t)depth); hh = fnv1a(hh, (uint32_t)w); hh = fnv1a(hh, (uint32_t)h);
+    if (used) used[0] = used[1] = used[2] = used[3] = 0;
     for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            hh = fnv1a(hh, texel(texpage, depth, u + x, v + y));
+        for (int x = 0; x < w; x++) {
+            const uint32_t t = texel(texpage, depth, u + x, v + y);
+            hh = fnv1a(hh, t);
+            if (used && depth < 2) used[(t >> 6) & 3] |= 1ull << (t & 63);   /* palette indices this rect draws */
+        }
     *tex = hh;
     uint64_t hp = 0;
     if (depth < 2) {
@@ -154,6 +159,10 @@ static void hash_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
             hp = fnv1a(hp, s_vram[(size_t)(clut_y & 511) * 1024 + ((clut_x + i) & 1023)]);
     }
     *pal = hp;
+}
+static void hash_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
+                      int u, int v, int w, int h, int depth, uint64_t *tex, uint64_t *pal) {
+    hash_rect_used(texpage, clut_x, clut_y, u, v, w, h, depth, tex, pal, NULL);
 }
 
 uint64_t texture_pack_hash_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
@@ -269,7 +278,7 @@ typedef struct PackEntry {
 static PackEntry *s_pack[PACK_BUCKETS];
 static int s_pack_n = 0;
 static char s_pack_dir[1024];
-static uint64_t s_lookups = 0, s_hits = 0;
+static uint64_t s_lookups = 0, s_hits = 0, s_nofit = 0;   /* nofit = draws left native: palette not a fade of any variant */
 static uint32_t s_pack_gen = 0;
 
 uint32_t texture_pack_generation(void) { return s_pack_gen; }
@@ -296,15 +305,15 @@ void texture_pack_unload(void) {
         int used = 0;
         for (unsigned b = 0; b < PACK_BUCKETS; b++)
             for (const PackEntry *e = s_pack[b]; e; e = e->next) used += e->img.hits ? 1 : 0;
-        fprintf(stdout, "psxrecomp: HD texture pack %s: %d of %d images were drawn (%llu lookups, %llu hits)\n",
-                s_pack_dir, used, s_pack_n, (unsigned long long)s_lookups, (unsigned long long)s_hits);
+        fprintf(stdout, "psxrecomp: HD texture pack %s: %d of %d images were drawn (%llu lookups, %llu hits, %llu draws left native: palette is not a fade of any variant)\n",
+                s_pack_dir, used, s_pack_n, (unsigned long long)s_lookups, (unsigned long long)s_hits, (unsigned long long)s_nofit);
     }
     for (unsigned b = 0; b < PACK_BUCKETS; b++) {
         PackEntry *e = s_pack[b];
         while (e) { PackEntry *n = e->next; free((void*)e->img.rgba); free(e); e = n; }
         s_pack[b] = NULL;
     }
-    s_pack_n = 0; s_pack_dir[0] = 0; s_lookups = s_hits = 0;
+    s_pack_n = 0; s_pack_dir[0] = 0; s_lookups = s_hits = s_nofit = 0;
     g_texture_pack_replace = 0;
     s_pack_gen++;
 }
@@ -359,53 +368,62 @@ int texture_pack_load(const char *dir) {
 }
 
 float texture_pack_palette_mod(const uint16_t *ref, int n, uint16_t clut_x, uint16_t clut_y, float mod[6]) {
+    return texture_pack_palette_mod_used(ref, n, clut_x, clut_y, NULL, mod);
+}
+float texture_pack_palette_mod_used(const uint16_t *ref, int n, uint16_t clut_x, uint16_t clut_y,
+                                    const uint64_t used[4], float mod[6]) {
     mod[0] = mod[1] = mod[2] = 1.0f; mod[3] = mod[4] = mod[5] = 0.0f;
     if (!ref || n <= 0 || !s_vram) return TEXPACK_NO_FIT;
-    /* Two uniform-fade models, fitted per channel over the entries whose
-     * reference is neither transparent nor black:
+#define TP_USED(i) (!used || (used[((i) >> 6) & 3] >> ((i) & 63)) & 1)
+    /* Two uniform-fade models, fitted per channel over the entries the texture
+     * uses (all of them without a mask). Entry 0 / a 0x0000 reference is the
+     * transparent colour and never drawn, so it is skipped; an opaque-black
+     * reference (0x8000, or a channel at 0) DOES take part — the subtractive
+     * model can brighten it, which is how a solid tile authored dark reads the
+     * live palette's colour.
      *   multiplicative  cur = ref * k          (dimming, brightness)
-     *   subtractive     cur = clamp(ref - d)   (the classic PSX fade: every
-     *                                           channel steps down by d)
+     *   subtractive     cur = clamp(ref - d)   (the classic PSX fade / flash:
+     *                                           every channel steps by d,
+     *                                           clamping at 0 / 31; the step
+     *                                           comes from the unclamped
+     *                                           entries, all clamped = fully
+     *                                           black / white)
      * The model whose per-entry residual is smaller wins, and only if that
-     * residual is small; otherwise the palette is a permutation / cycle /
-     * recolour and the authored colours are kept (identity). */
+     * residual is below ~2 levels rms; otherwise the palette is a
+     * permutation / cycle / recolour (TEXPACK_NO_FIT, mod = identity). */
     float mul[3] = {1, 1, 1}, sub[3] = {0, 0, 0};
     float err_mul = 0.0f, err_sub = 0.0f;
-    int   any = 0;
+    int   m = 0;
     for (int k = 0; k < 3; k++) {
         float sr = 0, sc = 0, sd = 0; int cnt = 0, cntd = 0;
         for (int i = 0; i < n; i++) {
             const uint16_t r = ref[i];
-            if ((r & 0x7FFF) == 0) continue;
+            if (i == 0 || r == 0 || !TP_USED(i)) continue;
             const uint16_t c = s_vram[(size_t)(clut_y & 511) * 1024 + ((clut_x + i) & 1023)];
             const int rv = (r >> (5 * k)) & 31, cv = (c >> (5 * k)) & 31;
-            if (rv <= 0) continue;
             sr += (float)rv; sc += (float)cv; cnt++;
             if (cv > 0 && cv < 31) { sd += (float)(rv - cv); cntd++; }   /* unclamped entries define the step */
         }
         if (!cnt) continue;
-        any = 1;
-        mul[k] = sr > 0 ? sc / sr : 1.0f;
+        mul[k] = sr > 0 ? sc / sr : (sc > 0 ? 99.0f : 1.0f);          /* ref channel all 0: mul cannot brighten */
         if (cntd) sub[k] = sd / (float)cntd;
         else      sub[k] = sc / (float)cnt <= 0.5f ? 31.0f : -31.0f;   /* all clamped: fully black / white */
         for (int i = 0; i < n; i++) {
             const uint16_t r = ref[i];
-            if ((r & 0x7FFF) == 0) continue;
+            if (i == 0 || r == 0 || !TP_USED(i)) continue;
             const uint16_t c = s_vram[(size_t)(clut_y & 511) * 1024 + ((clut_x + i) & 1023)];
             const int rv = (r >> (5 * k)) & 31, cv = (c >> (5 * k)) & 31;
-            if (rv <= 0) continue;
             float pm = (float)rv * mul[k]; if (pm > 31.0f) pm = 31.0f;
             float ps = (float)rv - sub[k]; if (ps < 0.0f) ps = 0.0f; if (ps > 31.0f) ps = 31.0f;
             err_mul += ((float)cv - pm) * ((float)cv - pm);
             err_sub += ((float)cv - ps) * ((float)cv - ps);
+            m++;
         }
     }
-    if (!any) return TEXPACK_NO_FIT;
+    if (!m) return 0.0f;                          /* nothing drawn but the transparent colour */
     /* residual per entry-channel; a fit is accepted below ~2 levels rms */
-    int m = 0;
-    for (int i = 0; i < n; i++) if ((ref[i] & 0x7FFF) != 0) m += 3;
-    const float rms_mul = m ? (float)sqrt((double)err_mul / m) : 99.0f;
-    const float rms_sub = m ? (float)sqrt((double)err_sub / m) : 99.0f;
+    const float rms_mul = (float)sqrt((double)err_mul / m);
+    const float rms_sub = (float)sqrt((double)err_sub / m);
     if (rms_sub <= rms_mul && rms_sub < 2.0f) {
         for (int k = 0; k < 3; k++) { mod[k] = 1.0f; mod[3 + k] = -sub[k] * (255.0f / 31.0f); }
         return rms_sub;
@@ -414,6 +432,7 @@ float texture_pack_palette_mod(const uint16_t *ref, int n, uint16_t clut_x, uint
         return rms_mul;
     }
     return TEXPACK_NO_FIT;
+#undef TP_USED
 }
 
 static int img_fits_rect(const TexPackImage *im, int w, int h) {
@@ -426,32 +445,40 @@ const TexPackImage *texture_pack_lookup_rect_mod(uint16_t texpage, uint16_t clut
     if (!g_texture_pack_replace || !s_vram || w <= 0 || h <= 0) return NULL;
     if (w > 256) w = 256;
     if (h > 256) h = 256;
-    uint64_t tex, pal;
+    uint64_t tex, pal, used[4];
     const int depth = (texpage >> 7) & 3;
-    hash_rect(texpage, clut_x, clut_y, u, v, w, h, depth, &tex, &pal);
+    hash_rect_used(texpage, clut_x, clut_y, u, v, w, h, depth, &tex, &pal, used);
     s_lookups++;
     /* 1. the exact palette variant; 2. else the entry whose reference CLUT
-     *    best explains the live one as a uniform fade (palette-agnostic or a
-     *    <tex>-<pal> variant with a .clut sidecar) — a stage fade-in of a
-     *    genuine recolour then dims THAT recolour; 3. else the palette-agnostic
-     *    entry as authored. Every candidate must be a whole multiple of the rect. */
+     *    best explains the live one as a uniform fade — over the palette entries
+     *    THIS rect actually uses (a solid tile only cares about its one index) —
+     *    so a stage fade-in of a genuine recolour dims THAT recolour; 3. an entry
+     *    with a reference that does NOT fit is a recolour the pack has no art
+     *    for: draw the NATIVE texels rather than the wrong colours (degrade to
+     *    the original, never guess); 4. entries without any reference palette
+     *    (packs made before sidecars) draw as authored. Every candidate must be
+     *    a whole multiple of the rect. */
     PackEntry *any = NULL, *best = NULL;
+    int refs = 0;
     float best_rms = TEXPACK_NO_FIT, best_mod[6];
     PackEntry *chain = s_pack[(unsigned)(tex ^ (tex >> 23)) & (PACK_BUCKETS - 1)];
     for (PackEntry *e = chain; e; e = e->next) {
         if (e->tex != tex || !img_fits_rect(&e->img, w, h)) continue;
         if (e->pal == pal) { s_hits++; e->img.hits++; return &e->img; }
         if (e->pal == 0 && !any) any = e;
+        if (e->img.ref_n > 0) refs++;
     }
-    if (mod && depth < 2) {
+    if (depth < 2 && refs) {
+        float m[6];
         for (PackEntry *e = chain; e; e = e->next) {
             if (e->tex != tex || e->img.ref_n <= 0 || !img_fits_rect(&e->img, w, h)) continue;
-            float m[6];
-            float rms = texture_pack_palette_mod(e->img.ref_clut, e->img.ref_n, clut_x, clut_y, m);
+            float rms = texture_pack_palette_mod_used(e->img.ref_clut, e->img.ref_n, clut_x, clut_y, used, m);
             if (rms < best_rms) { best_rms = rms; best = e; memcpy(best_mod, m, sizeof m); }
         }
+        if (best) { s_hits++; best->img.hits++; if (mod) memcpy(mod, best_mod, sizeof best_mod); return &best->img; }
+        s_nofit++;                       /* recolour without a variant: native texels */
+        return NULL;
     }
-    if (best) { s_hits++; best->img.hits++; memcpy(mod, best_mod, sizeof best_mod); return &best->img; }
     if (any)  { s_hits++; any->img.hits++; return &any->img; }
     return NULL;
 }
@@ -480,6 +507,7 @@ int texture_pack_stats_json(char *buf, int cap) {
     int used = 0;
     for (unsigned b = 0; b < PACK_BUCKETS; b++)
         for (const PackEntry *e = s_pack[b]; e; e = e->next) used += e->img.hits ? 1 : 0;
-    return snprintf(buf, (size_t)cap, "{\"loaded\":%d,\"dir\":\"%s\",\"lookups\":%llu,\"hits\":%llu,\"used\":%d}",
-                    s_pack_n, s_pack_dir, (unsigned long long)s_lookups, (unsigned long long)s_hits, used);
+    return snprintf(buf, (size_t)cap, "{\"loaded\":%d,\"dir\":\"%s\",\"lookups\":%llu,\"hits\":%llu,\"used\":%d,\"native_recolour\":%llu}",
+                    s_pack_n, s_pack_dir, (unsigned long long)s_lookups, (unsigned long long)s_hits, used,
+                    (unsigned long long)s_nofit);
 }

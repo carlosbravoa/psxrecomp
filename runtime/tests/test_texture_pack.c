@@ -112,13 +112,16 @@ int main(void) {
         for (int i = 0; i < 16; i++) vram[480 * 1024 + 80 + i] = ref[15 - i];
         texture_pack_palette_mod(ref, 16, 80, 480, m);
         assert(m[0] == 1.0f && m[1] == 1.0f && m[2] == 1.0f && m[3] == 0.0f);
-        /* a palette-agnostic entry with a .clut sidecar: dumped .clut is copied as <tex>.clut */
+        /* a palette-agnostic entry with a .clut sidecar (<tex>.clut = the CLUT the
+         * art was authored against — here the grey ramp `ref` now live in CLUT A) */
         char src[400], dst[400];
         snprintf(src, sizeof src, "%s/%016llx-%016llx.clut", dir, (unsigned long long)t1, (unsigned long long)p1);
         snprintf(dst, sizeof dst, "%s/%016llx.clut", dir, (unsigned long long)t1);
         FILE *fi = fopen(src, "rb"); assert(fi);
-        uint8_t raw[32]; assert(fread(raw, 1, 32, fi) == 32); fclose(fi);
-        FILE *fo = fopen(dst, "wb"); assert(fo); fwrite(raw, 1, 32, fo); fclose(fo);
+        uint8_t raw[32]; assert(fread(raw, 1, 32, fi) == 32); fclose(fi);      /* dump wrote 32 bytes */
+        FILE *fo = fopen(dst, "wb"); assert(fo);
+        for (int i = 0; i < 16; i++) { uint8_t b2[2] = { (uint8_t)(ref[i] & 0xFF), (uint8_t)(ref[i] >> 8) }; fwrite(b2, 1, 2, fo); }
+        fclose(fo);
         char any[400];
         snprintf(any, sizeof any, "%s/%016llx.png", dir, (unsigned long long)t1);
         snprintf(src, sizeof src, "%s/%016llx-%016llx.png", dir, (unsigned long long)t1, (unsigned long long)p1);
@@ -164,6 +167,41 @@ int main(void) {
         assert(imF == imR && m[0] == 1.0f && m[3] < -25.0f && m[3] > -40.0f);        /* fade of R -> R, offset ~ -4*255/31 */
         imF = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 48, 480, 0, 0, 16, 16, m);
         assert(imF == imA && m[0] > 0.4f && m[0] < 0.6f);                            /* half of A -> A */
+        /* CLUT G (112,480): a genuine recolour of neither A nor R (entries scrambled,
+         * not uniform) -> the pack has references but none fits: NATIVE texels
+         * (NULL), not the authored art in the wrong colours; counted in stats. */
+        for (int i = 0; i < 16; i++) vram[480 * 1024 + 112 + i] = (uint16_t)(0x8000 | ((i * 7) & 31) | (((i * 3) & 31) << 5) | (((31 - i) & 31) << 10));
+        assert(texture_pack_lookup_rect_mod(tpage(512, 0, 0), 112, 480, 0, 0, 16, 16, m) == NULL);
+        texture_pack_stats_json(st, sizeof st);
+        assert(strstr(st, "\"native_recolour\":1"));
+        /* used-index fit: a texture that only draws index 5 (solid tile) with CLUT G
+         * where entry 5 equals A's entry 5 -> identical picture -> A, identity. */
+        for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++) put4(512, 0, 64 + x, y, 5);
+        vram[480 * 1024 + 112 + 5] = ref[5];
+        const uint64_t ts = texture_pack_hash_rect(tpage(512, 0, 0), 0, 480, 64, 0, 16, 16);
+        assert(ts != t1);
+        char sp[400], sc[400];
+        snprintf(sp, sizeof sp, "%s/%016llx.png", dir, (unsigned long long)ts);
+        snprintf(sc, sizeof sc, "%s/%016llx.clut", dir, (unsigned long long)ts);
+        snprintf(cmd, sizeof cmd, "cp '%s' '%s' && cp '%s' '%s'", any, sp, dst, sc); assert(system(cmd) == 0);
+        assert(texture_pack_load(dir) >= 3);
+        const TexPackImage *imS = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 112, 480, 64, 0, 16, 16, m);
+        assert(imS && m[0] == 1.0f && m[3] == 0.0f);
+        /* one used entry: ANY change of it is a per-channel fade (the art has one
+         * colour; the modulation reproduces the live colour exactly) */
+        vram[480 * 1024 + 112 + 5] = (uint16_t)(0x8000 | 1 | (20 << 5) | (5 << 10));
+        imS = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 112, 480, 64, 0, 16, 16, m);
+        assert(imS && m[3] < 0.0f && m[4] > 0.0f && m[5] < 0.0f);
+        /* two used entries moving in opposite directions -> not a fade -> native */
+        for (int y = 0; y < 8; y++) for (int x = 0; x < 16; x++) put4(512, 0, 64 + x, y, 6);
+        vram[480 * 1024 + 112 + 5] = (uint16_t)(0x8000 | 1 | (1 << 5) | (1 << 10));
+        vram[480 * 1024 + 112 + 6] = 0xFFFF;
+        const uint64_t ts2 = texture_pack_hash_rect(tpage(512, 0, 0), 0, 480, 64, 0, 16, 16);
+        snprintf(cmd, sizeof cmd, "cp '%s' '%s/%016llx.png' && cp '%s' '%s/%016llx.clut'", any, dir, (unsigned long long)ts2, dst, dir, (unsigned long long)ts2);
+        assert(system(cmd) == 0);
+        assert(texture_pack_load(dir) >= 4);
+        assert(texture_pack_lookup_rect_mod(tpage(512, 0, 0), 112, 480, 64, 0, 16, 16, m) == NULL);
+        assert(texture_pack_lookup_rect_mod(tpage(512, 0, 0), 0, 480, 64, 0, 16, 16, m) != NULL);   /* palette A itself */
         texture_pack_unload();
     }
     puts("texture_pack_test: OK");

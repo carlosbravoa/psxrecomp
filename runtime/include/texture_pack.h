@@ -70,7 +70,15 @@ const TexPackImage *texture_pack_lookup_rect_mod(uint16_t texpage, uint16_t clut
  * uniform fade (palette cycling / recolours keep the authored art). */
 #define TEXPACK_NO_FIT 99.0f
 float texture_pack_palette_mod(const uint16_t *ref, int n, uint16_t clut_x, uint16_t clut_y, float mod[6]);
-/* {"loaded":N,"dir":"..","lookups":N,"hits":N,"used":N} (used = images drawn at least once) */
+/* Same, restricted to the palette indices in `used` (4 x 64-bit mask, NULL = all):
+ * only the entries a texture draws decide whether the live palette is a fade of
+ * the reference (a solid tile cares about one entry). */
+float texture_pack_palette_mod_used(const uint16_t *ref, int n, uint16_t clut_x, uint16_t clut_y,
+                                    const uint64_t used[4], float mod[6]);
+/* {"loaded":N,"dir":"..","lookups":N,"hits":N,"used":N,"native_recolour":N}
+ * (used = images drawn at least once; native_recolour = draws that had a pack
+ * entry but were left native because the live palette is not a fade of any
+ * variant's reference — the count that says "this needs a <tex>-<pal> variant") */
 int  texture_pack_stats_json(char *buf, int cap);
 /* Write <path> (TSV: tex_id, pal_id, w, h, hits) for every loaded image; returns rows or -1. */
 int  texture_pack_write_usage(const char *path);

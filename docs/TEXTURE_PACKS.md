@@ -189,32 +189,42 @@ exactly what the dump writes, so `starter` just copies them). Entries without
 a sidecar behave as before (as authored, any palette).
 
 **Fade model.** When the live palette id differs from the reference's, the
-runtime fits the live CLUT against the reference per channel with two uniform
-models and keeps the closer one if its residual is below 2 levels rms:
+runtime fits the live CLUT against the reference per channel — **over the
+palette entries the primitive's texels actually use** (a solid tile cares
+about one entry; entry 0 / a 0x0000 reference is the transparent colour and
+is skipped; an opaque-black reference takes part) — with two uniform models
+and keeps the closer one if its residual is below 2 levels rms:
 *multiplicative* `cur = ref × k` (dimming) and *subtractive*
 `cur = clamp(ref − d)` (the classic PSX fade / flash: every channel steps by
 the same amount, clamping at 0 or 31 — the step is estimated from the
-unclamped entries, all-clamped means fully black / fully white). The
-replacement is then drawn as `clamp(rgb × scale + offset)` — on the software
-path in `rep_sample`, on GL through the `a_rep_mod` / `a_rep_off` attributes.
-A palette that is not a uniform fade of the reference (permutation, cycle,
-recolour) leaves the entry as authored (identity).
+unclamped entries, all-clamped means fully black / fully white; a negative
+step brightens, which is how art authored dark reads a brighter live entry).
+The replacement is then drawn as `clamp(rgb × scale + offset)` — on the
+software path in `rep_sample`, on GL through the `a_rep_mod` / `a_rep_off`
+attributes.
 
-**Variant selection.** Lookup order per primitive: (1) the exact
-`<tex>-<pal>` variant; (2) among all entries of that texel id that carry a
-sidecar, the one whose reference the live palette is a fade of (smallest
-residual) — so a stage fade-in of a *recolour* dims that recolour, not the
-common art; (3) the palette-agnostic entry as authored. `starter --palette
-common` (the default) writes the most-drawn palette per texel id (from
-`pairs.tsv`) as `<tex>.png` and every palette the fade model cannot reach as
-a `<tex>-<pal>.png` variant with its sidecar (Mega Man 8, boot → intro
-stage: 776 ids, 10 recolour variants — mostly solid tiles whose texels are
-the same index everywhere and legitimately mean different colours in
-different places).
+**Variant selection — and degrading to native.** Lookup order per primitive:
+(1) the exact `<tex>-<pal>` variant; (2) among all entries of that texel id
+that carry a sidecar, the one whose reference the live palette is a fade of
+(smallest residual) — so a stage fade-in of a *recolour* dims that recolour,
+not the common art; (3) if the pack has reference palettes for this texel id
+but the live palette is a fade of none of them, the pack has **no art for
+this recolour: the native texels are drawn** (counted as
+`native_recolour` in `texture_pack stats` — the number that says "this needs
+a `<tex>-<pal>` variant"); (4) entries without any sidecar (packs made
+before B9) draw as authored. Showing authored art under a foreign palette is
+never right — the same solid/border/font tiles recur across the title, the
+stage select, text bubbles and the pause menu with unrelated CLUTs, and
+"as authored" painted them in the intro stage's colours (pink bubble
+borders, black squares on the stage select). `starter --palette common`
+(the default) writes the most-drawn palette per texel id (from `pairs.tsv`)
+as `<tex>.png` and every palette the fade model cannot reach as a
+`<tex>-<pal>.png` variant with its sidecar.
 
 **Result.** With a 2× nearest starter pack (pixel-identical art) the software
 hi-res picture is **pixel-identical to native** through the title fade-in,
-the white flash and its fade back, and the intro stage; on OpenGL the
+the white flash and its fade back, the intro stage, the stage select, a
+later stage, the pause/weapon menu and the title menu; on OpenGL the
 difference is the documented ≤ 2/255 of 5→8-bit expansion. Verified with the
 game repo's `tools/mm8_headless.sh`-style scripts capturing `screenshot_hires`
 with and without `PSX_TEXTURE_PACK` (the config pack must be empty for the
