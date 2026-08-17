@@ -28,7 +28,26 @@
 extern "C" {
 #endif
 
-extern int g_texture_pack_active;   /* 0 = every note returns immediately */
+extern int g_texture_pack_active;   /* 0 = every note returns immediately (dump) */
+extern int g_texture_pack_replace;  /* 1 = a replacement pack is loaded (B3) */
+
+/* ---- replacement pack (B3) ----
+ * A pack is a directory of <tex_id>.png (any palette) and/or
+ * <tex_id>-<pal_id>.png (that palette only), each an integer multiple N of the
+ * native texel rectangle. The software renderer's hi-res / wide targets sample
+ * these instead of VRAM; native VRAM (and everything at 1x) is untouched. */
+typedef struct {
+    int w, h;                 /* pixels */
+    const uint8_t *rgba;      /* w*h*4, top-down */
+} TexPackImage;
+
+int  texture_pack_load(const char *dir);        /* returns number of images, 0 = none/failed */
+void texture_pack_unload(void);
+/* Identify the primitive's texel rect and return its replacement (or NULL). */
+const TexPackImage *texture_pack_lookup_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
+                                             int u, int v, int w, int h);
+/* {"loaded":N,"dir":"..","lookups":N,"hits":N} */
+int  texture_pack_stats_json(char *buf, int cap);
 
 void texture_pack_set_vram(const uint16_t *vram_1024x512);
 void texture_pack_note_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,

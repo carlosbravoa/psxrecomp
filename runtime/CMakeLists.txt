@@ -209,6 +209,9 @@ if(BUILD_TESTING)
         tests/test_texture_pack.c
         src/texture_pack.c)
     target_include_directories(texture_pack_test PRIVATE include src)
+    if(NOT WIN32)
+        target_link_libraries(texture_pack_test PRIVATE m)   # stb_image (PNG decoder) uses pow()
+    endif()
     add_test(NAME texture_pack_test COMMAND texture_pack_test)
 
     add_executable(mod_packages_test

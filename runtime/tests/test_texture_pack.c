@@ -68,6 +68,23 @@ int main(void) {
     assert(lines == 3);   /* header + 2 rows */
     texture_dump_disarm();
     assert(!g_texture_pack_active);
+    /* B3: the dump directory is a valid (1x) pack: load it, look the texture up */
+    assert(texture_pack_load(dir) == 2);
+    assert(g_texture_pack_replace);
+    const TexPackImage *img = texture_pack_lookup_rect(tpage(512, 0, 0), 0, 480, 0, 0, 16, 16);
+    assert(img && img->w == 16 && img->h == 16 && img->rgba);
+    /* palette A -> exact variant; palette B (same contents) -> same id -> hit; a rect the
+     * pack does not have -> NULL; a wrong-size request -> NULL */
+    assert(texture_pack_lookup_rect(tpage(576, 256, 0), 16, 480, 32, 64, 16, 16) == NULL); /* texel 5,5 was changed above */
+    assert(texture_pack_lookup_rect(tpage(512, 0, 0), 0, 480, 0, 0, 16, 8) == NULL);
+    /* colour 0 -> transparent in the dumped PNG (index 0 = 0x8000|0 -> STP set, non-zero -> opaque
+     * in this test), and every other pixel opaque */
+    int opaque = 0; for (int i = 0; i < 256; i++) opaque += img->rgba[i * 4 + 3] == 255;
+    assert(opaque == 256);
+    texture_pack_stats_json(st, sizeof st);
+    assert(strstr(st, "\"loaded\":2") && strstr(st, "\"hits\":1"));
+    texture_pack_unload();
+    assert(!g_texture_pack_replace && texture_pack_lookup_rect(tpage(512, 0, 0), 0, 480, 0, 0, 16, 16) == NULL);
     puts("texture_pack_test: OK");
     return 0;
 }

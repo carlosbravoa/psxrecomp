@@ -6,6 +6,7 @@
 #include <string.h>
 
 int g_texture_pack_active = 0;
+int g_texture_pack_replace = 0;
 
 static const uint16_t *s_vram = NULL;
 static char s_dir[1024];
@@ -54,6 +55,8 @@ static void check_env(void) {
     s_env_checked = 1;
     const char *d = getenv("PSX_TEXTURE_DUMP");
     if (d && d[0]) texture_dump_arm(d);
+    const char *pk = getenv("PSX_TEXTURE_PACK");
+    if (pk && pk[0]) texture_pack_load(pk);
 }
 
 int texture_dump_arm(const char *dir) {
@@ -209,4 +212,105 @@ void texture_pack_note_tri(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
     if (w <= 0 || (w & 7)) w += 1;
     if (h <= 0 || (h & 7)) h += 1;
     note(texpage, clut_x, clut_y, umin, vmin, w, h);
+}
+
+/* ---- replacement pack (B3) ---- */
+
+/* Private, static PNG decoder (psx_window_icon.cpp keeps its own static copy too). */
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#include "../third_party/stb_image.h"
+#include <dirent.h>
+
+typedef struct PackEntry {
+    uint64_t tex, pal;        /* pal = 0: any palette */
+    TexPackImage img;
+    struct PackEntry *next;
+} PackEntry;
+
+#define PACK_BUCKETS 4096u
+static PackEntry *s_pack[PACK_BUCKETS];
+static int s_pack_n = 0;
+static char s_pack_dir[1024];
+static uint64_t s_lookups = 0, s_hits = 0;
+
+static int parse_hex16(const char *p, uint64_t *out) {
+    uint64_t v = 0;
+    for (int i = 0; i < 16; i++) {
+        char c = p[i]; int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return 0;
+        v = (v << 4) | (uint64_t)d;
+    }
+    *out = v; return 1;
+}
+
+void texture_pack_unload(void) {
+    for (unsigned b = 0; b < PACK_BUCKETS; b++) {
+        PackEntry *e = s_pack[b];
+        while (e) { PackEntry *n = e->next; free((void*)e->img.rgba); free(e); e = n; }
+        s_pack[b] = NULL;
+    }
+    s_pack_n = 0; s_pack_dir[0] = 0; s_lookups = s_hits = 0;
+    g_texture_pack_replace = 0;
+}
+
+int texture_pack_load(const char *dir) {
+    texture_pack_unload();
+    if (!dir || !dir[0]) return 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *n = de->d_name;
+        size_t len = strlen(n);
+        uint64_t tex, pal = 0;
+        if (len == 20 && strcmp(n + 16, ".png") == 0) {            /* <tex>.png */
+            if (!parse_hex16(n, &tex)) continue;
+        } else if (len == 37 && n[16] == '-' && strcmp(n + 33, ".png") == 0) {   /* <tex>-<pal>.png */
+            if (!parse_hex16(n, &tex) || !parse_hex16(n + 17, &pal)) continue;
+        } else continue;
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%s", dir, n);
+        int w = 0, h = 0, comp = 0;
+        unsigned char *px = stbi_load(path, &w, &h, &comp, 4);
+        if (!px || w <= 0 || h <= 0) { if (px) stbi_image_free(px); continue; }
+        PackEntry *e = (PackEntry*)calloc(1, sizeof *e);
+        if (!e) { stbi_image_free(px); break; }
+        e->tex = tex; e->pal = pal; e->img.w = w; e->img.h = h; e->img.rgba = px;
+        unsigned b = (unsigned)(tex ^ (tex >> 23)) & (PACK_BUCKETS - 1);
+        e->next = s_pack[b]; s_pack[b] = e; s_pack_n++;
+    }
+    closedir(d);
+    snprintf(s_pack_dir, sizeof s_pack_dir, "%s", dir);
+    g_texture_pack_replace = s_pack_n > 0;
+    return s_pack_n;
+}
+
+const TexPackImage *texture_pack_lookup_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
+                                             int u, int v, int w, int h) {
+    if (!g_texture_pack_replace || !s_vram || w <= 0 || h <= 0) return NULL;
+    if (w > 256) w = 256;
+    if (h > 256) h = 256;
+    uint64_t tex, pal;
+    hash_rect(texpage, clut_x, clut_y, u, v, w, h, (texpage >> 7) & 3, &tex, &pal);
+    s_lookups++;
+    const PackEntry *any = NULL;
+    for (const PackEntry *e = s_pack[(unsigned)(tex ^ (tex >> 23)) & (PACK_BUCKETS - 1)]; e; e = e->next) {
+        if (e->tex != tex) continue;
+        if (e->pal == pal) {
+            /* an exact palette variant must be a whole multiple of the rect */
+            if (e->img.w % w == 0 && e->img.h % h == 0 && e->img.w / w == e->img.h / h) { s_hits++; return &e->img; }
+        } else if (e->pal == 0 && !any) any = e;
+    }
+    if (any && any->img.w % w == 0 && any->img.h % h == 0 && any->img.w / w == any->img.h / h) { s_hits++; return &any->img; }
+    return NULL;
+}
+
+int texture_pack_stats_json(char *buf, int cap) {
+    return snprintf(buf, (size_t)cap, "{\"loaded\":%d,\"dir\":\"%s\",\"lookups\":%llu,\"hits\":%llu}",
+                    s_pack_n, s_pack_dir, (unsigned long long)s_lookups, (unsigned long long)s_hits);
 }

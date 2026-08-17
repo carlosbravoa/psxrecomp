@@ -6047,6 +6047,26 @@ static void handle_texture_dump(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"stats\":%s}", id, st);
 }
 
+/* texture_pack: {"cmd":"texture_pack","op":"load","dir":"/path"} loads a
+ * replacement pack (software renderer hi-res/wide targets sample it);
+ * op=unload; op=stats (default). See docs/TEXTURE_PACKS.md. */
+static void handle_texture_pack(int id, const char *json)
+{
+    char op[16] = "stats";
+    json_get_str(json, "op", op, sizeof(op));
+    if (strcmp(op, "load") == 0) {
+        char dir[1024] = "";
+        json_get_str(json, "dir", dir, sizeof(dir));
+        if (!dir[0]) { send_err(id, "missing dir"); return; }
+        if (texture_pack_load(dir) <= 0) { send_err(id, "no <tex_id>[-<pal_id>].png images found"); return; }
+    } else if (strcmp(op, "unload") == 0) {
+        texture_pack_unload();
+    }
+    char st[512];
+    texture_pack_stats_json(st, sizeof st);
+    send_fmt("{\"id\":%d,\"ok\":true,\"stats\":%s}", id, st);
+}
+
 extern int gpu_get_c0_count(void);
 extern int gpu_get_c0_history(int index, int *x, int *y, int *w, int *h,
                               uint32_t *func, uint32_t *sp, uint32_t *s1,
@@ -8761,13 +8781,14 @@ static void handle_screenshot_hires(int id, const char *json)
 
     uint32_t *argb = (uint32_t *)malloc((size_t)ow * oh * sizeof(uint32_t));
     if (!argb) { send_err(id, "alloc failed"); return; }
-    int got = gr_render_display_hires(argb, (int)ow, (int)di.display_x,
+    /* pitch is in BYTES (same contract as the SDL present path) */
+    int got = gr_render_display_hires(argb, (int)(ow * sizeof(uint32_t)), (int)di.display_x,
                                       (int)di.display_y, (int)w, (int)h);
     if (!got) {
         /* No hi-res surface (scale 1, or a backend without one): resolve the
          * native display instead and say so, rather than emitting a blank. */
         scale = 1; ow = w; oh = h;
-        got = gr_render_display(argb, (int)ow, (int)di.display_x,
+        got = gr_render_display(argb, (int)(ow * sizeof(uint32_t)), (int)di.display_x,
                                 (int)di.display_y, (int)w, (int)h);
         if (!got) { free(argb); send_err(id, "no display surface"); return; }
     }
@@ -13621,6 +13642,7 @@ static const CmdEntry s_commands[] = {
     { "a0_history",        handle_a0_history },
     { "vram_upload_log",   handle_vram_upload_log },
     { "texture_dump",      handle_texture_dump },
+    { "texture_pack",      handle_texture_pack },
     { "c0_history",        handle_c0_history },
     { "capture_quads",     handle_capture_quads },
     { "get_quads",         handle_get_quads },

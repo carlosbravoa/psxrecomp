@@ -28,6 +28,7 @@
  */
 
 #include "gpu_sw_renderer.h"
+#include "texture_pack.h"
 #include "gpu_vram_dirty.h"
 #include "gpu_sw_edges.h"
 #include <string.h>
@@ -322,6 +323,34 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
     t->buf[idx] = color;
     if (t->buf == g_vram)
         gpu_vram_dirty_mark_row((uint32_t)y);
+}
+
+/* ------------------------------------------------------------------ */
+/* Texture replacement (texture_pack.h, B3). Set per primitive by the   */
+/* sw_draw_textured_* entries for the hi-res / wide targets only; the  */
+/* native target never sees it, so VRAM stays byte-identical. The rect */
+/* (u0,v0,w,h) is the primitive's texel span the pack image covers.    */
+/* ------------------------------------------------------------------ */
+
+static const TexPackImage *g_rep = NULL;
+static int g_rep_u0, g_rep_v0, g_rep_w, g_rep_h;
+
+/* Sample the replacement at texel-space (fu, fv) (fractional native texel
+ * coordinates inside the primitive's span). Returns 0 = draw nothing here,
+ * else the 15-bit colour (with `stp` = the native texel's semi-transparency
+ * bit) in *out. */
+static inline int rep_sample(float fu, float fv, uint16_t native_texel, uint16_t *out) {
+    float ox = fu - (float)g_rep_u0, oy = fv - (float)g_rep_v0;
+    int rx = (int)(ox * (float)g_rep->w / (float)g_rep_w);
+    int ry = (int)(oy * (float)g_rep->h / (float)g_rep_h);
+    if (rx < 0) rx = 0; if (rx >= g_rep->w) rx = g_rep->w - 1;
+    if (ry < 0) ry = 0; if (ry >= g_rep->h) ry = g_rep->h - 1;
+    const uint8_t *p = g_rep->rgba + ((size_t)ry * g_rep->w + rx) * 4;
+    if (p[3] < 128) return 0;
+    uint16_t c = (uint16_t)((p[0] >> 3) | ((p[1] >> 3) << 5) | ((p[2] >> 3) << 10));
+    if (c == 0) c = 0x0001;                       /* opaque black must not read as "transparent" */
+    *out = (uint16_t)(c | (native_texel & 0x8000));
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -985,6 +1014,11 @@ static void raster_textured_triangle(const RTarget *t,
             uint16_t texel = g_texture_filter
                 ? texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y)
                 : texel_fetch((int)fu & 0xFF, (int)fv & 0xFF, texpage, clut_x, clut_y);
+            if (g_rep && t->s > 1) {
+                uint16_t rc;
+                if (!rep_sample(fu, fv, texel, &rc)) continue;
+                texel = rc;
+            }
             put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
         }
     }
@@ -1010,6 +1044,17 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
                              x2, y2, u2, v2, clut_x, clut_y, texpage,
                              g_perspective_valid,
                              g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
+    if (g_texture_pack_replace && (g_hr || g_wide_cur)) {
+        /* the same span rule as texture_pack_note_tri: uv bbox, inclusive when
+         * not a multiple of 8 */
+        int umin = min_i(u0, min_i(u1, u2)), umax = max_i(u0, max_i(u1, u2));
+        int vmin = min_i(v0, min_i(v1, v2)), vmax = max_i(v0, max_i(v1, v2));
+        int rw = umax - umin, rh = vmax - vmin;
+        if (rw <= 0 || (rw & 7)) rw += 1;
+        if (rh <= 0 || (rh & 7)) rh += 1;
+        g_rep = texture_pack_lookup_rect(texpage, clut_x, clut_y, umin, vmin, rw, rh);
+        g_rep_u0 = umin; g_rep_v0 = vmin; g_rep_w = rw; g_rep_h = rh;
+    }
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
@@ -1032,6 +1077,7 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
                                  g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
     precise_consumed();
+    g_rep = NULL;
 }
 
 static inline void color24_to_mod(uint32_t color, int *r, int *g, int *b) {
@@ -1305,6 +1351,11 @@ static void raster_textured_rect(const RTarget *t, int x, int y, int w, int h,
                 int tu = (u + col / s) & 0xFF;
                 texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
             }
+            if (g_rep && s > 1) {
+                uint16_t rc;
+                if (!rep_sample((float)u + (float)col / (float)s, fv, texel, &rc)) continue;
+                texel = rc;
+            }
             put_textured(t, px, py, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
         }
     }
@@ -1317,6 +1368,10 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
     if (g_texture_filter) sw_rect_uv_limits(u, v, u + w, v + h);
     RTarget n = rt_native();
     raster_textured_rect(&n, x, y, w, h, u, v, clut_x, clut_y, texpage);
+    if (g_texture_pack_replace && (g_hr || g_wide_cur)) {
+        g_rep = texture_pack_lookup_rect(texpage, clut_x, clut_y, u, v, w, h);
+        g_rep_u0 = u; g_rep_v0 = v; g_rep_w = w; g_rep_h = h;
+    }
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
@@ -1336,6 +1391,7 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
         } else
             raster_textured_rect(&wt, (x+dx)*s, y*s, w*s, h*s, u, v, clut_x, clut_y, texpage);
     }
+    g_rep = NULL;
 }
 
 /* ---- MMX6 native-wide reveal-column tile (host-side, WIDE SURFACE ONLY) --------
@@ -1396,6 +1452,11 @@ static void raster_textured_rect_scaled(const RTarget *t, int x, int y,
                 int tu = (int)(u0 + ((int64_t)du * col) / w) & 0xFF;
                 texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
             }
+            if (g_rep && t->s > 1) {
+                uint16_t rc;
+                if (!rep_sample((float)u0 + (float)du * (float)col / (float)w, fv, texel, &rc)) continue;
+                texel = rc;
+            }
             put_textured(t, px, py, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
         }
     }
@@ -1410,6 +1471,10 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
     RTarget n = rt_native();
     raster_textured_rect_scaled(&n, x, y, w, h, u0, v0, u1, v1,
                                 clut_x, clut_y, texpage);
+    if (g_texture_pack_replace && (g_hr || g_wide_cur) && u1 > u0 && v1 > v0) {
+        g_rep = texture_pack_lookup_rect(texpage, clut_x, clut_y, u0, v0, u1 - u0, v1 - v0);
+        g_rep_u0 = u0; g_rep_v0 = v0; g_rep_w = u1 - u0; g_rep_h = v1 - v0;
+    }
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
@@ -1426,6 +1491,7 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
         raster_textured_rect_scaled(&wt, (xl+dx)*s, y*s, (xr-xl)*s, h*s, u0, v0, u1, v1,
                                     clut_x, clut_y, texpage);
     }
+    g_rep = NULL;
 }
 
 /* ------------------------------------------------------------------ */
