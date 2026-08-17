@@ -93,6 +93,21 @@ static const struct { const char* key; const char* line; } s_queries[] = {
     { "display_ring_stats",    "{\"cmd\":\"display_ring_stats\"}" },
     { "gpu_ring_stats",        "{\"cmd\":\"gpu_ring_stats\"}" },
     { "input_route_status",    "{\"cmd\":\"input_route_status\"}" },
+    /* Thread / IRQ / CD trail for "the game froze / went black but keeps
+     * running" reports: the last scheduler escapes (incl. safety-net resumes),
+     * thread events, IRQ contexts, CD and IRQ state, registers, hot PCs. */
+    { "sched_escape_ring",     "{\"cmd\":\"sched_escape_ring\",\"count\":512}" },
+    { "thread_trace",          "{\"cmd\":\"thread_trace\",\"count\":2048}" },
+    { "thread_ctx_ring",       "{\"cmd\":\"thread_ctx_ring\"}" },
+    { "irqctx_ring",           "{\"cmd\":\"irqctx_ring\",\"count\":256}" },
+    { "event_ring_tail",       "{\"cmd\":\"event_ring_tail\",\"n\":128}" },
+    { "cdrom_state",           "{\"cmd\":\"cdrom_state\"}" },
+    { "cdrom_command_history", "{\"cmd\":\"cdrom_command_history\"}" },
+    { "irq_state",             "{\"cmd\":\"irq_state\"}" },
+    { "dma_state",             "{\"cmd\":\"dma_state\"}" },
+    { "get_registers",         "{\"cmd\":\"get_registers\"}" },
+    { "phase_hot_static",      "{\"cmd\":\"phase_hot\",\"set\":\"static\",\"top\":16}" },
+    { "cycles_to_next_event",  "{\"cmd\":\"cycles_to_next_event\"}" },
 };
 
 int bug_report_capture(const char* trigger) {

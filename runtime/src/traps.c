@@ -60,9 +60,16 @@ typedef struct SchedEscapeEntry {
     uint32_t ra;
     uint32_t sp;
 } SchedEscapeEntry;
-#define SCHED_ESCAPE_RING_CAP 256u
+#define SCHED_ESCAPE_RING_CAP 1024u
 PSX_BSS SchedEscapeEntry g_sched_escape_ring[SCHED_ESCAPE_RING_CAP];
 uint64_t g_sched_escape_seq = 0;
+/* Pseudo-reason logged (never dispatched) when the one-level switch-back safety
+ * net in psx_scheduler_run resumes a yielder because the target's top-level
+ * dispatch RETURNED (cpu->pc==0) instead of yielding — a thread lost the rest
+ * of its slice. Counted so a bug-report bundle shows it at a glance. */
+#define PSX_RUN_SAFETY_NET_RESUME 100u
+uint64_t g_sched_safety_net_count = 0;
+uint32_t g_sched_safety_net_last_frame = 0;
 
 static void sched_escape_ring_log(CPUState* cpu, uint32_t reason,
                                   uint32_t current_tcb, uint32_t target_tcb,
@@ -897,7 +904,15 @@ void psx_scheduler_run(CPUState* cpu)
         if (psx_is_valid_tcb(cpu, g_sched_return_tcb) &&
             g_sched_return_tcb != psx_current_tcb_ptr(cpu)) {
             uint32_t yielder = g_sched_return_tcb;
+            uint32_t abandoned = psx_current_tcb_ptr(cpu);
             g_sched_return_tcb = 0;
+            /* Telemetry first (current = the thread whose dispatch returned,
+             * target = the yielder we fall back to, resume_pc = its saved
+             * resume PC is unknown here -> the abandoned thread's $ra). */
+            g_sched_safety_net_count++;
+            { extern uint64_t s_frame_count; g_sched_safety_net_last_frame = (uint32_t)s_frame_count; }
+            sched_escape_ring_log(cpu, PSX_RUN_SAFETY_NET_RESUME, abandoned, yielder, cpu->gpr[31]);
+            debug_server_log_thread_event(40, cpu, abandoned, yielder, cpu->gpr[31]);
             psx_set_current_tcb(cpu, yielder);
             g_sched_escape.reason = PSX_RUN_YIELD_TO_TCB;
             sched_escape_ring_log(cpu, PSX_RUN_YIELD_TO_TCB,

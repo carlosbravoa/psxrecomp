@@ -4075,6 +4075,7 @@ static const char *thread_kind_name(uint32_t kind)
         case 31: return "inexc_switch_defer";
         case 32: return "deferred_switch_escape";
         case 33: return "deferred_switch_stale";
+        case 40: return "sched_safety_net_resume";    /* target's top-level dispatch returned pc==0 -> yielder resumed (traps.c) */
         default: return "unknown";
     }
 }
@@ -9977,6 +9978,41 @@ static void handle_d44_ring(int id, const char *json)
  * callback word [0x80079D44], CD-DMA-active + dma-depth, and COP0/IRQ state. Shows
  * whether VBlank was delivered while 0x80079D44 was the clobbered 0x016F0110 AND a
  * CD DMA was mid-transfer (the VSync-in-DMA-window bug). */
+/* sched_escape_ring: the deterministic scheduler's structured escapes (traps.c
+ * g_sched_escape_ring): every ChangeThread / RFE-yield / resume-at, plus the
+ * one-level safety-net resumes (reason 100 = a thread's top-level dispatch
+ * returned pc==0 and control fell back to its yielder). {"count":N} newest N. */
+static void handle_sched_escape_ring(int id, const char *json)
+{
+    typedef struct { uint32_t seq, frame, reason, current_tcb, target_tcb, resume_pc, pc, ra, sp; } E;
+    extern E g_sched_escape_ring[]; extern uint64_t g_sched_escape_seq;
+    extern uint64_t g_sched_safety_net_count; extern uint32_t g_sched_safety_net_last_frame;
+    const uint32_t cap = 1024u;   /* SCHED_ESCAPE_RING_CAP in traps.c */
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > (int)cap) count = (int)cap;
+    uint64_t total = g_sched_escape_seq;
+    uint32_t avail = total < cap ? (uint32_t)total : cap;
+    uint32_t n = (uint32_t)count < avail ? (uint32_t)count : avail;
+    size_t BUF_SZ = 512u + (size_t)n * 200u;
+    char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = (size_t)snprintf(buf, BUF_SZ,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"safety_net_resumes\":%llu,\"safety_net_last_frame\":%u,"
+        "\"reasons\":{\"0\":\"continue\",\"1\":\"yield_to_tcb\",\"2\":\"resume_current\",\"3\":\"guest_exit\",\"4\":\"return_to_lobby\",\"5\":\"fatal\",\"100\":\"safety_net_resume\"},"
+        "\"entries\":[",
+        id, (unsigned long long)total, (unsigned long long)g_sched_safety_net_count, g_sched_safety_net_last_frame);
+    for (uint32_t i = 0; i < n && pos < BUF_SZ - 256; i++) {
+        uint64_t idx = total - n + i;
+        const E *e = &g_sched_escape_ring[idx & (cap - 1u)];
+        pos += (size_t)snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%u,\"frame\":%u,\"reason\":%u,\"cur\":\"0x%08X\",\"target\":\"0x%08X\",\"resume_pc\":\"0x%08X\",\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\"}",
+            i ? "," : "", e->seq, e->frame, e->reason, e->current_tcb, e->target_tcb, e->resume_pc, e->pc, e->ra, e->sp);
+    }
+    snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 static void handle_irqctx_ring(int id, const char *json)
 {
     typedef struct { uint64_t seq, cycle; uint32_t frame, istat, imask, sr, d44,
@@ -13621,6 +13657,7 @@ static const CmdEntry s_commands[] = {
     { "wtrace_clear",        handle_wtrace_clear },
     { "freeze_check",      handle_freeze_check },
     { "d44_ring",          handle_d44_ring },
+    { "sched_escape_ring", handle_sched_escape_ring },
     { "irqctx_ring",       handle_irqctx_ring },
     { "sp_ring",           handle_sp_ring },
     { "disp_ring",         handle_disp_ring },

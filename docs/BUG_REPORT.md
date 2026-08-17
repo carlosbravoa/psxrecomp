@@ -20,7 +20,18 @@ skip, turbo loads) and `runtime` — the JSON answers of `ping` (frame counter,
 dispatch misses), `gpu_state`, `video_filter`, `window_size`, `gl_interp`,
 `gl_present_ring` (last 16), `overlay_loader_status`, `autocompile_status`,
 `pad_status`, `turbo_state`, `display_ring_stats`, `gpu_ring_stats`,
-`input_route_status`. It is built with `debug_server_run_local()`, so a bundle
+`input_route_status`, plus the **thread / IRQ / CD trail** for "the picture
+froze or went black but the game keeps running" reports: `sched_escape_ring`
+(the deterministic scheduler's last 512 structured escapes — every
+ChangeThread / RFE yield / resume-at, with `safety_net_resumes` = times a
+thread's top-level dispatch returned pc==0 and control fell back to its
+yielder, reason 100), `thread_trace` (last 2048 thread events),
+`thread_ctx_ring`, `irqctx_ring` (last 256 IRQ contexts), `event_ring_tail`,
+`cdrom_state`, `cdrom_command_history`, `irq_state`, `dma_state`,
+`get_registers`, `phase_hot` (static hot PCs), `cycles_to_next_event`.
+`tools/bugreport_threads.py <bundle>` prints that trail readably (escape
+cadence per frame, non-routine thread events, hot PCs). It is built with
+`debug_server_run_local()`, so a bundle
 from a release build is directly comparable with a live debug session, and
 adding telemetry = adding a debug command (`runtime/src/bug_report.c`).
 
