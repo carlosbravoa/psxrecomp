@@ -442,6 +442,14 @@ struct RuntimeConfig {
     // ignored and a trusted activation plugin owns the runtime switch.
     bool                  video_offer_skip_fmv = true;
 
+    // texture_pack: directory (relative to the project root) of an HD
+    // texture-replacement pack (docs/TEXTURE_PACKS.md): <tex_id>[-<pal_id>].png
+    // at integer multiples of the native texel rect. Empty = none offered.
+    // texture_pack_enabled: default state of the launcher's "HD textures"
+    // toggle (settings.toml overrides). Byte-identical when off.
+    std::filesystem::path video_texture_pack;
+    bool                  video_texture_pack_enabled = true;
+
     // fmv_skip_*: per-game FMV instant-skip via the game's own end-of-movie path.
     // Some players (Tomba) end a movie when the streamed frame number reaches that
     // movie's per-movie frame total minus a small offset. When auto_skip_fmv is on
@@ -1099,6 +1107,7 @@ struct UserSettings {
     bool has_scanline_size    = false; double scanline_size    = 0.35;
     bool has_scanline_glow    = false; double scanline_glow    = 0.50;
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
+    bool has_texture_pack   = false; bool texture_pack   = true;  // HD textures toggle
     // [video] turbo_loads: DEPRECATED AND IGNORED — the legacy home of the
     // generic Turbo loads switch, back when the launcher drew a row for it.
     // Load acceleration now lives in the Mods catalog (see

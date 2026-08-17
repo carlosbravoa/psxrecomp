@@ -596,6 +596,12 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("offer_skip_fmv")) {
             rt.video_offer_skip_fmv = toml::find<bool>(video, "offer_skip_fmv");
         }
+        if (video.contains("texture_pack")) {
+            const std::string tp = toml::find<std::string>(video, "texture_pack");
+            if (!tp.empty()) rt.video_texture_pack = fs::absolute(root / tp);
+        }
+        if (video.contains("texture_pack_enabled"))
+            rt.video_texture_pack_enabled = toml::find<bool>(video, "texture_pack_enabled");
         if (video.contains("fmv_skip_total_table")) {
             rt.video_fmv_skip_total_table =
                 (uint32_t)toml::find<int64_t>(video, "fmv_skip_total_table");
@@ -2211,6 +2217,9 @@ UserSettings load_user_settings(const fs::path& path) {
         if (v.contains("auto_skip_fmv")) try_get([&]{
             s.auto_skip_fmv = toml::find<bool>(v, "auto_skip_fmv"); s.has_auto_skip_fmv = true;
         });
+        if (v.contains("texture_pack")) try_get([&]{
+            s.texture_pack = toml::find<bool>(v, "texture_pack"); s.has_texture_pack = true;
+        });
         // Deprecated and ignored: read only so the runtime can report that a
         // stale value was found (and so the next save drops it). Never applied
         // — see UserSettings::turbo_loads in config_loader.h.
@@ -2519,6 +2528,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (s.has_scanline_glow)    f << "scanline_glow     = " << s.scanline_glow << "\n";
     if (s.has_auto_skip_fmv)
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
+    if (s.has_texture_pack)
+        f << "texture_pack      = " << (s.texture_pack ? "true" : "false") << "\n";
     /* turbo_loads is deliberately NOT written back: it is deprecated and no
      * longer restored, so re-emitting it would preserve a dead row that looks
      * authoritative. Omitting it lets an existing settings.toml self-clean on

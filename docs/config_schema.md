@@ -428,6 +428,13 @@ Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc
 - `default_game_root` — for sibling-junction setups
 
+### `texture_pack` — HD texture replacement (docs/TEXTURE_PACKS.md)
+
+| Field | Meaning |
+|---|---|
+| `texture_pack` | directory (relative to the project root) of `<tex_id>[-<pal_id>].png` replacements at integer multiples of the native texel rect; offered in the launcher ("HD textures") only when it exists |
+| `texture_pack_enabled` | default of the launcher toggle (`settings.toml [video] texture_pack` overrides). Off = byte-identical. Visible only with `supersampling >= 2`. |
+
 ## Audit block
 
 See `docs/audit_inventory.md` for the audit pipeline. The schema here is

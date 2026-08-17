@@ -128,11 +128,44 @@ Replaced colours keep 8-bit precision on GL (the software path quantises to
 Not on GL yet: shaded-textured triangles, bilinear sampling of pack images
 (nearest only), the Vulkan backend (unfiltered by design, like video filters).
 
-## Next (B7+)
+## Configuration and authoring (B7)
 
-`[video] texture_pack` key + launcher row; coverage tooling per stage;
+```toml
+[video]
+texture_pack = "game-assets/textures/pack"   # relative to the project root; offered only when the dir exists
+texture_pack_enabled = true                  # default of the launcher toggle
+```
+
+The launcher's Display page gains an **"HD textures"** checkbox (with the
+pack directory name) when the directory exists; the choice persists in
+`settings.toml` (`[video] texture_pack = true|false`) and applies live from
+the in-game launcher too. `PSX_TEXTURE_PACK=<dir>` still overrides for one
+run; the `texture_pack` debug command loads/unloads at runtime. Remember the
+pack is only *visible* at `[video] supersampling` ≥ 2 (launcher: Display →
+Supersampling) — at 1× the renderers draw native texels.
+
+`tools/texpack.py` (Pillow only):
+
+```
+texpack.py summary  DUMPDIR                     pairs / texel ids / sizes / pages
+texpack.py starter  DUMPDIR PACKDIR --scale N   one <tex_id>.png per texel id, N x nearest —
+                                                the pixel-identical skeleton artists repaint
+                                                (--palette all keeps every <tex>-<pal>.png variant)
+texpack.py coverage PACKDIR TSV...              covered texel ids / exact-palette pairs, --missing out.tsv
+texpack.py validate PACKDIR [--tsv TSV]         names, alpha channel, integer-multiple sizes
+texpack.py sheet    DIR OUT.png                 contact sheet of a dump or a pack
+```
+
+Workflow: play (or script) through the game with `texture_dump` armed →
+`starter` → repaint the PNGs you care about (keep the size an integer
+multiple of the native rect; alpha 0 = transparent) → `validate` →
+`coverage` against new dumps as you play further → drop the pack directory
+where `[video] texture_pack` points and toggle it in the launcher.
+
+## Next (B9+)
+
 DEGRADED logging when a pack entry's native hash no longer matches;
-fade-aware palette handling.
+fade-aware palette handling; bilinear pack sampling; SW-vs-GL parity tool.
 
 ## Files
 
@@ -142,4 +175,8 @@ dump, pack loading — private static `stb_image` PNG decoder),
 (replacement sampling in the S× rasterisers), `runtime/src/gpu_gl_renderer.c`
 (atlas + shader path), `runtime/src/png_write.h`
 (`png_write_rgba`), `runtime/src/debug_server.c` (`texture_dump`,
-`texture_pack`; `screenshot_hires` pitch fix), `runtime/tests/test_texture_pack.c`.
+`texture_pack`; `screenshot_hires` pitch fix), `runtime/tests/test_texture_pack.c`,
+`recompiler/src/config_loader.{h,cpp}` (`[video] texture_pack`, settings),
+`runtime/src/main.cpp` (load + launcher glue), `tools/texpack.py`, and in
+recomp-ui `recomp_launcher.h` / `launcher_model.{h,c}` / `launcher_imgui.cpp`
+(the "HD textures" row, `RECOMP_LAUNCHER_HAS_TEXTURE_PACK`).

@@ -79,6 +79,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "disc_identity.h"
 #include "disc_path.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
+#include "texture_pack.h"    /* HD texture packs (docs/TEXTURE_PACKS.md) */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #include "psx_window_icon.h"
 
@@ -1133,6 +1134,10 @@ static int           g_video_win_w    = 1280; /* window width (height follows as
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_audio_freq     = 44100; /* host device request */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
+/* HD texture pack (docs/TEXTURE_PACKS.md): [video] texture_pack dir; the
+ * launcher's "HD textures" toggle / settings.toml [video] texture_pack. */
+static std::string   g_texture_pack_dir;
+static int           g_texture_pack_enabled = 1;
 static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/150/200) */
 static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
 static int           g_hotkey_pad_rewind = 1272;       /* select + r3 */
@@ -10657,6 +10662,16 @@ namespace {
         gi->assist_binding_count = PSX_ASSIST_BIND_COUNT;
         gi->has_skip_fmv = skip_fmv_offered_b ? 1 : 0;
         gi->has_turbo_loads = turbo_loads_offered_b ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_TEXTURE_PACK)
+        gi->has_texture_pack = g_texture_pack_dir.empty() ? 0 : 1;
+        {
+            static std::string s_tp_label;
+            s_tp_label = g_texture_pack_dir.empty()
+                ? std::string()
+                : std::filesystem::path(g_texture_pack_dir).filename().string();
+            gi->texture_pack_label = s_tp_label.empty() ? nullptr : s_tp_label.c_str();
+        }
+#endif
         gi->has_geometry_precision = 1;
         gi->has_rewind_depth = 1;
 #if defined(RECOMP_LAUNCHER_HAS_VIDEO_FILTER)
@@ -11277,6 +11292,18 @@ int main(int argc, char** argv) {
                                           (int)gc.ws_backdrop_x_sites.size());
             g_audio_spu_hq     = gc.runtime.audio_spu_hq;
             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
+            g_texture_pack_dir = gc.runtime.video_texture_pack.string();
+            g_texture_pack_enabled = gc.runtime.video_texture_pack_enabled ? 1 : 0;
+            if (!g_texture_pack_dir.empty()) {
+                std::error_code tp_ec;
+                if (!std::filesystem::is_directory(g_texture_pack_dir, tp_ec)) {
+                    /* Not offered (no launcher row, nothing loaded) until the
+                     * directory exists — a fresh checkout has no pack yet. */
+                    std::fprintf(stdout, "psxrecomp: [video] texture_pack %s not found; HD textures not offered\n",
+                                 g_texture_pack_dir.c_str());
+                    g_texture_pack_dir.clear();
+                }
+            }
             /* [controller] game-declared input defaults (settings.toml/launcher
              * still override below). */
             if (gc.runtime.has_default_mode) {
@@ -11462,6 +11489,7 @@ int main(int argc, char** argv) {
         if (us.has_scanline_size)    g_scan.size    = (float)us.scanline_size;
         if (us.has_scanline_glow)    g_scan.glow    = (float)us.scanline_glow;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
+        if (us.has_texture_pack)   g_texture_pack_enabled = us.texture_pack ? 1 : 0;
         /* turbo_loads is deliberately NOT restored from settings.toml. It is a
          * write-only latch: the launcher stopped drawing a Turbo loads row when
          * load acceleration moved to the Mods catalog, so a persisted `true`
@@ -11895,6 +11923,8 @@ int main(int argc, char** argv) {
             seed.video_filter = video_filter_name(g_video_filter); seed.has_video_filter = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);
             seed.has_auto_skip_fmv = skip_fmv_offered;
+            seed.texture_pack = (g_texture_pack_enabled != 0);
+            seed.has_texture_pack = !g_texture_pack_dir.empty();
             seed.turbo_loads = (g_turbo_loads_enabled != 0);
             seed.has_turbo_loads = turbo_loads_offered;
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
@@ -12079,6 +12109,9 @@ int main(int argc, char** argv) {
                 normalize_hotkey_pad_binding(seed.hotkey_pad_save_state_menu,
                     PSX_HOTKEY_PAD_SELECT_R1);
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_TEXTURE_PACK)
+            ls.texture_pack       = seed.texture_pack ? 1 : 0;
+#endif
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
             /* Localization: index of resolved_language within lang_menu_options
              * (match by code; games with no [runtime].languages list leave
@@ -12328,6 +12361,10 @@ int main(int argc, char** argv) {
                 seed.has_hotkey_pad_save_state_menu = true;
                 seed.auto_skip_fmv = ls.auto_skip_fmv != 0;
                 seed.has_auto_skip_fmv = skip_fmv_offered;
+#if defined(RECOMP_LAUNCHER_HAS_TEXTURE_PACK)
+                seed.texture_pack = ls.texture_pack != 0;
+                seed.has_texture_pack = !g_texture_pack_dir.empty();
+#endif
                 seed.turbo_loads = ls.turbo_loads != 0;
                 seed.has_turbo_loads = turbo_loads_offered;
                 host_volume_set(ls.volume);
@@ -12515,6 +12552,7 @@ int main(int argc, char** argv) {
                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv = skip_fmv_offered && seed.auto_skip_fmv ? 1 : 0;
+                if (seed.has_texture_pack) g_texture_pack_enabled = seed.texture_pack ? 1 : 0;
                 g_turbo_loads_enabled =
                     turbo_loads_offered && seed.turbo_loads ? 1 : 0;
                 fast_boot = seed.fast_boot;
@@ -12948,6 +12986,20 @@ session_reboot:
     if (g_audio_spu_hq)
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
+    /* HD texture pack ([video] texture_pack + the "HD textures" toggle). The
+     * PSX_TEXTURE_PACK environment override is honoured by texture_pack.c on
+     * first use and wins over this. Off = nothing loaded, byte-identical. */
+    if (!g_texture_pack_dir.empty()) {
+        if (g_texture_pack_enabled) {
+            const int n = texture_pack_load(g_texture_pack_dir.c_str());
+            std::fprintf(stdout, "psxrecomp: HD texture pack %s (%d images)%s\n",
+                         g_texture_pack_dir.c_str(), n,
+                         n ? "" : " — none loaded (missing directory or no <tex_id>.png files)");
+        } else {
+            std::fprintf(stdout, "psxrecomp: HD texture pack %s available, disabled by settings\n",
+                         g_texture_pack_dir.c_str());
+        }
+    }
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
 
     /* A disc was requested but nothing mounted. cdrom_init() is non-fatal here
@@ -13901,6 +13953,9 @@ soft_return_lobby:
         ls.frame_interp_fps = g_frame_interpolation_fps;
         ls.spu_hq = g_audio_spu_hq ? 1 : 0;
         ls.auto_skip_fmv = (skip_fmv_offered && g_auto_skip_fmv) ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_TEXTURE_PACK)
+        ls.texture_pack = g_texture_pack_enabled ? 1 : 0;
+#endif
         ls.turbo_loads = (turbo_loads_offered && g_turbo_loads_enabled) ? 1 : 0;
         ls.rewind_depth = g_rewind_depth;
         ls.rewind_interval = g_rewind_interval;
@@ -14182,6 +14237,10 @@ soft_return_lobby:
                 us.has_hotkey_pad_save_state_menu = true;
                 us.auto_skip_fmv = ls.auto_skip_fmv != 0;
                 us.has_auto_skip_fmv = skip_fmv_offered;
+#if defined(RECOMP_LAUNCHER_HAS_TEXTURE_PACK)
+                us.texture_pack = ls.texture_pack != 0;
+                us.has_texture_pack = !g_texture_pack_dir.empty();
+#endif
                 us.turbo_loads = ls.turbo_loads != 0;
                 us.has_turbo_loads = turbo_loads_offered;
                 us.fullscreen = ls.fullscreen != 0;
@@ -14231,6 +14290,16 @@ soft_return_lobby:
              * enabled mod silently back off on the first in-game Apply. The
              * offered flags are false for both, so leave both globals alone. */
             if (skip_fmv_offered)     g_auto_skip_fmv = ls.auto_skip_fmv ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_TEXTURE_PACK)
+            if (!g_texture_pack_dir.empty()) {
+                g_texture_pack_enabled = ls.texture_pack ? 1 : 0;
+                if (g_texture_pack_enabled) {
+                    const int n = texture_pack_load(g_texture_pack_dir.c_str());
+                    std::fprintf(stdout, "psxrecomp: HD texture pack %s (%d images)\n",
+                                 g_texture_pack_dir.c_str(), n);
+                } else texture_pack_unload();
+            }
+#endif
             if (turbo_loads_offered)  g_turbo_loads_enabled = ls.turbo_loads ? 1 : 0;
             g_fullscreen = ls.fullscreen != 0;
             g_frame_interpolation = ls.frame_interp ? 1 : 0;
