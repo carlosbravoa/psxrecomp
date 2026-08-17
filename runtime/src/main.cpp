@@ -5489,18 +5489,40 @@ enum {
     SYSM_FPS,
     SYSM_FILTER,
     SYSM_VIDEO_FILTER,
-    SYSM_SCAN_OPACITY,
-    SYSM_SCAN_SIZE,
-    SYSM_SCAN_GLOW,
+    SYSM_SCANLINES,       /* one row for opacity/size/glow; only when the
+                             scanlines filter is active */
     SYSM_RESTART,
     SYSM_QUIT,
     SYSM_COUNT
 };
 
 static int  g_sysmenu_open = 0;
-static int  g_sysmenu_sel  = 0;
+static int  g_sysmenu_sel  = 0;   /* index into the VISIBLE rows */
+/* Which of the three scanline parameters LEFT/RIGHT adjust on the SCANLINES
+ * row (0 opacity, 1 size, 2 glow); Enter cycles it. Bracketed in the label. */
+static int  g_sysmenu_scan_field = 0;
 static char *g_saved_argv[64];
 static int   g_saved_argc = 0;
+
+/* Rows are conditional (the scanline row exists only while that filter is the
+ * active one), so the on-screen index is not the row id. `ids` receives the
+ * visible rows in order; returns their count. */
+static int sysmenu_visible_ids(int ids[SYSM_COUNT]) {
+    int n = 0;
+    for (int id = 0; id < SYSM_COUNT; ++id) {
+        if (id == SYSM_SCANLINES && video_filter_get() != VF_SCANLINES) continue;
+        ids[n++] = id;
+    }
+    return n;
+}
+
+static int sysmenu_selected_id(void) {
+    int ids[SYSM_COUNT];
+    const int n = sysmenu_visible_ids(ids);
+    if (g_sysmenu_sel < 0) g_sysmenu_sel = 0;
+    if (g_sysmenu_sel >= n) g_sysmenu_sel = n - 1;
+    return ids[g_sysmenu_sel];
+}
 
 static int sysmenu_is_fullscreen(void) {
     return sdl_window &&
@@ -5520,7 +5542,8 @@ static void sysmenu_set_fullscreen(int on) {
     SDL_SetWindowFullscreen(sdl_window, target);
 }
 
-static void sysmenu_build_rows(char rows[SYSM_COUNT][40]) {
+/* Formats every row by id; the visible subset is picked below. */
+static void sysmenu_build_all_rows(char rows[SYSM_COUNT][40]) {
     const int have_skip = savestate_slot_exists(SAVESTATE_SLOT_SKIP_POINT);
     snprintf(rows[SYSM_RESUME],     sizeof rows[0], "RESUME");
     snprintf(rows[SYSM_SKIP_GOTO],  sizeof rows[0], "GO TO SKIP POINT%s",
@@ -5548,21 +5571,49 @@ static void sysmenu_build_rows(char rows[SYSM_COUNT][40]) {
         snprintf(rows[SYSM_VIDEO_FILTER], sizeof rows[0], "VIDEO FILTER %s", up);
     }
     {
+        /* All three scanline parameters on ONE row, directly under
+         * "VIDEO FILTER SCANLINES" (the row exists only then). The parameter
+         * LEFT/RIGHT adjust is bracketed; Enter cycles it. Worst case
+         * "[DARK 100%] SIZE 80% GLOW 100%" is 30 columns, the widest label the
+         * panel draws inside its row box (16 px glyphs from x=96 to 580). */
         VideoScanlineParams sp; video_filter_scanline_get(&sp);
-        snprintf(rows[SYSM_SCAN_OPACITY], sizeof rows[0], "SCANLINE DARK %d%%", (int)(sp.opacity * 100.f + 0.5f));
-        snprintf(rows[SYSM_SCAN_SIZE],    sizeof rows[0], "SCANLINE SIZE %d%%", (int)(sp.size * 100.f + 0.5f));
-        snprintf(rows[SYSM_SCAN_GLOW],    sizeof rows[0], "SCANLINE GLOW %d%%", (int)(sp.glow * 100.f + 0.5f));
+        const int v[3] = { (int)(sp.opacity * 100.f + 0.5f),
+                           (int)(sp.size    * 100.f + 0.5f),
+                           (int)(sp.glow    * 100.f + 0.5f) };
+        static const char *const name[3] = { "DARK", "SIZE", "GLOW" };
+        char *p = rows[SYSM_SCANLINES];
+        size_t left = sizeof rows[0];
+        for (int f = 0; f < 3; ++f) {
+            const int hot = (f == g_sysmenu_scan_field);
+            int w = snprintf(p, left, "%s%s%s %d%%%s", f ? " " : "",
+                             hot ? "[" : "", name[f], v[f], hot ? "]" : "");
+            if (w < 0 || (size_t)w >= left) break;
+            p += w; left -= (size_t)w;
+        }
     }
     snprintf(rows[SYSM_RESTART],    sizeof rows[0], "RESTART GAME");
     snprintf(rows[SYSM_QUIT],       sizeof rows[0], "QUIT");
 }
 
+/* Visible rows, in display order. Returns the count. */
+static int sysmenu_build_rows(char rows[SYSM_COUNT][40]) {
+    char all[SYSM_COUNT][40];
+    int ids[SYSM_COUNT];
+    const int n = sysmenu_visible_ids(ids);
+    sysmenu_build_all_rows(all);
+    for (int i = 0; i < n; ++i)
+        memcpy(rows[i], all[ids[i]], sizeof rows[0]);
+    return n;
+}
+
 static void sysmenu_sync(void) {
     char rows[SYSM_COUNT][40];
     const char *ptrs[SYSM_COUNT];
-    sysmenu_build_rows(rows);
-    for (int i = 0; i < SYSM_COUNT; ++i) ptrs[i] = rows[i];
-    psx_system_menu_set_items(g_sysmenu_open, g_sysmenu_sel, ptrs, SYSM_COUNT);
+    const int n = sysmenu_build_rows(rows);
+    if (g_sysmenu_sel >= n) g_sysmenu_sel = n - 1;
+    if (g_sysmenu_sel < 0) g_sysmenu_sel = 0;
+    for (int i = 0; i < n; ++i) ptrs[i] = rows[i];
+    psx_system_menu_set_items(g_sysmenu_open, g_sysmenu_sel, ptrs, n);
 }
 
 /* The overlay is composited in the present path, not into VRAM, so `screenshot`
@@ -5572,11 +5623,11 @@ static void sysmenu_sync(void) {
 extern "C" int psx_system_menu_debug_rows(char *out, int cap) {
     char rows[SYSM_COUNT][40];
     int n = 0;
-    sysmenu_build_rows(rows);
-    for (int i = 0; i < SYSM_COUNT && n < cap - 2; ++i)
+    const int count = sysmenu_build_rows(rows);
+    for (int i = 0; i < count && n < cap - 2; ++i)
         n += snprintf(out + n, (size_t)(cap - n), "%s%s",
                       i ? "|" : "", rows[i]);
-    return SYSM_COUNT;
+    return count;
 }
 
 static void sysmenu_quit(void) {
@@ -5620,7 +5671,7 @@ static void sysmenu_close(void) {
 static void persist_video_filter_setting(int kind);   /* defined with the settings path */
 static void persist_scanline_settings(void);
 static void sysmenu_activate(int delta) {
-    switch (g_sysmenu_sel) {
+    switch (sysmenu_selected_id()) {
     case SYSM_RESUME:
         if (delta == 0) sysmenu_close();
         break;
@@ -5676,13 +5727,18 @@ static void sysmenu_activate(int delta) {
         gr_set_texture_filter(g_video_texfilter);
         sysmenu_sync();
         break;
-    case SYSM_SCAN_OPACITY:
-    case SYSM_SCAN_SIZE:
-    case SYSM_SCAN_GLOW: {
+    case SYSM_SCANLINES: {
+        /* Enter moves the bracket to the next parameter; LEFT/RIGHT step the
+         * bracketed one by 5 % (video_filter_scanline_set clamps). */
+        if (delta == 0) {
+            g_sysmenu_scan_field = (g_sysmenu_scan_field + 1) % 3;
+            sysmenu_sync();
+            break;
+        }
         VideoScanlineParams sp; video_filter_scanline_get(&sp);
         const float step = (delta < 0 ? -0.05f : 0.05f);
-        float* v = g_sysmenu_sel == SYSM_SCAN_OPACITY ? &sp.opacity
-                 : g_sysmenu_sel == SYSM_SCAN_SIZE ? &sp.size : &sp.glow;
+        float* v = g_sysmenu_scan_field == 0 ? &sp.opacity
+                 : g_sysmenu_scan_field == 1 ? &sp.size : &sp.glow;
         *v += step;
         video_filter_scanline_set(&sp);
         video_filter_scanline_get(&g_scan);
@@ -5729,13 +5785,13 @@ static int system_menu_handle_key(SDL_Keycode key) {
         sysmenu_close();
         return 1;
     case SDLK_UP:
-        g_sysmenu_sel = (g_sysmenu_sel + SYSM_COUNT - 1) % SYSM_COUNT;
+    case SDLK_DOWN: {
+        int ids[SYSM_COUNT];
+        const int n = sysmenu_visible_ids(ids);
+        g_sysmenu_sel = (g_sysmenu_sel + n + (key == SDLK_UP ? -1 : 1)) % n;
         sysmenu_sync();
         return 1;
-    case SDLK_DOWN:
-        g_sysmenu_sel = (g_sysmenu_sel + 1) % SYSM_COUNT;
-        sysmenu_sync();
-        return 1;
+    }
     case SDLK_LEFT:
         sysmenu_activate(-1);
         return 1;

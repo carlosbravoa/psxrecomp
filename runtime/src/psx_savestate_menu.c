@@ -60,7 +60,10 @@ static int s_confirm;
 /* System menu (ESC). It shares this module's panel and the three compositing
  * sites that already blit it, so adding it here costs nothing in the GL, VK and
  * software present paths. Only one of the two can be open at a time. */
-#define SYS_MENU_MAX   12
+/* Storage cap only: rasterize_system_panel() shrinks the row pitch so every row
+ * handed over (plus the key hint under them) stays inside the 480-px panel;
+ * 16 rows is the last count with a readable pitch (see SYS_ROW_H_MIN). */
+#define SYS_MENU_MAX   16
 #define SYS_MENU_LABEL_CAP 40
 static int  s_sys_open;
 static int  s_sys_sel;
@@ -249,12 +252,28 @@ static void draw_confirm_banner(void)
               "ENTER CONFIRMS      ESC CANCELS", 0xFFC8D2E4u, 1);
 }
 
+/* Row pitch: 34 px when the list is short, shrinking so that every row AND the
+ * key hint below them fit the panel. The caller decides how many rows exist
+ * (some are conditional), so the panel must never drop the last ones — that
+ * is how QUIT went missing when three scanline rows were added. Rows are 16-px
+ * glyphs (scale 2), so the pitch never goes below SYS_ROW_H_MIN. */
+#define SYS_ROWS_TOP   62
+#define SYS_HINT_H     30   /* 18 px gap + 8 px glyphs + 4 px margin */
+#define SYS_ROW_H_MAX  34
+#define SYS_ROW_H_MIN  24
+
 static void rasterize_system_panel(void)
 {
     int i;
     const int n = s_sys_count > 0 ? s_sys_count : 0;
-    const int row_h = 34;
-    const int top = 62;
+    const int top = SYS_ROWS_TOP;
+    int row_h = SYS_ROW_H_MAX;
+
+    if (n > 0) {
+        row_h = (SSM_H - top - SYS_HINT_H) / n;
+        if (row_h > SYS_ROW_H_MAX) row_h = SYS_ROW_H_MAX;
+        if (row_h < SYS_ROW_H_MIN) row_h = SYS_ROW_H_MIN;
+    }
 
     for (i = 0; i < SSM_W * SSM_H; i++)
         s_panel[i] = 0xFF0F1118u;
@@ -265,12 +284,13 @@ static void rasterize_system_panel(void)
 
     for (i = 0; i < n; i++) {
         const int y = top + i * row_h;
+        const int box_h = row_h - 6;
         const int sel = (i == s_sys_sel);
-        fill_rect(s_panel, 60, y, SSM_W - 120, row_h - 6,
+        fill_rect(s_panel, 60, y, SSM_W - 120, box_h,
                   sel ? 0xFF243044u : 0xFF161A22u);
         if (sel)
-            fill_rect(s_panel, 60, y, 6, row_h - 6, 0xFFFFD24Du);
-        draw_text(s_panel, 96, y + 7, s_sys_label[i],
+            fill_rect(s_panel, 60, y, 6, box_h, 0xFFFFD24Du);
+        draw_text(s_panel, 96, y + (box_h - 16) / 2, s_sys_label[i],
                   sel ? 0xFFFFFFFFu : 0xFFA8B2C4u, 2);
     }
     draw_text(s_panel, 60, top + n * row_h + 18,

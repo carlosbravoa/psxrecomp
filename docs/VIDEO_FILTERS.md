@@ -43,8 +43,10 @@ Precedence: game.toml → settings.toml → env → launcher → mod/debug.
 | size | 0.1..0.8 | 0.35 | gap thickness as a fraction of one native line |
 | glow | 0..1 | 0.50 | brightens the line core and bleeds the line + neighbours into the gap (bloom, in linear light) |
 
-Set them in the **ESC menu** (SCANLINE DARK / SIZE / GLOW rows, ±5 % per
-press, persisted), in `settings.toml` / `game.toml` (`[video]
+Set them in the **ESC menu**: while the scanlines filter is active a single row
+`[DARK 60%] SIZE 35% GLOW 50%` appears under VIDEO FILTER — LEFT/RIGHT step the
+bracketed value by 5 %, ENTER moves the bracket to the next parameter
+(persisted). Or in `settings.toml` / `game.toml` (`[video]
 scanline_opacity`, `scanline_size`, `scanline_glow`), or live over the debug
 server (`{"cmd":"video_filter","scan_opacity":"0.9","scan_size":"0.5","scan_glow":"0"}`).
 Lost energy is partly compensated, so the default look keeps the source's
