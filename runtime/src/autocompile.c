@@ -1,6 +1,12 @@
-/* autocompile.c — see autocompile.h. Windows-first (the project's dev
- * platform); on other hosts the spawn is a graceful no-op and the manual
- * compile_overlays.py flow still works. */
+/* autocompile.c — see autocompile.h.
+ *
+ * The overlay compile child and its publication pipeline run on Windows and on
+ * POSIX hosts alike. Everything below the platform-primitive layer — the
+ * queues, the FIFO invariants, the retry policy, the counters, the parsing — is
+ * platform-neutral logic with exactly ONE implementation. Only the primitives
+ * it stands on are per-platform, and on Windows those expand to the same calls
+ * this file used directly before the POSIX port, so the Windows path is
+ * unchanged by construction. */
 #include "autocompile.h"
 #include "overlay_loader.h"
 
@@ -13,6 +19,116 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#else
+#  include <errno.h>
+#  include <pthread.h>
+#  include <signal.h>
+#  include <sys/stat.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <time.h>
+#  include <unistd.h>
+#  ifdef __linux__
+#    include <sys/prctl.h>
+#  endif
+#endif
+
+/* ---- platform primitives -------------------------------------------------
+ * Deliberately thin. Each maps 1:1 onto what the Win32 code below called
+ * inline before the port, so reviewing the Windows side is a matter of
+ * checking these expansions rather than re-reading the pipeline. */
+#ifdef _WIN32
+typedef CRITICAL_SECTION   ac_mutex_t;
+typedef CONDITION_VARIABLE ac_cond_t;
+#  define AC_THREAD_RET  DWORD
+#  define AC_THREAD_CALL WINAPI
+#else
+typedef pthread_mutex_t ac_mutex_t;
+typedef pthread_cond_t  ac_cond_t;
+#  define AC_THREAD_RET  void *
+#  define AC_THREAD_CALL
+#endif
+typedef AC_THREAD_RET (AC_THREAD_CALL *ac_thread_fn)(void *);
+
+/* A joinable-once handle. pthread_t has no portable "empty" value, so validity
+ * is tracked explicitly on both platforms rather than by comparing handles. */
+typedef struct {
+#ifdef _WIN32
+    HANDLE   h;
+#else
+    pthread_t t;
+#endif
+    int live;
+} ac_thread_t;
+
+static ac_mutex_t s_out_lock;
+static ac_cond_t  s_publish_cv;
+/* Titles that never call autocompile_configure() have no lock; every entry
+ * point checks this so the unconfigured path stays a strict no-op. */
+static int        s_out_lock_init = 0;
+
+static void ac_sync_init(void) {
+    if (s_out_lock_init) return;
+#ifdef _WIN32
+    InitializeCriticalSection(&s_out_lock);
+    InitializeConditionVariable(&s_publish_cv);
+#else
+    pthread_mutex_init(&s_out_lock, NULL);
+    pthread_cond_init(&s_publish_cv, NULL);
+#endif
+    s_out_lock_init = 1;
+}
+
+#ifdef _WIN32
+static void ac_lock(void)          { EnterCriticalSection(&s_out_lock); }
+static void ac_unlock(void)        { LeaveCriticalSection(&s_out_lock); }
+static void ac_cond_wait(void)     { SleepConditionVariableCS(&s_publish_cv, &s_out_lock, INFINITE); }
+static void ac_cond_wake(void)     { WakeConditionVariable(&s_publish_cv); }
+static void ac_cond_wake_all(void) { WakeAllConditionVariable(&s_publish_cv); }
+static void ac_sleep_ms(unsigned ms) { Sleep(ms); }
+static uint64_t ac_now_us(void) {
+    LARGE_INTEGER q, f;
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&f);
+    return f.QuadPart > 0 ? (uint64_t)(q.QuadPart * 1000000LL / f.QuadPart) : 0;
+}
+static int ac_thread_start(ac_thread_t *th, ac_thread_fn fn, void *arg) {
+    th->h = CreateThread(NULL, 0, fn, arg, 0, NULL);
+    th->live = th->h != NULL;
+    return th->live;
+}
+static void ac_thread_join(ac_thread_t *th) {
+    if (!th->live) return;
+    WaitForSingleObject(th->h, INFINITE);
+    CloseHandle(th->h);
+    th->live = 0;
+}
+#else
+static void ac_lock(void)          { pthread_mutex_lock(&s_out_lock); }
+static void ac_unlock(void)        { pthread_mutex_unlock(&s_out_lock); }
+static void ac_cond_wait(void)     { pthread_cond_wait(&s_publish_cv, &s_out_lock); }
+static void ac_cond_wake(void)     { pthread_cond_signal(&s_publish_cv); }
+static void ac_cond_wake_all(void) { pthread_cond_broadcast(&s_publish_cv); }
+static void ac_sleep_ms(unsigned ms) {
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) { }
+}
+static uint64_t ac_now_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+static int ac_thread_start(ac_thread_t *th, ac_thread_fn fn, void *arg) {
+    th->live = pthread_create(&th->t, NULL, fn, arg) == 0;
+    return th->live;
+}
+static void ac_thread_join(ac_thread_t *th) {
+    if (!th->live) return;
+    pthread_join(th->t, NULL);
+    th->live = 0;
+}
 #endif
 
 static char s_cmd[4096];   /* large: the runtime-constructed bundled tcc cmd has
@@ -24,6 +140,8 @@ static char s_cwd[512];
 static char s_cache_dir[512];
 static char s_captures[512];
 
+/* Both are written by the worker threads and read by the emulation thread, so
+ * both are atomic on both platforms — not merely volatile. */
 enum { AC_IDLE = 0, AC_RUNNING = 1, AC_DONE = 2 };
 #ifdef _WIN32
 static volatile LONG s_state     = AC_IDLE;
@@ -34,11 +152,27 @@ static int ac_state_load(void) {
 static void ac_state_store(int value) {
     InterlockedExchange(&s_state, (LONG)value);
 }
+static int  ac_exit_code_load(void) {
+    return (int)InterlockedCompareExchange(&s_exit_code, -1, -1);
+}
+static void ac_exit_code_store(int value) {
+    InterlockedExchange(&s_exit_code, (LONG)value);
+}
 #else
-static int s_state     = AC_IDLE;
-static int s_exit_code = -1;
-static int ac_state_load(void) { return s_state; }
-static void ac_state_store(int value) { s_state = value; }
+static volatile int s_state     = AC_IDLE;
+static volatile int s_exit_code = -1;
+static int ac_state_load(void) {
+    return __atomic_load_n(&s_state, __ATOMIC_SEQ_CST);
+}
+static void ac_state_store(int value) {
+    __atomic_store_n(&s_state, value, __ATOMIC_SEQ_CST);
+}
+static int  ac_exit_code_load(void) {
+    return __atomic_load_n(&s_exit_code, __ATOMIC_SEQ_CST);
+}
+static void ac_exit_code_store(int value) {
+    __atomic_store_n(&s_exit_code, value, __ATOMIC_SEQ_CST);
+}
 #endif
 static uint32_t     s_runs      = 0;
 static uint32_t     s_fails     = 0;
@@ -52,11 +186,14 @@ static uint64_t     s_retry_not_before_ms = 0;
 #define AC_RETRY_INITIAL_MS 1000ull
 #define AC_RETRY_MAX_MS   300000ull
 
+/* Monotonic. The retry backoff is derived from this, so a host without a real
+ * clock here would spawn a broken command forever — which is exactly what the
+ * previous `return 0` did off-Windows. */
 static uint64_t autocompile_now_ms(void) {
 #ifdef _WIN32
     return (uint64_t)GetTickCount64();
 #else
-    return 0;
+    return ac_now_us() / 1000ull;
 #endif
 }
 
@@ -73,11 +210,6 @@ static uint64_t autocompile_now_ms(void) {
 static int s_reported_broken = 0;
 /* Defined below, once the child-output tail ring it reads is declared. */
 static void autocompile_report_broken_once(void);
-#ifndef _WIN32
-/* The compile spawner and its output ring are Windows-only in this file, so
- * there is no child output to quote off-Windows and nothing to report. */
-static void autocompile_report_broken_once(void) { }
-#endif
 
 static void autocompile_note_failure(void) {
     s_fails++;
@@ -147,18 +279,213 @@ static int  s_out_len = 0;
 static unsigned s_publish_drops_run = 0;
 static unsigned s_publish_load_fail_run = 0, s_publish_parse_fail_run = 0;
 
+/* ---- the compile child ---------------------------------------------------
+ * The whole cmd/sh -> python -> gcc tree must die with the runtime: a compiler
+ * still writing into the shard cache after we are gone corrupts it for the next
+ * launch.
+ *
+ * Windows: a kill-on-close JOB OBJECT. Any exit path, crash included, closes
+ * the handle and the kernel reaps the tree.
+ * POSIX: the child leads its own PROCESS GROUP, so one killpg() reaps the tree,
+ * plus PR_SET_PDEATHSIG on Linux for the crash-orphan case the job object also
+ * covers. `sh -c` execs a simple command in place, so in the normal
+ * configuration the death signal lands on python itself rather than on a
+ * surviving shell. That is strictly weaker than a job object for the
+ * shell-builtin/pipeline forms of the command; it is the closest POSIX
+ * equivalent that does not require a supervisor process. */
+typedef struct {
 #ifdef _WIN32
-static CRITICAL_SECTION s_out_lock;
-static CONDITION_VARIABLE s_publish_cv;
-static int              s_out_lock_init = 0;
-static HANDLE           s_proc = NULL;
-/* Kill-on-close job tying the whole cmd->python->gcc compile tree to this
- * process: any exit path (including a crash) closes the handle and the kernel
- * reaps the tree, so a compiler can never keep writing into the cache after
- * the runtime is gone. Owned exclusively by the emulation thread. */
-static HANDLE           s_job = NULL;
-static HANDLE           s_watch_thread = NULL;
-static HANDLE           s_prepare_thread = NULL;
+    HANDLE proc;
+    HANDLE job;
+    HANDLE rd;
+#else
+    pid_t  pid;
+    int    rd;
+#endif
+} ac_proc_t;
+
+static void ac_proc_clear(ac_proc_t *p) {
+#ifdef _WIN32
+    p->proc = NULL; p->job = NULL; p->rd = NULL;
+#else
+    p->pid = -1; p->rd = -1;
+#endif
+}
+
+/* Spawn `cmd` with stdout+stderr on a pipe, at below-normal priority, in `cwd`.
+ * Compilation is opportunistic and must never outrank the interpreter keeping
+ * the current frame alive. */
+static int ac_proc_spawn(ac_proc_t *p, const char *cmd, const char *cwd) {
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    /* cmd.exe /C resolves the command via PATH and supports the relative paths
+     * in the configured line (cwd = project root). The WHOLE command is wrapped
+     * in one extra pair of quotes: when the line after /C BEGINS with a quote
+     * and contains further quotes (a quoted interpreter path plus quoted args),
+     * cmd.exe strips the first and last quote characters and mangles the line
+     * ("The filename, directory name, or volume label syntax is incorrect" —
+     * every autocompile run failed and the reshard silently never happened).
+     * With the outer quotes cmd strips exactly those two and executes the inner
+     * command verbatim. */
+    char full[4200];
+    snprintf(full, sizeof(full), "cmd.exe /C \"%s\"", cmd);
+
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError  = wr;
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+    /* Job created before the child and assigned while it is still SUSPENDED, so
+     * cmd.exe cannot spawn grandchildren outside the job. If job setup fails
+     * (rare), proceed without it — shutdown still terminates the direct child;
+     * only crash-orphan protection is lost. */
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+        memset(&jeli, 0, sizeof(jeli));
+        jeli.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                     &jeli, sizeof(jeli))) {
+            CloseHandle(job);
+            job = NULL;
+        }
+    }
+    BOOL ok = CreateProcessA(NULL, full, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS |
+                                 CREATE_SUSPENDED,
+                             NULL, (cwd && cwd[0]) ? cwd : NULL, &si, &pi);
+    CloseHandle(wr);
+    if (!ok) {
+        if (job) CloseHandle(job);
+        CloseHandle(rd);
+        return 0;
+    }
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        CloseHandle(job);
+        job = NULL;
+    }
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    p->proc = pi.hProcess;
+    p->job  = job;
+    p->rd   = rd;
+    return 1;
+#else
+    int fds[2];
+    if (pipe(fds) != 0) return 0;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return 0; }
+    if (pid == 0) {
+        /* Between fork and exec in a threaded process: async-signal-safe calls
+         * only. setpgid/dup2/close/chdir/nice/execl all qualify. */
+        setpgid(0, 0);
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+#endif
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        dup2(fds[1], STDERR_FILENO);
+        if (fds[1] > STDERR_FILENO) close(fds[1]);
+        if (cwd && cwd[0] && chdir(cwd) != 0) _exit(127);
+        /* Opportunistic: a failure to lower priority is not worth aborting
+         * the compile over, but glibc marks nice() warn_unused_result. */
+        if (nice(10) == -1) { /* keep default priority */ }
+        /* /bin/sh -c mirrors the cmd.exe /C semantics the config format
+         * documents: PATH resolution, quoting and relative paths all behave as
+         * the user typed them into a shell. */
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    setpgid(pid, pid);   /* also done in the child: whoever wins, no race */
+    close(fds[1]);
+    p->pid = pid;
+    p->rd  = fds[0];
+    return 1;
+#endif
+}
+
+/* >0 bytes, or <=0 at EOF/error. */
+static int ac_proc_read(ac_proc_t *p, char *buf, int cap) {
+#ifdef _WIN32
+    DWORD got = 0;
+    if (!ReadFile(p->rd, buf, (DWORD)cap, &got, NULL)) return 0;
+    return (int)got;
+#else
+    for (;;) {
+        ssize_t n = read(p->rd, buf, (size_t)cap);
+        if (n < 0 && errno == EINTR) continue;
+        return n < 0 ? 0 : (int)n;
+    }
+#endif
+}
+
+static void ac_proc_close_read(ac_proc_t *p) {
+#ifdef _WIN32
+    if (p->rd) { CloseHandle(p->rd); p->rd = NULL; }
+#else
+    if (p->rd >= 0) { close(p->rd); p->rd = -1; }
+#endif
+}
+
+static int ac_proc_wait(ac_proc_t *p) {
+#ifdef _WIN32
+    DWORD code = (DWORD)-1;
+    WaitForSingleObject(p->proc, INFINITE);
+    GetExitCodeProcess(p->proc, &code);
+    return (int)code;
+#else
+    int st = 0;
+    while (waitpid(p->pid, &st, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (WIFEXITED(st))   return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return -1;
+#endif
+}
+
+/* Hard kill of the whole tree — the compile has nothing worth flushing. */
+static void ac_proc_kill_tree(ac_proc_t *p) {
+#ifdef _WIN32
+    if (p->job) TerminateJobObject(p->job, 1);
+    else if (p->proc) TerminateProcess(p->proc, 1);
+#else
+    if (p->pid > 0) killpg(p->pid, SIGKILL);
+#endif
+}
+
+/* Release OS handles. On POSIX the child is reaped by ac_proc_wait, so there is
+ * nothing left to release beyond the pipe. */
+static void ac_proc_close(ac_proc_t *p) {
+    ac_proc_close_read(p);
+#ifdef _WIN32
+    if (p->proc) { CloseHandle(p->proc); p->proc = NULL; }
+    if (p->job)  { CloseHandle(p->job);  p->job  = NULL; }
+#endif
+}
+
+static void ac_setenv(const char *name, const char *value) {
+#ifdef _WIN32
+    SetEnvironmentVariableA(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+/* The live child, guarded by s_out_lock. s_proc_live is cleared by the watcher
+ * only after the child is reaped, and shutdown only kills while it is set. */
+static ac_proc_t s_proc;
+static int       s_proc_live = 0;
+static ac_thread_t s_watch_thread;
+static ac_thread_t s_prepare_thread;
 
 typedef struct PublishItem {
     struct PublishItem *next;
@@ -195,14 +522,14 @@ static void autocompile_report_broken_once(void) {
         "in the interpreter. Check [runtime] overlay_autocompile_cmd in "
         "game.toml: every path in it must resolve from the process working "
         "directory.",
-        s_consecutive_fails, (int)s_exit_code);
+        s_consecutive_fails, ac_exit_code_load());
     char tail[AC_OUT_CAP];
     int n = 0;
     if (s_out_lock_init) {
-        EnterCriticalSection(&s_out_lock);
+        ac_lock();
         n = s_out_len < (int)sizeof tail - 1 ? s_out_len : (int)sizeof tail - 1;
         if (n > 0) memcpy(tail, s_out + (s_out_len - n), (size_t)n);
-        LeaveCriticalSection(&s_out_lock);
+        ac_unlock();
     }
     tail[n > 0 ? n : 0] = '\0';
     fprintf(stdout,
@@ -216,7 +543,7 @@ static void autocompile_report_broken_once(void) {
         "  process working directory, and the recompiler and "
         "tools/compile_overlays.py it names must exist.\n"
         "  Last compiler output:\n%s%s",
-        s_consecutive_fails, (int)s_exit_code,
+        s_consecutive_fails, ac_exit_code_load(),
         n > 0 ? tail : "    (no output captured)\n",
         (n > 0 && tail[n - 1] != '\n') ? "\n" : "");
     fflush(stdout);
@@ -288,7 +615,7 @@ static void child_line_locked(void) {
     if (s_publish_raw_tail) s_publish_raw_tail->next = item;
     else s_publish_raw_head = item;
     s_publish_raw_tail = item;
-    WakeConditionVariable(&s_publish_cv);
+    ac_cond_wake();
 }
 
 static void publish_parse_locked(const char *buf, int n) {
@@ -316,19 +643,19 @@ static void publish_parse_locked(const char *buf, int n) {
  * compiler. There is exactly one mapped handoff at a time. The worker also
  * waits for the preceding main-thread commit to finish before entering the
  * process-wide Windows loader lock again. */
-static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
+static AC_THREAD_RET AC_THREAD_CALL publish_prepare_thread_main(void *unused) {
     (void)unused;
     for (;;) {
         PublishItem *item = NULL;
-        EnterCriticalSection(&s_out_lock);
+        ac_lock();
         while (!s_publish_stop && !s_publish_raw_head &&
                !s_publish_input_done)
-            SleepConditionVariableCS(&s_publish_cv, &s_out_lock, INFINITE);
+            ac_cond_wait();
         while (!s_publish_stop && s_publish_raw_head &&
                (s_publish_ready_count != 0 || s_publish_commit_active != 0))
-            SleepConditionVariableCS(&s_publish_cv, &s_out_lock, INFINITE);
+            ac_cond_wait();
         if (s_publish_stop || (!s_publish_raw_head && s_publish_input_done)) {
-            LeaveCriticalSection(&s_out_lock);
+            ac_unlock();
             break;
         }
         item = s_publish_raw_head;
@@ -336,7 +663,7 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
         if (!s_publish_raw_head) s_publish_raw_tail = NULL;
         item->next = NULL;
         s_publish_preparing++;
-        LeaveCriticalSection(&s_out_lock);
+        ac_unlock();
 
         /* A dropped publication silently reverts this artifact to a
          * synchronous emulation-thread first-map on its next dispatch miss —
@@ -347,28 +674,25 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
          * pointless sleeps; that's an accepted cost of keeping prepare's
          * failure reasons opaque. */
         enum { AC_PREPARE_ATTEMPTS = 3, AC_PREPARE_RETRY_MS = 100 };
-        LARGE_INTEGER q0, q1, qf;
+        uint64_t q0 = 0, q1 = 0;
         int attempts = 0;
         for (;;) {
-            QueryPerformanceCounter(&q0);
+            q0 = ac_now_us();
             item->image = overlay_loader_prepare_published(item->path);
-            QueryPerformanceCounter(&q1);
+            q1 = ac_now_us();
             attempts++;
             if (item->image || attempts >= AC_PREPARE_ATTEMPTS) break;
             int stopping;
-            EnterCriticalSection(&s_out_lock);
+            ac_lock();
             s_publish_prepare_retry++;
             stopping = s_publish_stop;
-            LeaveCriticalSection(&s_out_lock);
+            ac_unlock();
             if (stopping) break;
-            Sleep(AC_PREPARE_RETRY_MS);
+            ac_sleep_ms(AC_PREPARE_RETRY_MS);
         }
-        QueryPerformanceFrequency(&qf);
-        uint64_t elapsed_us = qf.QuadPart > 0
-            ? (uint64_t)((q1.QuadPart - q0.QuadPart) * 1000000LL /
-                         qf.QuadPart) : 0;
+        uint64_t elapsed_us = q1 > q0 ? q1 - q0 : 0;
         if (!item->image) {
-            EnterCriticalSection(&s_out_lock);
+            ac_lock();
             s_publish_preparing--;
             s_publish_prepare_count++;
             s_publish_prepare_fail++;
@@ -378,11 +702,11 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
             if (elapsed_us > s_publish_prepare_max_us)
                 s_publish_prepare_max_us = elapsed_us;
             s_publish_load_fail_run++;
-            LeaveCriticalSection(&s_out_lock);
+            ac_unlock();
             free(item);
             continue;
         }
-        EnterCriticalSection(&s_out_lock);
+        ac_lock();
         s_publish_preparing--;
         s_publish_prepare_count++;
         s_publish_prepare_last_us = elapsed_us;
@@ -390,7 +714,7 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
         if (elapsed_us > s_publish_prepare_max_us)
             s_publish_prepare_max_us = elapsed_us;
         if (s_publish_stop) {
-            LeaveCriticalSection(&s_out_lock);
+            ac_unlock();
             overlay_loader_discard_prepared(item->image);
             free(item);
             break;
@@ -399,9 +723,9 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
          * Keep a defensive condition in case future code adds another worker. */
         while (!s_publish_stop &&
                s_publish_ready_count >= AC_PUBLISH_READY_LIMIT)
-            SleepConditionVariableCS(&s_publish_cv, &s_out_lock, INFINITE);
+            ac_cond_wait();
         if (s_publish_stop) {
-            LeaveCriticalSection(&s_out_lock);
+            ac_unlock();
             overlay_loader_discard_prepared(item->image);
             free(item);
             break;
@@ -412,16 +736,16 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
         s_publish_ready_count++;
         if (s_publish_ready_count > s_publish_ready_highwater)
             s_publish_ready_highwater = s_publish_ready_count;
-        LeaveCriticalSection(&s_out_lock);
+        ac_unlock();
     }
     if (!s_publish_stop)
         ac_state_store(AC_DONE);
-    return 0;
+    return (AC_THREAD_RET)0;
 }
 
 static PublishItem *publish_ready_pop(void) {
     PublishItem *item;
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     item = s_publish_ready_head;
     if (item) {
         s_publish_ready_head = item->next;
@@ -430,40 +754,40 @@ static PublishItem *publish_ready_pop(void) {
         s_publish_ready_count--;
         s_publish_commit_active++;
     }
-    LeaveCriticalSection(&s_out_lock);
+    ac_unlock();
     return item;
 }
 
 static void publish_commit_finished(void) {
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     if (s_publish_commit_active) s_publish_commit_active--;
-    WakeAllConditionVariable(&s_publish_cv);
-    LeaveCriticalSection(&s_out_lock);
+    ac_cond_wake_all();
+    ac_unlock();
 }
 
 static int publish_pending(void) {
     int pending;
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     pending = s_publish_raw_head != NULL || s_publish_ready_head != NULL ||
               s_publish_preparing != 0 || s_publish_commit_active != 0;
-    LeaveCriticalSection(&s_out_lock);
+    ac_unlock();
     return pending;
 }
 
 static void publish_note_load_failure(void) {
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     s_publish_load_fail_run++;
-    LeaveCriticalSection(&s_out_lock);
+    ac_unlock();
 }
 
 static int publish_discard_all(void) {
     PublishItem *raw, *ready;
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     /* Only an idle provider may reset publication ownership. Never pretend an
      * image currently inside LoadLibrary is no longer preparing: doing so
      * would let a new run race the old watcher and corrupt the FIFO invariant. */
     if (s_publish_preparing != 0 || s_publish_commit_active != 0) {
-        LeaveCriticalSection(&s_out_lock);
+        ac_unlock();
         return 0;
     }
     raw = s_publish_raw_head;
@@ -471,8 +795,8 @@ static int publish_discard_all(void) {
     s_publish_raw_head = s_publish_raw_tail = NULL;
     s_publish_ready_head = s_publish_ready_tail = NULL;
     s_publish_ready_count = 0;
-    WakeAllConditionVariable(&s_publish_cv);
-    LeaveCriticalSection(&s_out_lock);
+    ac_cond_wake_all();
+    ac_unlock();
     while (raw) {
         PublishItem *next = raw->next;
         free(raw);
@@ -488,7 +812,7 @@ static int publish_discard_all(void) {
 }
 
 static void out_append(const char *buf, int n) {
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     publish_parse_locked(buf, n);
     if (n >= AC_OUT_CAP) {
         memcpy(s_out, buf + (n - AC_OUT_CAP), AC_OUT_CAP);
@@ -502,7 +826,7 @@ static void out_append(const char *buf, int n) {
         memcpy(s_out + s_out_len, buf, n);
         s_out_len += n;
     }
-    LeaveCriticalSection(&s_out_lock);
+    ac_unlock();
 }
 
 #ifdef PSX_AUTOCOMPILE_TEST
@@ -511,53 +835,52 @@ void autocompile_test_feed_output(const char *buf, int n) {
 }
 
 int autocompile_test_start_preparer(void) {
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     s_publish_input_done = 0;
     s_publish_stop = 0;
-    LeaveCriticalSection(&s_out_lock);
-    s_prepare_thread = CreateThread(NULL, 0, publish_prepare_thread_main,
-                                    NULL, 0, NULL);
-    return s_prepare_thread != NULL;
+    ac_unlock();
+    ac_sync_init();
+    return ac_thread_start(&s_prepare_thread, publish_prepare_thread_main, NULL);
 }
 
 void autocompile_test_finish_input(void) {
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     s_publish_input_done = 1;
-    WakeAllConditionVariable(&s_publish_cv);
-    LeaveCriticalSection(&s_out_lock);
+    ac_cond_wake_all();
+    ac_unlock();
 }
 
-int autocompile_test_join_preparer(DWORD timeout_ms) {
-    if (!s_prepare_thread) return 1;
-    if (WaitForSingleObject(s_prepare_thread, timeout_ms) != WAIT_OBJECT_0)
-        return 0;
-    CloseHandle(s_prepare_thread);
-    s_prepare_thread = NULL;
+/* The timeout is advisory: the preparer always terminates once input is
+ * finished, and an untimed join keeps this portable. A hang fails the test by
+ * hitting the harness timeout instead of by returning 0. */
+int autocompile_test_join_preparer(unsigned timeout_ms) {
+    (void)timeout_ms;
+    ac_thread_join(&s_prepare_thread);
     return 1;
 }
 
 int autocompile_test_ready_count(void) {
     int count = 0;
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     for (PublishItem *item = s_publish_ready_head; item; item = item->next)
         count++;
-    LeaveCriticalSection(&s_out_lock);
+    ac_unlock();
     return count;
 }
 
 int autocompile_test_ready_highwater(void) {
     int highwater;
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     highwater = (int)s_publish_ready_highwater;
-    LeaveCriticalSection(&s_out_lock);
+    ac_unlock();
     return highwater;
 }
 
 int autocompile_test_preparing_count(void) {
     int preparing;
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     preparing = (int)s_publish_preparing;
-    LeaveCriticalSection(&s_out_lock);
+    ac_unlock();
     return preparing;
 }
 
@@ -566,19 +889,18 @@ void autocompile_test_discard_all(void) {
 }
 #endif
 
-typedef struct { HANDLE read_pipe; HANDLE proc; } WatchCtx;
-
-static DWORD WINAPI watch_thread(LPVOID arg) {
-    WatchCtx *ctx = (WatchCtx *)arg;
+/* Owns the child from spawn to reap: drains its stdout into the tail ring and
+ * the line parser, waits for exit, then publishes the exit code and closes the
+ * input side of the pipeline. */
+static AC_THREAD_RET AC_THREAD_CALL watch_thread(void *arg) {
+    ac_proc_t *proc = (ac_proc_t *)arg;
     char buf[1024];
-    DWORD got;
-    while (ReadFile(ctx->read_pipe, buf, sizeof(buf), &got, NULL) && got > 0)
-        out_append(buf, (int)got);
-    CloseHandle(ctx->read_pipe);
-    WaitForSingleObject(ctx->proc, INFINITE);
-    DWORD code = (DWORD)-1;
-    GetExitCodeProcess(ctx->proc, &code);
-    EnterCriticalSection(&s_out_lock);
+    int got;
+    while ((got = ac_proc_read(proc, buf, (int)sizeof buf)) > 0)
+        out_append(buf, got);
+    ac_proc_close_read(proc);
+    int code = ac_proc_wait(proc);
+    ac_lock();
     /* A marker/result line cut off by child termination is not trustworthy.
      * Completion will force the idempotent directory rescan instead. */
     if (s_child_line_len || s_child_line_overflow) {
@@ -586,18 +908,17 @@ static DWORD WINAPI watch_thread(LPVOID arg) {
         s_child_line_len = 0;
         s_child_line_overflow = 0;
     }
-    if (s_proc == ctx->proc) s_proc = NULL;
-    LeaveCriticalSection(&s_out_lock);
-    CloseHandle(ctx->proc);
-    HeapFree(GetProcessHeap(), 0, ctx);
-    InterlockedExchange(&s_exit_code, (LONG)code);
-    EnterCriticalSection(&s_out_lock);
+    /* Reaped: shutdown must not signal this pid/handle any more. */
+    s_proc_live = 0;
+    ac_proc_close(proc);
+    ac_unlock();
+    ac_exit_code_store(code);
+    ac_lock();
     s_publish_input_done = 1;
-    WakeAllConditionVariable(&s_publish_cv);
-    LeaveCriticalSection(&s_out_lock);
-    return 0;
+    ac_cond_wake_all();
+    ac_unlock();
+    return (AC_THREAD_RET)0;
 }
-#endif /* _WIN32 */
 
 #ifdef _WIN32
 /* Name the interpreter the spawn will actually run, once, at configure time.
@@ -670,6 +991,62 @@ static void autocompile_report_interpreter(void) {
             }
         }
     }
+}
+#else  /* POSIX */
+/* Same intent as the Windows arm: name the interpreter the spawn will really
+ * run, once, at configure time, so "every compile fails" is a one-line
+ * diagnosis instead of a session-long mystery. `sh -c` resolves the first token
+ * through PATH exactly as this does. The MSYS2/Cygwin sibling check has no
+ * POSIX analogue and is omitted. */
+static void autocompile_report_interpreter(void) {
+    char tok[512];
+    size_t n = 0;
+    const char *p = s_cmd;
+    if (*p == '"' || *p == '\'') {
+        char quote = *p++;
+        while (*p && *p != quote && n + 1 < sizeof(tok)) tok[n++] = *p++;
+    } else {
+        while (*p && *p != ' ' && n + 1 < sizeof(tok)) tok[n++] = *p++;
+    }
+    tok[n] = '\0';
+    if (!tok[0]) return;
+
+    char resolved[1024];
+    resolved[0] = '\0';
+    if (strchr(tok, '/')) {
+        /* Already a path: the shell will not consult PATH for it. */
+        if (access(tok, X_OK) == 0)
+            snprintf(resolved, sizeof(resolved), "%s", tok);
+    } else {
+        const char *path = getenv("PATH");
+        for (const char *q = path; q && *q; ) {
+            const char *e = strchr(q, ':');
+            size_t dlen = e ? (size_t)(e - q) : strlen(q);
+            if (dlen > 0 && dlen < 480) {
+                char cand[1024];
+                snprintf(cand, sizeof(cand), "%.*s/%s", (int)dlen, q, tok);
+                if (access(cand, X_OK) == 0) {
+                    snprintf(resolved, sizeof(resolved), "%s", cand);
+                    break;
+                }
+            }
+            if (!e) break;
+            q = e + 1;
+        }
+    }
+    if (!resolved[0]) {
+        autocompile_set_degraded(
+            "overlay autocompile interpreter \"%s\" does not resolve on PATH; "
+            "every compile run will fail and overlay execution will stay in "
+            "the interpreter.", tok);
+        fprintf(stdout,
+            "psxrecomp: overlay autocompile interpreter '%s' does not resolve "
+            "on PATH — every compile run will fail.\n", tok);
+        fflush(stdout);
+        return;
+    }
+    fprintf(stdout, "psxrecomp: overlay autocompile interpreter: %s\n", resolved);
+    fflush(stdout);
 }
 #endif
 
@@ -747,22 +1124,66 @@ static void autocompile_check_path_args(void) {
         }
     }
 }
-#endif /* _WIN32 */
+#else  /* POSIX */
+static void autocompile_check_path_args(void) {
+    static const char *flags[] = { "--recompiler", "--runtime-include" };
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        const char *at = strstr(s_cmd, flags[i]);
+        if (!at) continue;
+        const char *p = at + strlen(flags[i]);
+        while (*p == ' ' || *p == '=') p++;
+        char path[1024];
+        size_t n = 0;
+        if (*p == '"' || *p == '\'') {
+            char quote = *p++;
+            while (*p && *p != quote && n + 1 < sizeof(path)) path[n++] = *p++;
+        } else {
+            while (*p && *p != ' ' && n + 1 < sizeof(path)) path[n++] = *p++;
+        }
+        path[n] = '\0';
+        if (!path[0]) continue;
+
+        /* Relative paths resolve against the CHILD's working directory, which
+         * is s_cwd — not ours. Mirror that, or a correct relative path would
+         * look broken from here. */
+        char full[sizeof(s_cwd) + sizeof(path) + 2];
+        if (path[0] == '/' || !s_cwd[0])
+            snprintf(full, sizeof(full), "%s", path);
+        else
+            snprintf(full, sizeof(full), "%s/%s", s_cwd, path);
+
+        struct stat st;
+        if (stat(full, &st) != 0) {
+            autocompile_set_degraded(
+                "overlay autocompile cannot start: %s \"%s\" does not exist "
+                "(resolved to \"%s\"). Every compile will fail and overlay "
+                "execution will stay in the interpreter. Fix the path in "
+                "[runtime] overlay_autocompile_cmd, or build the recompiler "
+                "where it points.",
+                flags[i], path, full);
+            fprintf(stdout,
+                "psxrecomp: WARNING: overlay autocompile %s \"%s\" does not "
+                "exist (resolved to \"%s\").\n"
+                "  Every overlay compile will fail and execution will stay in "
+                "the interpreter.\n"
+                "  Query the debug server's autocompile_status "
+                "(\"degraded_reason\") to see this without a console.\n",
+                flags[i], path, full);
+            fflush(stdout);
+        }
+    }
+}
+#endif
 
 void autocompile_configure(const char *cmd, const char *cwd) {
     snprintf(s_cmd, sizeof(s_cmd), "%s", cmd ? cmd : "");
     snprintf(s_cwd, sizeof(s_cwd), "%s", cwd ? cwd : "");
-#ifdef _WIN32
-    if (!s_out_lock_init) {
-        InitializeCriticalSection(&s_out_lock);
-        InitializeConditionVariable(&s_publish_cv);
-        s_out_lock_init = 1;
-    }
+    ac_sync_init();
+    ac_proc_clear(&s_proc);
     if (s_cmd[0]) {
         autocompile_report_interpreter();
         autocompile_check_path_args();
     }
-#endif
 }
 
 void autocompile_set_cache_paths(const char *cache_dir, const char *captures) {
@@ -817,11 +1238,11 @@ int autocompile_request(void) {
     if (!autocompile_configured() || ac_state_load() != AC_IDLE) return 0;
     if (s_retry_not_before_ms &&
         autocompile_now_ms() < s_retry_not_before_ms) return 0;
-#ifdef _WIN32
+    if (!s_out_lock_init) return 0;   /* never configured */
     /* IDLE should imply empty queues; discard defensively so a prior aborted
      * run can never leak a speculative module reference into the next one. */
     if (!publish_discard_all()) return 0;
-    EnterCriticalSection(&s_out_lock);
+    ac_lock();
     s_publish_drops_run = 0;
     s_publish_load_fail_run = s_publish_parse_fail_run = 0;
     s_publish_ready_highwater = 0;
@@ -838,155 +1259,73 @@ int autocompile_request(void) {
     s_child_line_len = 0;
     s_child_line_overflow = 0;
     s_out_len = 0;
-    s_exit_code = -1;
+    ac_exit_code_store(-1);
     s_shard_ok = s_shard_fail = s_shard_skipped = 0;
     s_shard_result_seen = 0;
-    LeaveCriticalSection(&s_out_lock);
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    HANDLE rd = NULL, wr = NULL;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
+    ac_unlock();
     /* Pin the WRITE cache + READ captures to the loader's canonical locations.
-     * Set on the PARENT env so the child (CreateProcessA lpEnvironment=NULL =>
-     * inherit) sees them; compile_overlays.py / coverage_vault.py prefer these
-     * over any CLI --out-dir/--captures, so the cache can never drift from where
-     * the loader reads. This is THE fix for the read/write-location divergence. */
-    if (s_cache_dir[0]) SetEnvironmentVariableA("PSX_OVERLAY_CACHE_DIR", s_cache_dir);
-    if (s_captures[0])  SetEnvironmentVariableA("PSX_OVERLAY_CAPTURES",  s_captures);
-    SetEnvironmentVariableA("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
+     * Set on the PARENT env so the spawned child inherits them;
+     * compile_overlays.py / coverage_vault.py prefer these over any CLI
+     * --out-dir/--captures, so the cache can never drift from where the loader
+     * reads. This is THE fix for the read/write-location divergence. */
+    if (s_cache_dir[0]) ac_setenv("PSX_OVERLAY_CACHE_DIR", s_cache_dir);
+    if (s_captures[0])  ac_setenv("PSX_OVERLAY_CAPTURES",  s_captures);
+    ac_setenv("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
 
-    /* cmd.exe /C resolves the command via PATH and supports the relative
-     * paths in the configured line (cwd = project root). The WHOLE command is
-     * wrapped in one extra pair of quotes: when the line after /C BEGINS with
-     * a quote and contains further quotes (a quoted interpreter path plus
-     * quoted args), cmd.exe strips the first and last quote characters and
-     * mangles the line ("The filename, directory name, or volume label syntax
-     * is incorrect" — every autocompile run failed and the reshard silently
-     * never happened). With the outer quotes cmd strips exactly those two and
-     * executes the inner command verbatim. */
-    char full[4200];
-    snprintf(full, sizeof(full), "cmd.exe /C \"%s\"", s_cmd);
-
-    STARTUPINFOA si;
-    memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = wr;
-    si.hStdError  = wr;
-    PROCESS_INFORMATION pi;
-    memset(&pi, 0, sizeof(pi));
-    /* Kill-on-close job for the whole compile tree. Created before the child
-     * and assigned while the child is still SUSPENDED, so cmd.exe cannot spawn
-     * python/gcc grandchildren outside the job. If job setup fails (rare),
-     * proceed without it — the shutdown path still terminates the direct
-     * child; only crash-orphan protection is lost. */
-    HANDLE job = CreateJobObjectA(NULL, NULL);
-    if (job) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
-        memset(&jeli, 0, sizeof(jeli));
-        jeli.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
-                                     &jeli, sizeof(jeli))) {
-            CloseHandle(job);
-            job = NULL;
-        }
-    }
-
-    /* Compilation is opportunistic: it must never outrank the interpreter that
-     * keeps the current frame alive. cmd -> python -> gcc inherit below-normal
-     * priority, while the live compile script also defaults to one worker. */
-    BOOL ok = CreateProcessA(NULL, full, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS |
-                                 CREATE_SUSPENDED,
-                             NULL, s_cwd[0] ? s_cwd : NULL, &si, &pi);
-    CloseHandle(wr);
-    if (!ok) {
-        if (job) CloseHandle(job);
-        CloseHandle(rd);
+    ac_proc_t proc;
+    ac_proc_clear(&proc);
+    if (!ac_proc_spawn(&proc, s_cmd, s_cwd)) {
         autocompile_note_failure();
         return 0;
     }
-    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
-        CloseHandle(job);
-        job = NULL;
-    }
-    ResumeThread(pi.hThread);
-    CloseHandle(pi.hThread);
-
-    WatchCtx *ctx = (WatchCtx *)HeapAlloc(GetProcessHeap(), 0, sizeof(*ctx));
-    if (!ctx) {
-        /* The child is already running. Leaving it detached would permit the
-         * state to remain IDLE and a second writer to enter the same cache. */
-        TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(rd);
-        CloseHandle(pi.hProcess);
-        if (job) CloseHandle(job);   /* reaps any grandchild */
-        autocompile_note_failure();
-        return 0;
-    }
-    ctx->read_pipe = rd;
-    ctx->proc      = pi.hProcess;
-    s_proc = pi.hProcess;
-    s_job  = job;
+    ac_lock();
+    s_proc = proc;
+    s_proc_live = 1;
+    ac_unlock();
     ac_state_store(AC_RUNNING);
     s_runs++;
-    s_prepare_thread = CreateThread(NULL, 0, publish_prepare_thread_main,
-                                    NULL, 0, NULL);
-    if (!s_prepare_thread) {
-        TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(rd);
-        CloseHandle(pi.hProcess);
-        HeapFree(GetProcessHeap(), 0, ctx);
-        s_proc = NULL;
-        if (s_job) { CloseHandle(s_job); s_job = NULL; }
+
+    if (!ac_thread_start(&s_prepare_thread, publish_prepare_thread_main, NULL)) {
+        ac_lock();
+        s_proc_live = 0;
+        ac_unlock();
+        ac_proc_kill_tree(&s_proc);
+        (void)ac_proc_wait(&s_proc);
+        ac_proc_close(&s_proc);
         ac_state_store(AC_IDLE);
         autocompile_note_failure();
         return 0;
     }
-    s_watch_thread = CreateThread(NULL, 0, watch_thread, ctx, 0, NULL);
-    if (!s_watch_thread) {
-        /* Without the watcher nobody drains stdout, observes completion, or
-         * closes the process handle. Cancel the just-created child fail-closed. */
-        TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(rd);
-        CloseHandle(pi.hProcess);
-        HeapFree(GetProcessHeap(), 0, ctx);
-        s_proc = NULL;
-        EnterCriticalSection(&s_out_lock);
+    /* Without the watcher nobody drains stdout, observes completion, or reaps
+     * the child. Cancel the just-created child fail-closed. */
+    if (!ac_thread_start(&s_watch_thread, watch_thread, &s_proc)) {
+        ac_lock();
+        s_proc_live = 0;
         s_publish_stop = 1;
-        WakeAllConditionVariable(&s_publish_cv);
-        LeaveCriticalSection(&s_out_lock);
-        WaitForSingleObject(s_prepare_thread, INFINITE);
-        CloseHandle(s_prepare_thread);
-        s_prepare_thread = NULL;
-        if (s_job) { CloseHandle(s_job); s_job = NULL; }
+        ac_cond_wake_all();
+        ac_unlock();
+        ac_proc_kill_tree(&s_proc);
+        (void)ac_proc_wait(&s_proc);
+        ac_proc_close(&s_proc);
+        ac_thread_join(&s_prepare_thread);
         ac_state_store(AC_IDLE);
         autocompile_note_failure();
         return 0;
     }
     return 1;
-#else
-    return 0;  /* non-Windows hosts: manual compile flow only */
-#endif
 }
 
 /* Scan the child-output tail ring for the LAST "PSX_SHARD_RESULT ok=N failed=M
  * skipped=K" line and record the counts. Returns 1 if a result line was found.
  * Called from autocompile_poll_main (emu thread) after the child exits. */
 static int parse_shard_result(void) {
-#ifdef _WIN32
     char buf[AC_OUT_CAP + 1];
     int n = 0;
     if (s_out_lock_init) {
-        EnterCriticalSection(&s_out_lock);
+        ac_lock();
         n = s_out_len;
         memcpy(buf, s_out, (size_t)n);
-        LeaveCriticalSection(&s_out_lock);
+        ac_unlock();
     }
     buf[n] = '\0';
     /* Find the LAST occurrence (a run may print more than once over its life). */
@@ -1011,16 +1350,12 @@ static int parse_shard_result(void) {
     s_shard_fail    = failed;
     s_shard_skipped = skipped;
     return 1;
-#else
-    return 0;
-#endif
 }
 
 void autocompile_poll_main(void) {
     /* Drain at most one atomic publication per frame. The producer only sends
      * mapped-but-uninitialized images; callback wiring, validation, and
      * candidate registration remain single-threaded here. */
-#ifdef _WIN32
     /* Titles without overlay autocompile never call autocompile_configure(),
      * so their publication lock does not exist. Poll is still called by the
      * shared maintenance path; keep that unconfigured path a strict no-op. */
@@ -1035,30 +1370,19 @@ void autocompile_poll_main(void) {
         s_rescans++;
     }
     if (ac_state_load() == AC_RUNNING) return;
-#endif
     if (ac_state_load() != AC_DONE) return;
-#ifdef _WIN32
     if (publish_pending()) return;
     /* DONE is published immediately before the preparer returns. Join both
      * per-run workers before exposing IDLE, so a new run cannot inherit a live
      * consumer of the shared FIFO. Neither worker needs the emulation thread. */
-    if (s_prepare_thread) {
-        WaitForSingleObject(s_prepare_thread, INFINITE);
-        CloseHandle(s_prepare_thread);
-        s_prepare_thread = NULL;
-    }
-    if (s_watch_thread) {
-        WaitForSingleObject(s_watch_thread, INFINITE);
-        CloseHandle(s_watch_thread);
-        s_watch_thread = NULL;
-    }
-    if (s_job) {
-        /* Child already exited (watcher joined); closing the kill-on-close
-         * job only reaps any grandchild the tree left behind. */
-        CloseHandle(s_job);
-        s_job = NULL;
-    }
-#endif
+    ac_thread_join(&s_prepare_thread);
+    ac_thread_join(&s_watch_thread);
+    /* The watcher reaped the child and released its handles; on Windows closing
+     * the kill-on-close job additionally reaps any grandchild the tree left
+     * behind. */
+    ac_lock();
+    ac_proc_close(&s_proc);
+    ac_unlock();
     /* Streaming parsing survives arbitrarily large chained post-processing
      * output.  Retain the tail scan as a compatibility fallback for output
      * injected by older/test paths that bypass the line parser. */
@@ -1076,7 +1400,7 @@ void autocompile_poll_main(void) {
     /* A run "failed" if the process exited non-zero OR it reported shard
      * failures. compile_overlays.py exits 2 when any shard that should have
      * built failed, so these usually agree; the parsed count is the detail. */
-    if (s_exit_code != 0 || !s_shard_result_seen || s_shard_fail > 0 ||
+    if (ac_exit_code_load() != 0 || !s_shard_result_seen || s_shard_fail > 0 ||
         s_publish_drops_run != 0 || s_publish_load_fail_run != 0 ||
         s_publish_parse_fail_run != 0)
         autocompile_note_failure();
@@ -1085,45 +1409,29 @@ void autocompile_poll_main(void) {
 }
 
 void autocompile_shutdown(void) {
-#ifdef _WIN32
     if (!s_out_lock_init) return;   /* never configured — nothing to stop */
-    /* Halt the pipeline first so the preparer can never START another
-     * LoadLibrary; one already in flight is waited out below (terminating a
-     * thread that holds the Windows loader lock can deadlock ExitProcess). */
-    HANDLE proc_dup = NULL;
-    EnterCriticalSection(&s_out_lock);
+    /* Halt the pipeline first so the preparer can never START another module
+     * load; one already in flight is waited out below (terminating a thread
+     * that holds the Windows loader lock can deadlock ExitProcess, and the
+     * POSIX dlopen equivalent is no safer to interrupt). */
+    ac_lock();
     s_publish_stop = 1;
-    WakeAllConditionVariable(&s_publish_cv);
-    /* s_proc is cleared+closed by the watcher on child exit; duplicate under
-     * the lock so the kill below can never race that close onto a reused
-     * handle value. */
-    if (s_proc)
-        DuplicateHandle(GetCurrentProcess(), s_proc, GetCurrentProcess(),
-                        &proc_dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
-    LeaveCriticalSection(&s_out_lock);
-    /* Kill the compile tree; the dying pipe write end unblocks the watcher. */
-    if (s_job) TerminateJobObject(s_job, 1);
-    else if (proc_dup) TerminateProcess(proc_dup, 1);
-    if (proc_dup) CloseHandle(proc_dup);
-    if (s_prepare_thread) {
-        WaitForSingleObject(s_prepare_thread, INFINITE);
-        CloseHandle(s_prepare_thread);
-        s_prepare_thread = NULL;
-    }
-    if (s_watch_thread) {
-        WaitForSingleObject(s_watch_thread, INFINITE);
-        CloseHandle(s_watch_thread);
-        s_watch_thread = NULL;
-    }
-    if (s_job) {
-        CloseHandle(s_job);
-        s_job = NULL;
-    }
+    ac_cond_wake_all();
+    /* Kill under the lock. s_proc_live is cleared by the watcher only after the
+     * child has been reaped, so holding the lock here means we can never signal
+     * a pid/handle that has already been recycled. The dying pipe write end
+     * unblocks the watcher's read loop. */
+    if (s_proc_live) ac_proc_kill_tree(&s_proc);
+    ac_unlock();
+    ac_thread_join(&s_prepare_thread);
+    ac_thread_join(&s_watch_thread);
+    ac_lock();
+    ac_proc_close(&s_proc);
+    ac_unlock();
     /* Both workers are joined and this is the emulation thread, so nothing is
      * preparing or committing: the discard cannot be refused. */
     (void)publish_discard_all();
     ac_state_store(AC_IDLE);
-#endif
 }
 
 /* Minimal JSON string escaper for the output tail. */
@@ -1157,9 +1465,8 @@ int autocompile_status_json(char *out, int cap) {
     uint64_t publish_prepare_total_us = 0, publish_prepare_max_us = 0;
     uint64_t publish_prepare_last_us = 0;
     tail[0] = '\0';
-#ifdef _WIN32
     if (s_out_lock_init) {
-        EnterCriticalSection(&s_out_lock);
+        ac_lock();
         int take = s_out_len < 900 ? s_out_len : 900;   /* newest tail */
         tn = json_escape_into(tail, sizeof(tail),
                               s_out + (s_out_len - take), take);
@@ -1173,9 +1480,8 @@ int autocompile_status_json(char *out, int cap) {
         publish_prepare_total_us = s_publish_prepare_total_us;
         publish_prepare_max_us = s_publish_prepare_max_us;
         publish_prepare_last_us = s_publish_prepare_last_us;
-        LeaveCriticalSection(&s_out_lock);
+        ac_unlock();
     }
-#endif
     (void)tn;
     uint64_t retry_ms = 0;
     const uint64_t now_ms = autocompile_now_ms();
@@ -1207,7 +1513,7 @@ int autocompile_status_json(char *out, int cap) {
         "\"output_tail\":\"%s\"}",
         s_degraded[0] ? 1 : 0, degr,
         autocompile_configured(), names[ac_state_load() & 3], s_runs, s_fails,
-        s_rescans, (int)s_exit_code, s_consecutive_fails,
+        s_rescans, ac_exit_code_load(), s_consecutive_fails,
         (unsigned long long)retry_ms,
         s_shard_ok, s_shard_fail, s_shard_skipped,
         s_shard_fail_total, s_shard_result_seen,

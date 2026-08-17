@@ -214,25 +214,32 @@ if(BUILD_TESTING)
     target_link_libraries(mod_runtime_test PRIVATE chdr-static)
     add_test(NAME mod_runtime_test COMMAND mod_runtime_test)
 
-    if(WIN32)
-        add_executable(autocompile_publication_test
-            tests/test_autocompile_publication.c
-            src/autocompile.c)
-        target_include_directories(autocompile_publication_test PRIVATE include)
-        target_compile_definitions(autocompile_publication_test PRIVATE
-            PSX_AUTOCOMPILE_TEST=1)
-        add_test(NAME autocompile_publication_test
-                 COMMAND autocompile_publication_test)
+    # These were WIN32-only while autocompile.c was Windows-only. The spawner
+    # and its publication pipeline are portable now, so the tests that pin its
+    # contract run on every host.
+    add_executable(autocompile_publication_test
+        tests/test_autocompile_publication.c
+        src/autocompile.c)
+    target_include_directories(autocompile_publication_test PRIVATE include)
+    target_compile_definitions(autocompile_publication_test PRIVATE
+        PSX_AUTOCOMPILE_TEST=1)
+    add_test(NAME autocompile_publication_test
+             COMMAND autocompile_publication_test)
 
-        # A misconfigured overlay_autocompile_cmd must be reported on a channel
-        # that exists: the stdout warnings reach nobody under -mwindows, so a
-        # broken autocompile silently degrades the whole run to the interpreter.
-        add_executable(autocompile_degraded_test
-            tests/test_autocompile_degraded.c
-            src/autocompile.c)
-        target_include_directories(autocompile_degraded_test PRIVATE include)
-        add_test(NAME autocompile_degraded_test
-                 COMMAND autocompile_degraded_test)
+    # A misconfigured overlay_autocompile_cmd must be reported on a channel
+    # that exists: the stdout warnings reach nobody under -mwindows, so a
+    # broken autocompile silently degrades the whole run to the interpreter.
+    add_executable(autocompile_degraded_test
+        tests/test_autocompile_degraded.c
+        src/autocompile.c)
+    target_include_directories(autocompile_degraded_test PRIVATE include)
+    add_test(NAME autocompile_degraded_test
+             COMMAND autocompile_degraded_test)
+
+    if(NOT WIN32)
+        find_package(Threads REQUIRED)
+        target_link_libraries(autocompile_publication_test PRIVATE Threads::Threads)
+        target_link_libraries(autocompile_degraded_test PRIVATE Threads::Threads)
     endif()
 
     # ---- previously-unregistered standalone tests -------------------------

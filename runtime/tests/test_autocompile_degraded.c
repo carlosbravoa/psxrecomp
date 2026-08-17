@@ -20,8 +20,16 @@
 #include "autocompile.h"
 #include "overlay_loader.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <limits.h>
+#  include <unistd.h>
+#  ifndef MAX_PATH
+#    define MAX_PATH PATH_MAX
+#  endif
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -62,16 +70,29 @@ static void expect_status(int want_degraded, const char *needle) {
 
 int main(void) {
     char cwd[MAX_PATH];
+#ifdef _WIN32
     GetCurrentDirectoryA(sizeof cwd, cwd);
+#else
+    if (!getcwd(cwd, sizeof cwd)) return 1;
+#endif
 
     /* --- a command naming a recompiler that does not exist --------------- */
     /* This is the exact real-world shape: the interpreter resolves fine, the
      * script path may resolve fine, and the --recompiler argument points at a
      * build directory the documented build recipe never produces. */
+    /* The interpreter must RESOLVE, so that the missing --recompiler is the
+     * first recorded cause — that is the contract under test. An unresolvable
+     * interpreter is a different (also-reported) cause, and "the first cause
+     * wins" would then hide the one being asserted here. */
     char cmd[2048];
     snprintf(cmd, sizeof cmd,
+#ifdef _WIN32
              "py -3 tools/compile_overlays.py --captures build/overlay_captures.json "
              "--recompiler %s\\definitely_not_here\\psxrecomp-game.exe "
+#else
+             "/bin/sh tools/compile_overlays.py --captures build/overlay_captures.json "
+             "--recompiler %s/definitely_not_here/psxrecomp-game "
+#endif
              "--out-dir build/cache", cwd);
     autocompile_configure(cmd, cwd);
     CHECK(autocompile_degraded_reason() != NULL,

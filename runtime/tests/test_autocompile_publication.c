@@ -1,18 +1,66 @@
 #include "autocompile.h"
 #include "overlay_loader.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#  include <time.h>
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* ---- portable shims ------------------------------------------------------
+ * The pipeline under test is platform-neutral (see the platform-primitive
+ * layer in autocompile.c), so this harness is too. */
+#ifdef _WIN32
+typedef DWORD tid_t;
+#  define TID_SELF()      GetCurrentThreadId()
+#  define TID_EQ(a, b)    ((a) == (b))
+typedef LONG counter_t;
+#  define COUNTER_INC(x)  InterlockedIncrement(&(x))
+typedef HANDLE worker_t;
+#  define WORKER_RET      DWORD WINAPI
+static int worker_start(worker_t *w, DWORD (WINAPI *fn)(void *), void *arg) {
+    *w = CreateThread(NULL, 0, fn, arg, 0, NULL);
+    return *w != NULL;
+}
+static void worker_join(worker_t *w) {
+    WaitForSingleObject(*w, INFINITE); CloseHandle(*w);
+}
+static uint64_t now_ms(void) { return (uint64_t)GetTickCount64(); }
+static void sleep_ms(unsigned ms) { Sleep(ms); }
+#else
+typedef pthread_t tid_t;
+#  define TID_SELF()      pthread_self()
+#  define TID_EQ(a, b)    pthread_equal((a), (b))
+typedef long counter_t;
+#  define COUNTER_INC(x)  __atomic_add_fetch(&(x), 1, __ATOMIC_SEQ_CST)
+typedef pthread_t worker_t;
+#  define WORKER_RET      void *
+static int worker_start(worker_t *w, void *(*fn)(void *), void *arg) {
+    return pthread_create(w, NULL, fn, arg) == 0;
+}
+static void worker_join(worker_t *w) { pthread_join(*w, NULL); }
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+static void sleep_ms(unsigned ms) {
+    struct timespec ts = { (time_t)(ms / 1000u), (long)(ms % 1000u) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+#endif
+
 void autocompile_test_feed_output(const char *buf, int n);
 int autocompile_test_start_preparer(void);
 void autocompile_test_finish_input(void);
-int autocompile_test_join_preparer(DWORD timeout_ms);
+int autocompile_test_join_preparer(unsigned timeout_ms);
 int autocompile_test_ready_count(void);
 int autocompile_test_ready_highwater(void);
 int autocompile_test_preparing_count(void);
@@ -22,35 +70,35 @@ struct OverlayPreparedImage {
     unsigned id;
 };
 
-static DWORD s_main_thread;
-static LONG s_prepared;
-static LONG s_committed;
-static LONG s_discarded;
-static LONG s_wrong_prepare_thread;
-static LONG s_wrong_commit_thread;
+static tid_t s_main_thread;
+static counter_t s_prepared;
+static counter_t s_committed;
+static counter_t s_discarded;
+static counter_t s_wrong_prepare_thread;
+static counter_t s_wrong_commit_thread;
 
 OverlayPreparedImage *overlay_loader_prepare_published(const char *path) {
     OverlayPreparedImage *image =
         (OverlayPreparedImage *)calloc(1, sizeof(*image));
     if (!image) return NULL;
     image->id = (unsigned)strtoul(strrchr(path, '_') + 1, NULL, 16);
-    if (GetCurrentThreadId() == s_main_thread)
-        InterlockedIncrement(&s_wrong_prepare_thread);
-    InterlockedIncrement(&s_prepared);
+    if (TID_EQ(TID_SELF(), s_main_thread))
+        COUNTER_INC(s_wrong_prepare_thread);
+    COUNTER_INC(s_prepared);
     return image;
 }
 
 int overlay_loader_commit_published(OverlayPreparedImage *image) {
-    if (GetCurrentThreadId() != s_main_thread)
-        InterlockedIncrement(&s_wrong_commit_thread);
+    if (!TID_EQ(TID_SELF(), s_main_thread))
+        COUNTER_INC(s_wrong_commit_thread);
     free(image);
-    InterlockedIncrement(&s_committed);
+    COUNTER_INC(s_committed);
     return 1;
 }
 
 void overlay_loader_discard_prepared(OverlayPreparedImage *image) {
     free(image);
-    InterlockedIncrement(&s_discarded);
+    COUNTER_INC(s_discarded);
 }
 
 void overlay_loader_rescan(void) {}
@@ -60,16 +108,16 @@ typedef struct {
     int length;
 } FeedArgs;
 
-static DWORD WINAPI feed_thread(void *opaque) {
+static WORKER_RET feed_thread(void *opaque) {
     FeedArgs *args = (FeedArgs *)opaque;
     autocompile_test_feed_output(args->text, args->length);
     autocompile_test_finish_input();
-    return 0;
+    return (WORKER_RET)0;
 }
 
 int main(void) {
     enum { ITEM_COUNT = 300 };
-    s_main_thread = GetCurrentThreadId();
+    s_main_thread = TID_SELF();
     /* The shared runtime polls every title. A title with overlay autocompile
      * disabled must not touch the publication lock before configuration. */
     autocompile_poll_main();
@@ -87,18 +135,14 @@ int main(void) {
 
     FeedArgs args = { text, length };
     if (!autocompile_test_start_preparer()) { free(text); return 1; }
-    HANDLE worker = CreateThread(NULL, 0, feed_thread, &args, 0, NULL);
-    if (!worker) { free(text); return 1; }
-    DWORD deadline = GetTickCount() + 10000u;
-    while (s_committed < ITEM_COUNT && GetTickCount() < deadline) {
+    worker_t worker;
+    if (!worker_start(&worker, feed_thread, &args)) { free(text); return 1; }
+    uint64_t deadline = now_ms() + 10000u;
+    while (s_committed < ITEM_COUNT && now_ms() < deadline) {
         autocompile_poll_main();
-        Sleep(1);
+        sleep_ms(1);
     }
-    if (WaitForSingleObject(worker, 1000) != WAIT_OBJECT_0) {
-        fprintf(stderr, "FAIL: bounded producer did not finish\n");
-        return 1;
-    }
-    CloseHandle(worker);
+    worker_join(&worker);
     if (!autocompile_test_join_preparer(1000)) {
         fprintf(stderr, "FAIL: preparer did not exit\n");
         return 1;
@@ -128,10 +172,10 @@ int main(void) {
         fprintf(stderr,
                 "FAIL: bounded handoff prep=%ld commit=%ld ready=%d "
                 "preparing=%d highwater=%d wrong=%ld/%ld\n",
-                s_prepared, s_committed, autocompile_test_ready_count(),
+                (long)s_prepared, (long)s_committed, autocompile_test_ready_count(),
                 autocompile_test_preparing_count(),
                 autocompile_test_ready_highwater(),
-                s_wrong_prepare_thread, s_wrong_commit_thread);
+                (long)s_wrong_prepare_thread, (long)s_wrong_commit_thread);
         autocompile_test_discard_all();
         return 1;
     }
@@ -143,14 +187,13 @@ int main(void) {
     args.text = extra;
     args.length = (int)strlen(extra);
     if (!autocompile_test_start_preparer()) return 1;
-    worker = CreateThread(NULL, 0, feed_thread, &args, 0, NULL);
-    if (!worker) return 1;
-    WaitForSingleObject(worker, INFINITE);
-    CloseHandle(worker);
+    if (!worker_start(&worker, feed_thread, &args)) return 1;
+    worker_join(&worker);
     if (!autocompile_test_join_preparer(1000)) return 1;
     autocompile_test_discard_all();
     if (s_discarded != 1 || autocompile_test_ready_count() != 0) {
-        fprintf(stderr, "FAIL: prepared reference discard count=%ld\n", s_discarded);
+        fprintf(stderr, "FAIL: prepared reference discard count=%ld\n",
+                (long)s_discarded);
         return 1;
     }
 
@@ -175,7 +218,7 @@ int main(void) {
         fprintf(stderr,
                 "FAIL: shutdown conservation prep=%ld commit=%ld discard=%ld "
                 "ready=%d preparing=%d\n",
-                s_prepared, s_committed, s_discarded,
+                (long)s_prepared, (long)s_committed, (long)s_discarded,
                 autocompile_test_ready_count(),
                 autocompile_test_preparing_count());
         return 1;
