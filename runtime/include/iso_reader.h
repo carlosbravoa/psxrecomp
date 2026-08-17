@@ -235,11 +235,13 @@ private:
      */
     bool ParseDirectoryRecord(const uint8_t* data, ISOFileEntry& entry) const;
 
+public:
     /**
      * Helper: List files in a directory given its LBA and size
-     * Used for subdirectory navigation
+     * Used for subdirectory navigation (and by iso_path_for_lba's tree walk)
      */
     std::vector<ISOFileEntry> ListFilesByLBA(uint32_t lba, uint32_t dir_size);
+private:
 
     /**
      * Helper: find the BinSegment containing a disc-relative LBA.

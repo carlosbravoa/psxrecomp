@@ -602,6 +602,12 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("texture_pack_enabled"))
             rt.video_texture_pack_enabled = toml::find<bool>(video, "texture_pack_enabled");
+        if (video.contains("fmv_pack")) {
+            const std::string fp = toml::find<std::string>(video, "fmv_pack");
+            if (!fp.empty()) rt.video_fmv_pack = fs::absolute(root / fp);
+        }
+        if (video.contains("fmv_pack_enabled"))
+            rt.video_fmv_pack_enabled = toml::find<bool>(video, "fmv_pack_enabled");
         if (video.contains("fmv_skip_total_table")) {
             rt.video_fmv_skip_total_table =
                 (uint32_t)toml::find<int64_t>(video, "fmv_skip_total_table");
@@ -2220,6 +2226,9 @@ UserSettings load_user_settings(const fs::path& path) {
         if (v.contains("texture_pack")) try_get([&]{
             s.texture_pack = toml::find<bool>(v, "texture_pack"); s.has_texture_pack = true;
         });
+        if (v.contains("fmv_pack")) try_get([&]{
+            s.fmv_pack = toml::find<bool>(v, "fmv_pack"); s.has_fmv_pack = true;
+        });
         // Deprecated and ignored: read only so the runtime can report that a
         // stale value was found (and so the next save drops it). Never applied
         // — see UserSettings::turbo_loads in config_loader.h.
@@ -2530,6 +2539,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
     if (s.has_texture_pack)
         f << "texture_pack      = " << (s.texture_pack ? "true" : "false") << "\n";
+    if (s.has_fmv_pack)
+        f << "fmv_pack          = " << (s.fmv_pack ? "true" : "false") << "\n";
     /* turbo_loads is deliberately NOT written back: it is deprecated and no
      * longer restored, so re-emitting it would preserve a dead row that looks
      * authoritative. Omitting it lets an existing settings.toml self-clean on

@@ -435,6 +435,13 @@ Reserved future fields:
 | `texture_pack` | directory (relative to the project root) of `<tex_id>[-<pal_id>].png` replacements at integer multiples of the native texel rect; offered in the launcher ("HD textures") only when it exists |
 | `texture_pack_enabled` | default of the launcher toggle (`settings.toml [video] texture_pack` overrides). Off = byte-identical. Visible only with `supersampling >= 2`. |
 
+### `fmv_pack` — HD movie replacement (docs/FMV_PACKS.md)
+
+| Field | Meaning |
+|---|---|
+| `fmv_pack` | directory (relative to the project root) of `<MOVIE>/NNNNN.png|jpg` frame sequences presented in place of the MDEC picture (one directory per STR movie, one image per decoded frame); offered in the launcher ("HD movies") only when it exists |
+| `fmv_pack_enabled` | default of the launcher toggle (`settings.toml [video] fmv_pack` overrides). Present-time only; off = the native present. |
+
 ## Audit block
 
 See `docs/audit_inventory.md` for the audit pipeline. The schema here is

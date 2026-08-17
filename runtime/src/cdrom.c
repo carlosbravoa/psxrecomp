@@ -282,6 +282,7 @@ void cdrom_notify_game_started(void) {
 
 int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
 
+
 /* Frontend XA-stream probe (FMV auto-skip / turbo-load gating in main.cpp). */
 int cdrom_xa_stream_active(void) { return xa_stream_active; }
 
@@ -3047,4 +3048,19 @@ void debug_force_cd_reinsert(void) {
 
     // Forzamos la ejecución de cualquier comando atascado en cola
     try_execute_queued_command();
+}
+
+/* Disc file the drive last delivered a sector from ("DIR/NAME.EXT"), or ""
+ * — the FMV pack names the streaming movie by it. Cached per file range. */
+extern int iso_path_for_lba(void* handle, uint32_t lba, char* out, int cap);
+const char *cdrom_current_file(void) {
+    static char s_path[256];
+    static int  s_lo = -1, s_hi = -1;       /* LBA range the cached path was resolved for */
+    if (!iso_handle || last_sector_lba < 0) { s_path[0] = 0; return s_path; }
+    if (last_sector_lba < s_lo || last_sector_lba > s_hi) {
+        if (!iso_path_for_lba(iso_handle, (uint32_t)last_sector_lba, s_path, sizeof s_path)) s_path[0] = 0;
+        /* re-resolve at most every 64 sectors, and immediately when the name changes */
+        s_lo = last_sector_lba; s_hi = last_sector_lba + 63;
+    }
+    return s_path;
 }

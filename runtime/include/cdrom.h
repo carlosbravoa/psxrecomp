@@ -57,6 +57,8 @@ void debug_force_cd_reinsert(void);
  * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA
  * sectors desyncs and hangs the player). */
 int  cdrom_xa_stream_active(void);
+/* Disc file ("DIR/NAME.EXT") the last delivered sector belongs to, "" if none. */
+const char *cdrom_current_file(void);
 /* True while a CD read is armed with XA/FMV mode bits (or XA already
  * streaming). Netplay uses this to arm no-invent / refuse tip episodes
  * before the first MDEC colour decode — MotK intro invent≠Start at FMV

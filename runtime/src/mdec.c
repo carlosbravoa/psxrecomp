@@ -1,4 +1,6 @@
 #include "mdec.h"
+#include "fmv_pack.h"
+#include "cdrom.h"
 #include "pst_wire.h"
 #include "psx_cycles.h"
 
@@ -644,6 +646,7 @@ static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
  * this per display-frame to tell "MDEC is actively producing frames" (FMV)
  * from idle. */
 static volatile uint32_t g_mdec_decode_count = 0;
+static uint32_t s_mdec_last_dma_out_words = 0;   /* words of the last DMA-out chunk (fmv dump: one 16-px column -> picture height) */
 uint32_t mdec_get_decode_count(void) { return g_mdec_decode_count; }
 
 static void execute_decode(void) {
@@ -693,6 +696,12 @@ static void execute_decode(void) {
     mdec_last_color_decode_frame = s_frame_count;
     mdec_last_color_decode_cycle = psx_cycle_count;
     trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
+    /* HD movie pack (fmv_pack.h): a decoded colour picture of the movie the
+     * CD is streaming — present-time only, the decode itself is untouched. */
+    if (g_fmv_pack_active) fmv_pack_note_decode(cdrom_current_file(), mdec.decode_macroblocks);
+    if (fmv_dump_armed()) fmv_dump_note_decode(cdrom_current_file(), mdec.decode_macroblocks,
+                                               mdec.output, mdec.output_size, mdec.output_depth,
+                                               s_mdec_last_dma_out_words);
 }
 
 static void execute_command(void) {
@@ -1046,6 +1055,7 @@ void mdec_debug_dma_in_end(uint32_t addr, uint32_t words) {
 }
 
 void mdec_debug_dma_out_start(uint32_t addr, uint32_t words) {
+    s_mdec_last_dma_out_words = words;
     (void)addr;
     trace_event(MDEC_EVT_DMA_OUT_START, words);
 }

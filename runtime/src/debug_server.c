@@ -6028,6 +6028,7 @@ static void handle_vram_upload_log(int id, const char *json)
 }
 
 #include "texture_pack.h"
+#include "fmv_pack.h"
 /* texture_dump: {"cmd":"texture_dump","op":"arm","dir":"/path"} dumps every
  * distinct texture (id = hash of texels + CLUT) as PNG + textures.tsv;
  * op=disarm stops; op=stats (default) reports counters. See texture_pack.h. */
@@ -6072,6 +6073,42 @@ static void handle_texture_pack(int id, const char *json)
     }
     char st[512];
     texture_pack_stats_json(st, sizeof st);
+    send_fmt("{\"id\":%d,\"ok\":true,\"stats\":%s}", id, st);
+}
+
+/* fmv_pack: {"op":"load","dir":..} | "unload" | "stats" (docs/FMV_PACKS.md). */
+static void handle_fmv_pack(int id, const char *json)
+{
+    char op[16] = "stats";
+    json_get_str(json, "op", op, sizeof(op));
+    if (strcmp(op, "load") == 0) {
+        char dir[1024] = "";
+        json_get_str(json, "dir", dir, sizeof(dir));
+        if (!dir[0]) { send_err(id, "missing dir"); return; }
+        if (fmv_pack_load(dir) <= 0) { send_err(id, "no <MOVIE>/NNNNN.png|jpg frames found"); return; }
+    } else if (strcmp(op, "unload") == 0) {
+        fmv_pack_unload();
+    }
+    char st[512];
+    fmv_pack_stats_json(st, sizeof st);
+    send_fmt("{\"id\":%d,\"ok\":true,\"stats\":%s,\"disc_file\":\"%s\"}", id, st, cdrom_current_file());
+}
+
+/* fmv_dump: {"op":"arm","dir":..} | "disarm" | "stats" — native MDEC frames as PNGs. */
+static void handle_fmv_dump(int id, const char *json)
+{
+    char op[16] = "stats";
+    json_get_str(json, "op", op, sizeof(op));
+    if (strcmp(op, "arm") == 0) {
+        char dir[1024] = "";
+        json_get_str(json, "dir", dir, sizeof(dir));
+        if (!dir[0]) { send_err(id, "missing dir"); return; }
+        if (!fmv_dump_arm(dir)) { send_err(id, "dir must exist"); return; }
+    } else if (strcmp(op, "disarm") == 0) {
+        fmv_dump_disarm();
+    }
+    char st[512];
+    fmv_dump_stats_json(st, sizeof st);
     send_fmt("{\"id\":%d,\"ok\":true,\"stats\":%s}", id, st);
 }
 
@@ -13654,6 +13691,8 @@ static const CmdEntry s_commands[] = {
     { "a0_history",        handle_a0_history },
     { "vram_upload_log",   handle_vram_upload_log },
     { "texture_dump",      handle_texture_dump },
+    { "fmv_pack",          handle_fmv_pack },
+    { "fmv_dump",          handle_fmv_dump },
     { "texture_pack",      handle_texture_pack },
     { "c0_history",        handle_c0_history },
     { "capture_quads",     handle_capture_quads },

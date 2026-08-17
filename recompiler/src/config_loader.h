@@ -449,6 +449,13 @@ struct RuntimeConfig {
     // toggle (settings.toml overrides). Byte-identical when off.
     std::filesystem::path video_texture_pack;
     bool                  video_texture_pack_enabled = true;
+    // fmv_pack: directory (relative to the project root) of an HD movie pack
+    // (docs/FMV_PACKS.md): one sub-directory per STR movie holding NNNNN.png/jpg
+    // frames presented in place of the MDEC picture. Empty = none offered.
+    // fmv_pack_enabled: default state of the "HD movies" toggle (settings.toml
+    // overrides). Present-time only; byte-identical when off.
+    std::filesystem::path video_fmv_pack;
+    bool                  video_fmv_pack_enabled = true;
 
     // fmv_skip_*: per-game FMV instant-skip via the game's own end-of-movie path.
     // Some players (Tomba) end a movie when the streamed frame number reaches that
@@ -1108,6 +1115,7 @@ struct UserSettings {
     bool has_scanline_glow    = false; double scanline_glow    = 0.50;
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
     bool has_texture_pack   = false; bool texture_pack   = true;  // HD textures toggle
+    bool has_fmv_pack       = false; bool fmv_pack       = true;  // HD movies toggle
     // [video] turbo_loads: DEPRECATED AND IGNORED — the legacy home of the
     // generic Turbo loads switch, back when the launcher drew a row for it.
     // Load acceleration now lives in the Mods catalog (see

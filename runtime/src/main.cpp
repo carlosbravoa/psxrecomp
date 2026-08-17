@@ -79,7 +79,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "disc_identity.h"
 #include "disc_path.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
-#include "texture_pack.h"    /* HD texture packs (docs/TEXTURE_PACKS.md) */
+#include "texture_pack.h"
+#include "fmv_pack.h"    /* HD texture packs (docs/TEXTURE_PACKS.md) */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #include "psx_window_icon.h"
 
@@ -1137,6 +1138,14 @@ static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're de
 /* HD texture pack (docs/TEXTURE_PACKS.md): [video] texture_pack dir; the
  * launcher's "HD textures" toggle / settings.toml [video] texture_pack. */
 static std::string   g_texture_pack_dir;
+static std::string   g_fmv_pack_dir;          /* [video] fmv_pack (docs/FMV_PACKS.md); empty = none */
+static int           g_fmv_pack_enabled = 1;
+/* Present-time HD movie frame: replaces the depth24 (MDEC) picture in the
+ * present buffer path. Held here so the SW/GL/VK branches share the decision. */
+static const uint32_t* s_fmv_px = nullptr;
+static int             s_fmv_w = 0, s_fmv_h = 0;
+static SDL_Texture*    sdl_fmv_texture = nullptr;
+static int             sdl_fmv_tex_w = 0, sdl_fmv_tex_h = 0;
 static int           g_texture_pack_enabled = 1;
 static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/150/200) */
 static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
@@ -1600,11 +1609,15 @@ static void headless_capture_present(void) {
     std::vector<uint32_t> filtered;
     const int kind = video_filter_get();
     const int n = video_filter_cpu_scale(kind);
+    /* HD movie frame in place of the depth24 picture (fmv_pack.h). */
+    const uint32_t* fpx = nullptr; int fw = 0, fh = 0;
+    if (di.depth24 && g_fmv_pack_active && fmv_pack_current(&fpx, &fw, &fh)) {
+        px = fpx; ow = fw; oh = fh;
+    } else
     /* Supersampled present (software hi-res mirror): capture what the windowed
      * present would show — the S× picture with the display looks in place,
      * upscalers stood down (video_filter.h, "supersampled source"). */
-    const int ss = (gr_scale() > 1 && !di.depth24) ? gr_scale() : 1;
-    if (ss > 1) {
+    if (const int ss = (gr_scale() > 1 && !di.depth24) ? gr_scale() : 1; ss > 1) {
         std::vector<uint32_t> hires((size_t)w * ss * (size_t)h * ss);
         if (gr_render_display_hires(hires.data(), (int)(w * ss * sizeof(uint32_t)),
                                     (int)di.display_x, (int)di.display_y, w, h) > 0) {
@@ -2627,6 +2640,7 @@ static void teardown_game_session_keep_lobby(void) {
         g_gl_active = false;
     }
     if (sdl_filter_texture) { SDL_DestroyTexture(sdl_filter_texture); sdl_filter_texture = nullptr; }
+    if (sdl_fmv_texture) { SDL_DestroyTexture(sdl_fmv_texture); sdl_fmv_texture = nullptr; sdl_fmv_tex_w = sdl_fmv_tex_h = 0; }
     sdl_filter_texture_n = 0; s_sw_hold_tex = nullptr;
     if (sdl_texture) { SDL_DestroyTexture(sdl_texture); sdl_texture = nullptr; }
     if (sdl_renderer) { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
@@ -7005,8 +7019,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                  * inside the full-width buffer — never shrink present width. */
                 depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h,
                                              di.display_x);
-                vk_renderer_present_cpu(sdl_pixel_buf, (int)present_w, (int)h,
-                                        0 /* nearest */, fmv_frame ? 1 : 0);
+                if (s_fmv_px)
+                    vk_renderer_present_cpu(s_fmv_px, s_fmv_w, s_fmv_h, 1 /* linear */, 1);
+                else
+                    vk_renderer_present_cpu(sdl_pixel_buf, (int)present_w, (int)h,
+                                            0 /* nearest */, fmv_frame ? 1 : 0);
             } else if (wide_present &&
                        vk_renderer_present_wide((int)di.display_x, (int)di.display_y,
                                                 (int)h, g_video_aa ? 1 : 0)) {
@@ -7057,6 +7074,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* depth24 (MotK crawl is 128 lines): pin short bands for letterbox even
          * when fmv_frame is false on a plain 4:3 window (ws layer not engaged). */
         pin_43 = fmv_frame || di.depth24 || (nw_pin && !wide_present);
+        /* HD movie pack: a replacement for the MDEC picture on screen? Decided
+         * once here; the SW / GL / VK presents below use it in place of the
+         * depth24 rows (docs/FMV_PACKS.md). Never for netplay (host-only). */
+        s_fmv_px = nullptr;
+        if (di.depth24 && g_fmv_pack_active && !psx_netplay_active()) {
+            const uint32_t* fpx; int fw, fh;
+            if (fmv_pack_current(&fpx, &fw, &fh)) { s_fmv_px = fpx; s_fmv_w = fw; s_fmv_h = fh; }
+        }
         if (!wide_present) {
             /* Never hires-present under netplay CPU-auth (even if settings say
              * 4× — that preference is offline-only). */
@@ -7155,7 +7180,26 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     const uint32_t* present_px = sdl_pixel_buf;
     SDL_Texture* present_tex = sdl_texture;
     int vf_n = 1;
-    if (!g_gl_active && !g_vk_active && active_scale > 1 &&
+    int fmv_replaced = 0;
+    if (s_fmv_px && !g_vk_active) {
+        /* HD movie frame: its own size, linear fit, pillarboxed 4:3 like the
+         * native FMV; video filters do not apply (it is not pixel art). */
+        present_px = s_fmv_px; src_w = s_fmv_w; src_h = s_fmv_h; fmv_replaced = 1;
+        if (!g_gl_active && sdl_renderer) {
+            if (sdl_fmv_texture && (sdl_fmv_tex_w != src_w || sdl_fmv_tex_h != src_h)) {
+                SDL_DestroyTexture(sdl_fmv_texture); sdl_fmv_texture = nullptr;
+            }
+            if (!sdl_fmv_texture) {
+                sdl_fmv_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                                    SDL_TEXTUREACCESS_STREAMING, src_w, src_h);
+                sdl_fmv_tex_w = src_w; sdl_fmv_tex_h = src_h;
+                if (sdl_fmv_texture) SDL_SetTextureScaleMode(sdl_fmv_texture, SDL_ScaleModeLinear);
+            }
+            if (sdl_fmv_texture) present_tex = sdl_fmv_texture;
+            else { present_px = sdl_pixel_buf; src_w = (int)present_w * active_scale; src_h = (int)h * active_scale; fmv_replaced = 0; }
+        }
+    }
+    if (!fmv_replaced && !g_gl_active && !g_vk_active && active_scale > 1 &&
         video_filter_applies_at_scale(video_filter_get(), active_scale) &&
         src_w > 0 && src_h > 0 && sdl_renderer) {
         const size_t cap_px = (size_t)(640 * 4) * (size_t)(512 * 4);
@@ -7169,7 +7213,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                                           sdl_filter_buf, src_w, active_scale))
                 present_px = sdl_filter_buf;          /* same size: the plain hi-res texture path fits it */
         }
-    } else if (!g_gl_active && !g_vk_active && active_scale == 1 &&
+    } else if (!fmv_replaced && !g_gl_active && !g_vk_active && active_scale == 1 &&
         video_filter_get() != VF_NONE && src_w > 0 && src_h > 0 && sdl_renderer) {
         const int kind = video_filter_get();
         const int n = video_filter_cpu_scale(kind);
@@ -7214,8 +7258,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * still owns timing. 24-bit (FMV) frames pin to native 4:3. */
         /* FMV: nearest present — linear filtering fringes the right edge of
          * low-res 24-bit scanouts into adjacent (often garbage) texels. */
-        gl_renderer_present(sdl_pixel_buf, src_w, src_h,
-                            (g_video_aa && !depth24_frame) ? 1 : 0,
+        gl_renderer_present(fmv_replaced ? present_px : sdl_pixel_buf, src_w, src_h,
+                            fmv_replaced ? 1 : ((g_video_aa && !depth24_frame) ? 1 : 0),
                             pin_43 ? 1 : 0, 0 /* full width */);
         netplay_note_present();
     } else {
@@ -7249,7 +7293,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * so any residual linear fringe is black, matching the letterbox. */
     const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
     const int tex_h = 512 * tex_scale * vf_n;
-    if (src_w > 0 && src_h > 0 && src_h < tex_h) {
+    if (!fmv_replaced && src_w > 0 && src_h > 0 && src_h < tex_h) {
         static uint32_t s_black_pad[640 * 4]; /* covers g_video_scale <= 4 */
         const int pad_cap = (int)(sizeof(s_black_pad) / sizeof(s_black_pad[0]));
         const int pad_w = (src_w <= pad_cap) ? src_w : pad_cap;
@@ -10710,6 +10754,16 @@ namespace {
             gi->texture_pack_label = s_tp_label.empty() ? nullptr : s_tp_label.c_str();
         }
 #endif
+#if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
+        gi->has_fmv_pack = g_fmv_pack_dir.empty() ? 0 : 1;
+        {
+            static std::string s_fp_label;
+            s_fp_label = g_fmv_pack_dir.empty()
+                ? std::string()
+                : std::filesystem::path(g_fmv_pack_dir).filename().string();
+            gi->fmv_pack_label = s_fp_label.empty() ? nullptr : s_fp_label.c_str();
+        }
+#endif
         gi->has_geometry_precision = 1;
         gi->has_rewind_depth = 1;
 #if defined(RECOMP_LAUNCHER_HAS_VIDEO_FILTER)
@@ -11332,6 +11386,16 @@ int main(int argc, char** argv) {
             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
             g_texture_pack_dir = gc.runtime.video_texture_pack.string();
             g_texture_pack_enabled = gc.runtime.video_texture_pack_enabled ? 1 : 0;
+            g_fmv_pack_dir = gc.runtime.video_fmv_pack.string();
+            g_fmv_pack_enabled = gc.runtime.video_fmv_pack_enabled ? 1 : 0;
+            if (!g_fmv_pack_dir.empty()) {
+                std::error_code fp_ec;
+                if (!std::filesystem::is_directory(g_fmv_pack_dir, fp_ec)) {
+                    std::fprintf(stdout, "psxrecomp: [video] fmv_pack %s not found; HD movies not offered\n",
+                                 g_fmv_pack_dir.c_str());
+                    g_fmv_pack_dir.clear();
+                }
+            }
             if (!g_texture_pack_dir.empty()) {
                 std::error_code tp_ec;
                 if (!std::filesystem::is_directory(g_texture_pack_dir, tp_ec)) {
@@ -11528,6 +11592,7 @@ int main(int argc, char** argv) {
         if (us.has_scanline_glow)    g_scan.glow    = (float)us.scanline_glow;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
         if (us.has_texture_pack)   g_texture_pack_enabled = us.texture_pack ? 1 : 0;
+        if (us.has_fmv_pack)       g_fmv_pack_enabled = us.fmv_pack ? 1 : 0;
         /* turbo_loads is deliberately NOT restored from settings.toml. It is a
          * write-only latch: the launcher stopped drawing a Turbo loads row when
          * load acceleration moved to the Mods catalog, so a persisted `true`
@@ -11963,6 +12028,8 @@ int main(int argc, char** argv) {
             seed.has_auto_skip_fmv = skip_fmv_offered;
             seed.texture_pack = (g_texture_pack_enabled != 0);
             seed.has_texture_pack = !g_texture_pack_dir.empty();
+            seed.fmv_pack = (g_fmv_pack_enabled != 0);
+            seed.has_fmv_pack = !g_fmv_pack_dir.empty();
             seed.turbo_loads = (g_turbo_loads_enabled != 0);
             seed.has_turbo_loads = turbo_loads_offered;
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
@@ -12149,6 +12216,9 @@ int main(int argc, char** argv) {
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
 #if defined(RECOMP_LAUNCHER_HAS_TEXTURE_PACK)
             ls.texture_pack       = seed.texture_pack ? 1 : 0;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
+            ls.fmv_pack           = seed.fmv_pack ? 1 : 0;
 #endif
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
             /* Localization: index of resolved_language within lang_menu_options
@@ -12403,6 +12473,10 @@ int main(int argc, char** argv) {
                 seed.texture_pack = ls.texture_pack != 0;
                 seed.has_texture_pack = !g_texture_pack_dir.empty();
 #endif
+#if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
+                seed.fmv_pack = ls.fmv_pack != 0;
+                seed.has_fmv_pack = !g_fmv_pack_dir.empty();
+#endif
                 seed.turbo_loads = ls.turbo_loads != 0;
                 seed.has_turbo_loads = turbo_loads_offered;
                 host_volume_set(ls.volume);
@@ -12591,6 +12665,7 @@ int main(int argc, char** argv) {
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv = skip_fmv_offered && seed.auto_skip_fmv ? 1 : 0;
                 if (seed.has_texture_pack) g_texture_pack_enabled = seed.texture_pack ? 1 : 0;
+                if (seed.has_fmv_pack) g_fmv_pack_enabled = seed.fmv_pack ? 1 : 0;
                 g_turbo_loads_enabled =
                     turbo_loads_offered && seed.turbo_loads ? 1 : 0;
                 fast_boot = seed.fast_boot;
@@ -13053,6 +13128,26 @@ session_reboot:
             std::fprintf(stdout, "psxrecomp: HD texture pack %s available, disabled by settings\n",
                          g_texture_pack_dir.c_str());
         }
+    }
+    /* HD movie pack (fmv_pack.h): PSX_FMV_PACK is a one-run override. */
+    if (const char* fp_env = std::getenv("PSX_FMV_PACK")) {
+        if (fp_env[0]) { g_fmv_pack_dir = fp_env; g_fmv_pack_enabled = 1; }
+    }
+    if (!g_fmv_pack_dir.empty()) {
+        if (g_fmv_pack_enabled) {
+            const int n = fmv_pack_load(g_fmv_pack_dir.c_str());
+            std::fprintf(stdout, "psxrecomp: HD movie pack %s (%d movies)%s\n",
+                         g_fmv_pack_dir.c_str(), n,
+                         n ? "" : " — none loaded (no <MOVIE>/NNNNN.png|jpg frames)");
+        } else {
+            std::fprintf(stdout, "psxrecomp: HD movie pack %s available, disabled by settings\n",
+                         g_fmv_pack_dir.c_str());
+        }
+    }
+    if (const char* fd_env = std::getenv("PSX_FMV_DUMP")) {
+        /* native MDEC frames -> <dir>/<MOVIE>/NNNNN.png from the first movie on */
+        if (fd_env[0] && !fmv_dump_arm(fd_env))
+            std::fprintf(stdout, "psxrecomp: PSX_FMV_DUMP=%s is not a directory — ignored\n", fd_env);
     }
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
 
@@ -13951,6 +14046,8 @@ session_reboot:
     if (g_gl_active) gl_renderer_shutdown();
     if (g_vk_active) vk_renderer_shutdown();
     SDL_DestroyTexture(sdl_filter_texture); /* NULL-safe */
+    SDL_DestroyTexture(sdl_fmv_texture);
+    fmv_pack_unload();
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);
@@ -14009,6 +14106,9 @@ soft_return_lobby:
         ls.auto_skip_fmv = (skip_fmv_offered && g_auto_skip_fmv) ? 1 : 0;
 #if defined(RECOMP_LAUNCHER_HAS_TEXTURE_PACK)
         ls.texture_pack = g_texture_pack_enabled ? 1 : 0;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
+        ls.fmv_pack = g_fmv_pack_enabled ? 1 : 0;
 #endif
         ls.turbo_loads = (turbo_loads_offered && g_turbo_loads_enabled) ? 1 : 0;
         ls.rewind_depth = g_rewind_depth;
@@ -14295,6 +14395,10 @@ soft_return_lobby:
                 us.texture_pack = ls.texture_pack != 0;
                 us.has_texture_pack = !g_texture_pack_dir.empty();
 #endif
+#if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
+                us.fmv_pack = ls.fmv_pack != 0;
+                us.has_fmv_pack = !g_fmv_pack_dir.empty();
+#endif
                 us.turbo_loads = ls.turbo_loads != 0;
                 us.has_turbo_loads = turbo_loads_offered;
                 us.fullscreen = ls.fullscreen != 0;
@@ -14352,6 +14456,16 @@ soft_return_lobby:
                     std::fprintf(stdout, "psxrecomp: HD texture pack %s (%d images)\n",
                                  g_texture_pack_dir.c_str(), n);
                 } else texture_pack_unload();
+            }
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
+            if (!g_fmv_pack_dir.empty()) {
+                g_fmv_pack_enabled = ls.fmv_pack ? 1 : 0;
+                if (g_fmv_pack_enabled) {
+                    const int n = fmv_pack_load(g_fmv_pack_dir.c_str());
+                    std::fprintf(stdout, "psxrecomp: HD movie pack %s (%d movies)\n",
+                                 g_fmv_pack_dir.c_str(), n);
+                } else fmv_pack_unload();
             }
 #endif
             if (turbo_loads_offered)  g_turbo_loads_enabled = ls.turbo_loads ? 1 : 0;
