@@ -1286,9 +1286,20 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             uint16_t imm = get_imm16_u(instr);
             return fmt::format("{} = (uint32_t)psx_ws_bg2d_startcol((int)({} & 0x{:X}u), 0x{:X}u);{}",
                                reg_name(rt), reg_name(rs), imm, imm, comment);
+        } else if (opcode == 0x00 && (instr & 0x3F) == 0x03) {
+            // sra rd,rt,sa — UNMASKED start tile-column. A renderer that indexes
+            // its tile map directly (rather than through a power-of-two ring)
+            // derives the start column by arithmetic-shifting the scroll value
+            // and applies no wrap mask, so there is no andi to hook. Mega Man 8:
+            // `sra v0,v0,20` at 0x800F993C inside func_800F98D8. Pass an all-ones
+            // mask so psx_ws_bg2d_startcol() only subtracts the reveal and does
+            // not wrap. Identity at 4:3 (left_cols() == 0), like every other hook.
+            uint32_t rt = get_rt(instr), rd = get_rd(instr), sh = get_shamt(instr);
+            return fmt::format("{} = (uint32_t)psx_ws_bg2d_startcol((int)((int32_t){} >> {}), 0xFFFFFFFFu);{}",
+                               reg_name(rd), reg_name(rt), sh, comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] startcol_site 0x{:08X} is not "
-                       "andi (opcode 0x{:02X})\n", addr, opcode);
+                       "andi or sra (instr 0x{:08X})\n", addr, instr);
             std::exit(1);
         }
     }
