@@ -234,6 +234,13 @@ static PackEntry *s_pack[PACK_BUCKETS];
 static int s_pack_n = 0;
 static char s_pack_dir[1024];
 static uint64_t s_lookups = 0, s_hits = 0;
+static uint32_t s_pack_gen = 0;
+
+uint32_t texture_pack_generation(void) { return s_pack_gen; }
+void texture_pack_for_each(void (*fn)(TexPackImage *img, void *ctx), void *ctx) {
+    for (unsigned b = 0; b < PACK_BUCKETS; b++)
+        for (PackEntry *e = s_pack[b]; e; e = e->next) fn(&e->img, ctx);
+}
 
 static int parse_hex16(const char *p, uint64_t *out) {
     uint64_t v = 0;
@@ -256,6 +263,7 @@ void texture_pack_unload(void) {
     }
     s_pack_n = 0; s_pack_dir[0] = 0; s_lookups = s_hits = 0;
     g_texture_pack_replace = 0;
+    s_pack_gen++;
 }
 
 int texture_pack_load(const char *dir) {
@@ -281,12 +289,14 @@ int texture_pack_load(const char *dir) {
         PackEntry *e = (PackEntry*)calloc(1, sizeof *e);
         if (!e) { stbi_image_free(px); break; }
         e->tex = tex; e->pal = pal; e->img.w = w; e->img.h = h; e->img.rgba = px;
+        e->img.atlas_x = e->img.atlas_y = -1;
         unsigned b = (unsigned)(tex ^ (tex >> 23)) & (PACK_BUCKETS - 1);
         e->next = s_pack[b]; s_pack[b] = e; s_pack_n++;
     }
     closedir(d);
     snprintf(s_pack_dir, sizeof s_pack_dir, "%s", dir);
     g_texture_pack_replace = s_pack_n > 0;
+    s_pack_gen++;
     return s_pack_n;
 }
 

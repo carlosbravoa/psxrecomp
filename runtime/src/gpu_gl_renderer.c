@@ -68,6 +68,7 @@
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
 #include "host_osd.h"
+#include "texture_pack.h"
 #include "psx_savestate_menu.h"
 #include "host_time.h"
 #include "latency_ring.h"
@@ -379,7 +380,7 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
  * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
  * fragment shader read the noperspective varying — i.e. bit-identical to the
  * pre-feature pipeline. */
-#define TEXV 20
+#define TEXV 28   /* 20 + rep_org(4) + rep_atlas(4): texture-pack replacement (docs/TEXTURE_PACKS.md) */
 static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
 static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
 
@@ -394,6 +395,8 @@ static float   s_pq[3];
 
 /* TEX program uniforms. */
 static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
+static GLint s_uAtlas = -1;
+static GLuint s_atlas_tex = 0;   /* texture-pack atlas (built by gl_atlas_sync below) */
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
 static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
 static GLint s_uLimits = -1;
@@ -958,6 +961,8 @@ static const char *TEX_VS =
     "layout(location=7) in vec4 a_limits;\n"
     "layout(location=8) in float a_semi;\n"
     "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
+    "layout(location=10) in vec4 a_rep_org;   /* texture-pack: prim texel rect u0,v0,w,h */\n"
+    "layout(location=11) in vec4 a_rep_atlas; /* texture-pack: atlas rect x,y,w,h; w=0 none */\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
@@ -968,7 +973,9 @@ static const char *TEX_VS =
     "flat out int v_persp;\n"
     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
     "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
+    "flat out vec4 v_rep_org; flat out vec4 v_rep_atlas;\n"
     "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
+    "  v_rep_org = a_rep_org; v_rep_atlas = a_rep_atlas;\n"
     "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
     "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
     "  v_depth = int(a_depth + 0.5); v_raw = int(a_raw + 0.5);\n"
@@ -1000,7 +1007,10 @@ static const char *TEX_FS =
     "flat in int v_raw;       /* 1 = no color modulation */\n"
     "flat in ivec4 v_limits;  /* prim uv sampling bounds (inclusive, post-wrap) */\n"
     "flat in int v_semi;      /* GP0 command has semi-transparency enabled */\n"
+    "flat in vec4 v_rep_org;  /* texture-pack replacement: prim texel rect (u0,v0,w,h) */\n"
+    "flat in vec4 v_rep_atlas;/* ... its atlas rect (x,y,w,h); w == 0 -> native texels */\n"
     "uniform usampler2D u_vram;\n"
+    "uniform sampler2D u_atlas; /* texture-pack atlas (RGBA8) */\n"
     "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
@@ -1036,7 +1046,20 @@ static const char *TEX_FS =
     "   * AND this prim's packet carried full GTE projection provenance, so the\n"
     "   * default is the PS1's affine (noperspective) mapping. */\n"
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
-    "  if (u_filter == 0) {\n"
+    "  if (v_rep_atlas.z > 0.0) {\n"
+    "    /* Texture-pack replacement (docs/TEXTURE_PACKS.md): sample the pack image\n"
+    "     * at the prim's texel coordinates; its alpha decides coverage, the native\n"
+    "     * texel keeps the STP (semi-transparency) authority exactly like the\n"
+    "     * software path. Nearest sample; the image is an integer multiple of the\n"
+    "     * texel rect. */\n"
+    "    vec2 t = (uv - v_rep_org.xy) / v_rep_org.zw;\n"
+    "    ivec2 ap = ivec2(v_rep_atlas.xy) + clamp(ivec2(floor(t * v_rep_atlas.zw)), ivec2(0), ivec2(v_rep_atlas.zw) - 1);\n"
+    "    vec4 rc = texelFetch(u_atlas, ap, 0);\n"
+    "    if (rc.a < 0.5) discard;\n"
+    "    int rawn = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
+    "    stp = (rawn >> 15) & 1;\n"
+    "    rgb = rc.rgb;\n"
+    "  } else if (u_filter == 0) {\n"
     "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
     "    if (raw == 0) discard;\n"
     "    rgb = col5(raw);\n"
@@ -1739,6 +1762,12 @@ static void flush_tex_batch(void) {
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_raw_tex);
     p_glUniform1i(s_uVram, 0);
+    if (s_atlas_tex) {                       /* texture-pack atlas on unit 2 */
+        p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+        glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        p_glUniform1i(s_uAtlas, 2);
+    }
     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
@@ -1909,11 +1938,108 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
  * stencil (mask) write value is constant within each pass; the semi pass is
  * also where PS1 blending applies. lim = uv sampling bounds (see
  * tri_uv_limits); NULL computes them from the vertices. */
+/* ---- texture-pack atlas (docs/TEXTURE_PACKS.md, B4) ---------------------
+ * The loaded pack images are shelf-packed into one RGBA8 texture whenever the
+ * pack generation changes; each image records its atlas placement in
+ * TexPackImage.atlas_x/y (-1 = did not fit -> native texels for it). */
+static int      s_atlas_w = 0, s_atlas_h = 0;
+static uint32_t s_atlas_gen = 0xFFFFFFFFu;
+static int      s_atlas_dropped = 0, s_atlas_placed = 0;
+
+typedef struct { TexPackImage **v; int n, cap; } AtlasList;
+static void atlas_collect(TexPackImage *img, void *ctx) {
+    AtlasList *l = (AtlasList *)ctx;
+    if (l->n == l->cap) {
+        int nc = l->cap ? l->cap * 2 : 256;
+        TexPackImage **nv = (TexPackImage **)realloc(l->v, (size_t)nc * sizeof *nv);
+        if (!nv) return;
+        l->v = nv; l->cap = nc;
+    }
+    l->v[l->n++] = img;
+}
+static int atlas_cmp_h(const void *a, const void *b) {
+    const TexPackImage *x = *(TexPackImage *const *)a, *y = *(TexPackImage *const *)b;
+    if (x->h != y->h) return y->h - x->h;
+    return y->w - x->w;
+}
+static void gl_atlas_sync(void) {
+    const uint32_t gen = texture_pack_generation();
+    if (gen == s_atlas_gen) return;
+    s_atlas_gen = gen;
+    if (s_atlas_tex) { glDeleteTextures(1, &s_atlas_tex); s_atlas_tex = 0; }
+    s_atlas_placed = s_atlas_dropped = 0;
+    if (!g_texture_pack_replace) return;
+    AtlasList l = {0};
+    texture_pack_for_each(atlas_collect, &l);
+    if (!l.n) { free(l.v); return; }
+    qsort(l.v, (size_t)l.n, sizeof *l.v, atlas_cmp_h);
+    GLint maxsz = 4096;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxsz);
+    if (maxsz > 8192) maxsz = 8192;
+    /* pick the smallest square that shelf-packs everything (or the max) */
+    int size = 1024;
+    for (;;) {
+        int x = 0, y = 0, shelf = 0, ok = 1;
+        for (int i = 0; i < l.n; i++) {
+            const TexPackImage *im = l.v[i];
+            if (im->w > size || im->h > size) { ok = 0; break; }
+            if (x + im->w > size) { x = 0; y += shelf; shelf = 0; }
+            if (y + im->h > size) { ok = 0; break; }
+            if (im->h > shelf) shelf = im->h;
+            x += im->w;
+        }
+        if (ok || size >= maxsz) break;
+        size *= 2;
+    }
+    s_atlas_w = s_atlas_h = size;
+    glGenTextures(1, &s_atlas_tex);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+    glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    {
+        int x = 0, y = 0, shelf = 0;
+        for (int i = 0; i < l.n; i++) {
+            TexPackImage *im = l.v[i];
+            im->atlas_x = im->atlas_y = -1;
+            if (im->w > size || im->h > size) { s_atlas_dropped++; continue; }
+            if (x + im->w > size) { x = 0; y += shelf; shelf = 0; }
+            if (y + im->h > size) { s_atlas_dropped++; continue; }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, im->w, im->h, GL_RGBA, GL_UNSIGNED_BYTE, im->rgba);
+            im->atlas_x = x; im->atlas_y = y; s_atlas_placed++;
+            if (im->h > shelf) shelf = im->h;
+            x += im->w;
+        }
+    }
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    free(l.v);
+    if (s_atlas_dropped)
+        fprintf(stdout, "psxrecomp: texture pack atlas %dx%d: %d images placed, %d did not fit\n",
+                     size, size, s_atlas_placed, s_atlas_dropped);
+}
+/* Fill rep[8] = {u0,v0,w,h, ax,ay,aw,ah} for a prim's texel rect; aw = 0 when
+ * there is no replacement. */
+static void gl_rep_for_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
+                            int u, int v, int w, int h, float rep[8]) {
+    rep[0] = rep[1] = rep[2] = rep[3] = rep[4] = rep[5] = rep[6] = rep[7] = 0.0f;
+    if (!g_texture_pack_replace) return;
+    gl_atlas_sync();
+    if (!s_atlas_tex) return;
+    const TexPackImage *im = texture_pack_lookup_rect(texpage, clut_x, clut_y, u, v, w, h);
+    if (!im || im->atlas_x < 0) return;
+    rep[0] = (float)u; rep[1] = (float)v; rep[2] = (float)w; rep[3] = (float)h;
+    rep[4] = (float)im->atlas_x; rep[5] = (float)im->atlas_y; rep[6] = (float)im->w; rep[7] = (float)im->h;
+}
+
 static void gpu_textured_triangle(const int *xs, const int *ys,
                                   const int *us, const int *vs,
                                   const float *col, uint16_t texpage,
                                   uint16_t clut_x, uint16_t clut_y, int rawtex,
-                                  int semi, const int *lim) {
+                                  int semi, const int *lim, const float *rep) {
     int lim_buf[4];
     int uv_buf[6];
     if (!lim) {
@@ -1999,6 +2125,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
             vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
             vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
+            for (int k = 0; k < 8; k++) vp[20 + k] = rep ? rep[k] : 0.0f;   /* a_rep_org, a_rep_atlas */
         }
         s_tb_n += 3;
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
@@ -2090,13 +2217,21 @@ static void gpu_textured_rect(int x,int y,int w,int h,
      * from the original corners, then the mirror bump (see gpu_uv.h). */
     int lim[4];
     psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    /* texture-pack replacement: identify the ORIGINAL (unbumped) texel span;
+     * a mirrored rect (u0 > u1) samples the same image, mirrored by its uvs */
+    float rep[8];
+    {
+        int ru = u0 < u1 ? u0 : u1, rv = v0 < v1 ? v0 : v1;
+        int rw = u0 < u1 ? u1 - u0 : u0 - u1, rh = v0 < v1 ? v1 - v0 : v0 - v1;
+        gl_rep_for_rect(tp, clut_x, clut_y, ru, rv, rw, rh, rep);
+    }
     psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
-    gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
+    gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim,rep);
     int xs2[3]={x+w, x, x+w},  ys2[3]={y, y+h, y+h};
     int us2[3]={u1,u0,u1},     vs2[3]={v0,v1,v1};
-    gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
+    gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi,lim,rep);
 }
 
 /* GP0(02h) fill: writes color with bit15=0, ignoring draw area, mask and
@@ -2304,7 +2439,20 @@ static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1
     int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
-    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw, s_semi_en?s_semi_mode:-1, NULL);
+    /* texture-pack replacement: uv bbox with the same inclusive/exclusive
+     * span rule as texture_pack_note_tri / the software renderer */
+    float rep[8];
+    {
+        int umin = u0 < u1 ? (u0 < u2 ? u0 : u2) : (u1 < u2 ? u1 : u2);
+        int umax = u0 > u1 ? (u0 > u2 ? u0 : u2) : (u1 > u2 ? u1 : u2);
+        int vmin = v0 < v1 ? (v0 < v2 ? v0 : v2) : (v1 < v2 ? v1 : v2);
+        int vmax = v0 > v1 ? (v0 > v2 ? v0 : v2) : (v1 > v2 ? v1 : v2);
+        int rw = umax - umin, rh = vmax - vmin;
+        if (rw <= 0 || (rw & 7)) rw += 1;
+        if (rh <= 0 || (rh & 7)) rh += 1;
+        gl_rep_for_rect(tp, cx, cy, umin, vmin, rw, rh, rep);
+    }
+    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw, s_semi_en?s_semi_mode:-1, NULL, rep);
     precise_consumed();
 }
 static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,int x1,int y1,int u1,int v1,uint32_t c1,int x2,int y2,int u2,int v2,uint32_t c2,uint16_t cx,uint16_t cy,uint16_t tp,int raw){
@@ -2314,7 +2462,7 @@ static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32
     int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
     uint32_t cc[3]={c0,c1,c2}; float col[9];
     for (int i=0;i<3;i++){ col[i*3+0]=(cc[i]&0xFF)/255.0f; col[i*3+1]=((cc[i]>>8)&0xFF)/255.0f; col[i*3+2]=((cc[i]>>16)&0xFF)/255.0f; }
-    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw, s_semi_en?s_semi_mode:-1, NULL);
+    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw, s_semi_en?s_semi_mode:-1, NULL, NULL);
     precise_consumed();
 }
 static void glb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
@@ -2597,6 +2745,7 @@ static int init_gpu_raster(void) {
     if (!make_fbo(&s_scratch_fbo, s_scratch_tex, 0)) return 0;
 
     s_uVram  = p_glGetUniformLocation(s_tex_prog, "u_vram");
+    s_uAtlas = p_glGetUniformLocation(s_tex_prog, "u_atlas");
     s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
     s_uClut  = p_glGetUniformLocation(s_tex_prog, "u_clut");
     s_uDepth = p_glGetUniformLocation(s_tex_prog, "u_depth");
@@ -2681,6 +2830,8 @@ static int init_gpu_raster(void) {
         p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
         p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
         p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
+        p_glVertexAttribPointer(10, 4, GL_FLOAT, GL_FALSE, st, (void*)(20*sizeof(float))); p_glEnableVertexAttribArray(10); /* rep_org   */
+        p_glVertexAttribPointer(11, 4, GL_FLOAT, GL_FALSE, st, (void*)(24*sizeof(float))); p_glEnableVertexAttribArray(11); /* rep_atlas */
     }
 
     p_glGenVertexArrays(1, &s_blit_vao);

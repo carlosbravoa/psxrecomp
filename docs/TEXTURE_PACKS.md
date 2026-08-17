@@ -99,17 +99,47 @@ palette-agnostic replacement shows at full brightness during a palette fade —
 supply `<tex>-<pal>.png` variants for the settled palette, or wait for B9's
 palette-aware modulation), coverage tooling.
 
-## Next (B4+)
+## Replacement — OpenGL renderer (B4)
 
-GL twin of the sampler (atlas from the pack, same lookup) + parity tool;
+The GL backend (`gpu_gl_renderer.c`) carries the same replacement through
+its textured program: two extra flat vertex attributes per primitive
+(`a_rep_org` = the prim's texel rect u0,v0,w,h; `a_rep_atlas` = its rect in
+the **pack atlas**), and the fragment shader samples the atlas (RGBA8,
+nearest, `texelFetch`) at `(uv - org) / size` when `a_rep_atlas.w > 0`:
+alpha < 0.5 discards, the STP bit still comes from the native texel, colour
+modulation / semi-transparency / mask passes are the existing ones. The
+atlas is shelf-packed from every loaded image whenever the pack generation
+changes (up to 8192², images that do not fit fall back to native texels and
+are counted in the log). Lookups use the same texel id as the dump and the
+SW path (`gl_rep_for_rect`, unbumped span; mirrored rects sample the same
+image mirrored). Verified on Mega Man 8 (OpenGL, `[video] supersampling = 2`):
+identical replacements to the software path, 20,580 lookups → 17,960 hits.
+
+**Divergence (documented, accepted like the others in `gpu_gl_renderer.c`)**:
+on GL the hr FBO *is* VRAM — CPU readbacks (VRAM→CPU transfers, GPUREAD,
+`screenshot`, savestate VRAM) re-encode it, so replaced pixels of *rendered*
+framebuffer content are visible to them (at 5-bit precision), whereas the
+software renderer keeps native VRAM untouched. Textures the game uploads are
+never altered (uploads bypass the shader). Same behaviour as upscaled
+emulators; irrelevant to titles that do not read their framebuffer back.
+Replaced colours keep 8-bit precision on GL (the software path quantises to
+15-bit), so the two backends differ by ≤ 1 LSB of 5-bit for replaced texels.
+
+Not on GL yet: shaded-textured triangles, bilinear sampling of pack images
+(nearest only), the Vulkan backend (unfiltered by design, like video filters).
+
+## Next (B7+)
+
+`[video] texture_pack` key + launcher row; coverage tooling per stage;
 DEGRADED logging when a pack entry's native hash no longer matches;
-coverage stats per stage.
+fade-aware palette handling.
 
 ## Files
 
 `runtime/include/texture_pack.h`, `runtime/src/texture_pack.c` (identity,
 dump, pack loading — private static `stb_image` PNG decoder),
 `runtime/src/gpu_render.c` (identity hooks), `runtime/src/gpu_sw_renderer.c`
-(replacement sampling in the S× rasterisers), `runtime/src/png_write.h`
+(replacement sampling in the S× rasterisers), `runtime/src/gpu_gl_renderer.c`
+(atlas + shader path), `runtime/src/png_write.h`
 (`png_write_rgba`), `runtime/src/debug_server.c` (`texture_dump`,
 `texture_pack`; `screenshot_hires` pitch fix), `runtime/tests/test_texture_pack.c`.

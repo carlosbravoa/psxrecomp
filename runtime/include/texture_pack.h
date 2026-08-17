@@ -39,6 +39,7 @@ extern int g_texture_pack_replace;  /* 1 = a replacement pack is loaded (B3) */
 typedef struct {
     int w, h;                 /* pixels */
     const uint8_t *rgba;      /* w*h*4, top-down */
+    int atlas_x, atlas_y;     /* renderer-owned: placement in its atlas (-1 = not resident) */
 } TexPackImage;
 
 int  texture_pack_load(const char *dir);        /* returns number of images, 0 = none/failed */
@@ -48,6 +49,10 @@ const TexPackImage *texture_pack_lookup_rect(uint16_t texpage, uint16_t clut_x, 
                                              int u, int v, int w, int h);
 /* {"loaded":N,"dir":"..","lookups":N,"hits":N} */
 int  texture_pack_stats_json(char *buf, int cap);
+/* Bumped by every load/unload; renderers rebuild their atlas when it changes. */
+uint32_t texture_pack_generation(void);
+/* Visit every loaded image (renderers place them in an atlas and record atlas_x/y). */
+void texture_pack_for_each(void (*fn)(TexPackImage *img, void *ctx), void *ctx);
 
 void texture_pack_set_vram(const uint16_t *vram_1024x512);
 void texture_pack_note_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
