@@ -167,6 +167,27 @@ no data is read until requested. A Form 1 sector costs one 2048-byte read plus
 EDC/ECC (~10 µs); at 2× speed the drive asks for 150 sectors/s. Raw and audio
 sectors are plain reads. Host files are opened lazily and kept open.
 
+
+## Copying single files out of another dump (`disc_tree.py copy`)
+
+You do not need a second tree to borrow files from another disc (another
+region's movies, a different sound bank): `copy` takes just the named files
+out of a bin/cue in the same storage form `extract` uses — Form 1 files
+cooked (2048 B/sector), XA/STR files **raw 2336** with their sub-headers, which
+is what interleaved streams need for their audio sectors to survive:
+
+```
+python3 tools/disc_tree.py copy other.cue --list                        # what is on it, and how it is stored
+python3 tools/disc_tree.py copy other.cue <tree>/cdrom 'MOVIE/*.STR'    # drop them into an existing tree
+```
+
+ISO paths are kept below the destination, so pointing it at `<tree>/cdrom`
+overwrites the files in place (the tree relocates grown files and patches the
+game's LBA table as usual). A file saved by an ISO browser is cooked
+(2048 B/sector) even when it was an STR: the video sectors survive but the
+XA audio sectors lose their sub-header and payload — the movie plays silent.
+`copy` (or a raw-sector export) is the fix.
+
 ## Files
 
 | | |

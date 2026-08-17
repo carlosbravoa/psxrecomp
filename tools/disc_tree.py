@@ -27,6 +27,12 @@ Sub-commands:
     check   <tree> [cue]  data-level regeneration self-check (no ECC): rebuild
                           every metadata sector's 2048-byte payload + every
                           file payload and compare with the source image
+    copy    <cue> <out> <ISO path>...   copy just those files out of a bin/cue,
+                          in tree form (Form 1 cooked, XA/STR raw 2336) — e.g.
+                          `copy other.cue game-assets/disc/cdrom MOVIE/*.STR`
+                          drops another region's movies into an existing tree
+                          without re-extracting anything else (glob patterns
+                          match ISO paths; --list shows them)
 
 Only the Python standard library is used.
 """
@@ -909,6 +915,51 @@ def cmd_check(args) -> int:
     return 1 if bad else 0
 
 
+def cmd_copy(args) -> int:
+    """Copy selected files out of a bin/cue exactly as `extract` would store them."""
+    import fnmatch
+    cue_path = Path(args.cue).resolve()
+    sheet = parse_cue(cue_path)
+    data_tracks = [t for t in sheet.tracks if t.mode.startswith("MODE")]
+    if not data_tracks or data_tracks[0].mode != "MODE2/2352":
+        print("error: need a MODE2/2352 raw data track (bin/cue dump)", file=sys.stderr)
+        return 2
+    img = RawImage(data_tracks[0].file)
+    _pvd, _root, _dirs, files = walk_iso(img)
+    if args.list:
+        for r in files:
+            nsec = (r.size + USER - 1) // USER
+            form, _ = classify_file(img, r.lba, nsec)
+            print(f"{r.path:32s} {r.size:>10d} bytes  LBA {r.lba:>7d}  {'raw 2336' if form != '1' else 'form1 2048'}")
+        return 0
+    want = []
+    for r in files:
+        if any(fnmatch.fnmatchcase(r.path, pat) or fnmatch.fnmatchcase(r.base_name, pat) for pat in args.paths):
+            want.append(r)
+    if not want:
+        print("error: no file matches", args.paths, "(use --list)", file=sys.stderr)
+        return 2
+    out_root = Path(args.out)
+    for r in want:
+        nsec = (r.size + USER - 1) // USER
+        form, note = classify_file(img, r.lba, nsec)
+        host = out_root / r.path
+        host.parent.mkdir(parents=True, exist_ok=True)
+        if host.exists() and not host.stat().st_mode & 0o200:
+            host.chmod(host.stat().st_mode | 0o200)          # trees are extracted read-only
+        with open(host, "wb") as out:
+            if form == "1":
+                remaining = r.size
+                for i in range(nsec):
+                    chunk = img.user(r.lba + i)[:min(USER, remaining)]
+                    out.write(chunk); remaining -= len(chunk)
+            else:
+                for i in range(nsec):
+                    out.write(img.raw(r.lba + i)[16:16 + FORM2_USER])
+        print(f"{r.path}: {nsec} sectors -> {host} ({'raw 2336' if form != '1' else 'form1 cooked'}{', ' + note if note and form != '1' else ''})")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -930,6 +981,12 @@ def main() -> int:
     c.add_argument("tree")
     c.add_argument("cue", nargs="?")
     c.set_defaults(fn=cmd_check)
+    cp = sub.add_parser("copy", help="copy selected files out of a bin/cue in tree form (raw for XA/STR)")
+    cp.add_argument("cue")
+    cp.add_argument("out", help="destination root, e.g. <tree>/cdrom (ISO paths are kept below it)")
+    cp.add_argument("paths", nargs="*", help="ISO paths or glob patterns (MOVIE/*.STR)")
+    cp.add_argument("--list", action="store_true", help="list the files of the cue with their storage form")
+    cp.set_defaults(fn=cmd_copy)
     args = ap.parse_args()
     return args.fn(args)
 
