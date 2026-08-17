@@ -1146,6 +1146,46 @@ static const uint32_t* s_fmv_px = nullptr;
 static int             s_fmv_w = 0, s_fmv_h = 0;
 static SDL_Texture*    sdl_fmv_texture = nullptr;
 static int             sdl_fmv_tex_w = 0, sdl_fmv_tex_h = 0;
+/* "Start at" bookmarks (docs/BOOKMARKS.md): <memcard_dir>/bookmarks/*.pst,
+ * listed by file stem in the launcher's SYSTEM card; the chosen one is loaded
+ * right after boot (or immediately from the in-game launcher). Also
+ * PSX_START_STATE=<path> / --start-state <path>. */
+static std::vector<std::string> g_bookmark_labels, g_bookmark_paths;
+static std::vector<const char*> g_bookmark_label_ptrs;
+static std::string g_start_state_path;          /* staged for after boot */
+static void scan_bookmarks(const std::filesystem::path& memcard_dir) {
+    g_bookmark_labels.clear(); g_bookmark_paths.clear(); g_bookmark_label_ptrs.clear();
+    std::error_code ec;
+    const std::filesystem::path dir = memcard_dir / "bookmarks";
+    if (!std::filesystem::is_directory(dir, ec)) return;
+    std::vector<std::pair<std::string, std::string>> found;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        const auto& p = e.path();
+        std::string ext = p.extension().string();
+        for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+        if (ext != ".pst") continue;
+        found.emplace_back(p.stem().string(), p.string());
+    }
+    std::sort(found.begin(), found.end());
+    for (auto& f : found) { g_bookmark_labels.push_back(f.first); g_bookmark_paths.push_back(f.second); }
+    for (auto& l : g_bookmark_labels) g_bookmark_label_ptrs.push_back(l.c_str());
+    if (!found.empty())
+        std::fprintf(stdout, "psxrecomp: %zu bookmark(s) in %s (launcher: Start at)\n", found.size(), dir.string().c_str());
+}
+static int stage_start_state(const std::string& path, const char* why) {
+    extern int savestate_request_load_blob_protocol(const void* data, size_t size);
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { std::fprintf(stdout, "psxrecomp: start state %s: cannot open\n", path.c_str()); return 0; }
+    std::fseek(f, 0, SEEK_END); long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> blob(n > 0 ? (size_t)n : 0);
+    int ok = 0;
+    if (n > 0 && std::fread(blob.data(), 1, (size_t)n, f) == (size_t)n)
+        ok = savestate_request_load_blob_protocol(blob.data(), blob.size());
+    std::fclose(f);
+    std::fprintf(stdout, "psxrecomp: start state %s (%s): %s\n", path.c_str(), why, ok ? "staged" : "refused");
+    return ok;
+}
 static int           g_texture_pack_enabled = 1;
 static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/150/200) */
 static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
@@ -10754,6 +10794,10 @@ namespace {
             gi->texture_pack_label = s_tp_label.empty() ? nullptr : s_tp_label.c_str();
         }
 #endif
+#if defined(RECOMP_LAUNCHER_HAS_BOOKMARKS)
+        gi->bookmark_labels = g_bookmark_label_ptrs.empty() ? nullptr : g_bookmark_label_ptrs.data();
+        gi->num_bookmarks = (int)g_bookmark_label_ptrs.size();
+#endif
 #if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
         gi->has_fmv_pack = g_fmv_pack_dir.empty() ? 0 : 1;
         {
@@ -10896,6 +10940,8 @@ int main(int argc, char** argv) {
             cli_debug_port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
             cli_memcard_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--start-state") == 0 && i + 1 < argc) {
+            g_start_state_path = argv[++i];
         } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
             const char* r = argv[++i];
             if      (std::strcmp(r, "software") == 0) cli_renderer = 0;
@@ -11789,6 +11835,8 @@ int main(int argc, char** argv) {
      * the launcher can introspect the real card files. The same default is used
      * by the runtime below. */
     if (memcard_dir.empty()) memcard_dir = default_memcard_dir(argv[0]);
+    scan_bookmarks(memcard_dir);
+    if (const char* ss = std::getenv("PSX_START_STATE")) { if (ss[0]) g_start_state_path = ss; }
 
     /* The game's OWN native OPTION settings (game_options.toml, next to
      * game.toml) — persisted across launches, kept separate from game.toml
@@ -12220,6 +12268,9 @@ int main(int argc, char** argv) {
 #if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
             ls.fmv_pack           = seed.fmv_pack ? 1 : 0;
 #endif
+#if defined(RECOMP_LAUNCHER_HAS_BOOKMARKS)
+            ls.bookmark_index     = 0;                    /* every launch: normal boot unless chosen */
+#endif
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
             /* Localization: index of resolved_language within lang_menu_options
              * (match by code; games with no [runtime].languages list leave
@@ -12476,6 +12527,10 @@ int main(int argc, char** argv) {
 #if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
                 seed.fmv_pack = ls.fmv_pack != 0;
                 seed.has_fmv_pack = !g_fmv_pack_dir.empty();
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_BOOKMARKS)
+                if (ls.bookmark_index > 0 && ls.bookmark_index <= (int)g_bookmark_paths.size())
+                    g_start_state_path = g_bookmark_paths[(size_t)ls.bookmark_index - 1];
 #endif
                 seed.turbo_loads = ls.turbo_loads != 0;
                 seed.has_turbo_loads = turbo_loads_offered;
@@ -13754,6 +13809,8 @@ session_reboot:
         psx_rewind_configure(memory_get_bios_checksum(), game_entry_pc);
         /* Headless / agent load: PSX_LOAD_SLOT=N stages slot load (0..11)
          * at the next safe block boundary after boot. */
+        if (!g_start_state_path.empty() && !psx_netplay_active())
+            stage_start_state(g_start_state_path, "start at");
         if (const char *ls = std::getenv("PSX_LOAD_SLOT")) {
             int slot = atoi(ls);
             if (slot >= 0 && slot < 12) {
@@ -14109,6 +14166,9 @@ soft_return_lobby:
 #endif
 #if defined(RECOMP_LAUNCHER_HAS_FMV_PACK)
         ls.fmv_pack = g_fmv_pack_enabled ? 1 : 0;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_BOOKMARKS)
+        ls.bookmark_index = 0;
 #endif
         ls.turbo_loads = (turbo_loads_offered && g_turbo_loads_enabled) ? 1 : 0;
         ls.rewind_depth = g_rewind_depth;
@@ -14467,6 +14527,13 @@ soft_return_lobby:
                                  g_fmv_pack_dir.c_str(), n);
                 } else fmv_pack_unload();
             }
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_BOOKMARKS)
+            /* In-game "Start at": load the bookmark right now (a staged blob
+             * load lands at the next safe block boundary). */
+            if (ls.bookmark_index > 0 && ls.bookmark_index <= (int)g_bookmark_paths.size() &&
+                !psx_netplay_active())
+                stage_start_state(g_bookmark_paths[(size_t)ls.bookmark_index - 1], "in-game launcher");
 #endif
             if (turbo_loads_offered)  g_turbo_loads_enabled = ls.turbo_loads ? 1 : 0;
             g_fullscreen = ls.fullscreen != 0;
