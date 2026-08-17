@@ -255,9 +255,32 @@ picture is what gets presented. Video filters at that scale follow
 down (they would misread HD art as staircases), the display looks
 (sharp / scanlines / crt) apply at the native line pitch on both backends.
 
+## Software ↔ OpenGL parity (B11)
+
+`tools/texpack_parity.py` runs the game four times from a savestate at the
+same internal scale (`PSX_SUPERSAMPLING=<S>`, a one-run override of the
+configured scale) — software / OpenGL, pack off / on — and compares the S×
+pictures: software from `screenshot_hires` (headless, exact hi-res mirror),
+OpenGL from the `present_capture` `.src.png` companion under the `sharp`
+filter (an exact `glReadPixels` of the S× FBO rect the presenter consumed;
+the drawable itself is a half-texel-inset linear fit and is not compared).
+Pass rule: the pack must not *add* SW-vs-GL divergence — pixels differing by
+more than `--tolerance` (default 8/255 = one 5-bit level; software quantises
+replaced colours to 15-bit, GL keeps 8) with the pack on ≤ the no-pack
+baseline + `--margin` (0.5 % of the frame). It also prints what the pack
+changed (SW off vs on), which is zero for an identity starter pack.
+
+```
+python3 tools/texpack_parity.py --exe build-debug/<Game> --game game.toml --bios <bios>     --disc <tree|cue> --pack <dir> --slot 12 --slot 1 [--scale 2] [--settle 200]
+```
+
+Mega Man 8 (2×, slots 12 title menu / 1 stage / 3 pause menu / 2): baseline
+SW-vs-GL max 1/255 with 0 px over tolerance, identical with the pack on, pack
+delta 0 — the game repo wraps it as `tools/texpack_parity.sh`.
+
 ## Next
 
-Bilinear pack sampling; SW-vs-GL parity tool; shaded-textured triangles.
+Bilinear pack sampling; shaded-textured triangles.
 
 ## Files
 

@@ -12905,6 +12905,18 @@ session_reboot:
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init.
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
+    /* PSX_SUPERSAMPLING=<1..4>: one-run override of the internal scale (over
+     * game.toml and settings.toml) for tools that must pin it — the
+     * texture-pack parity check runs both renderers at the same S. */
+    if (const char *e = std::getenv("PSX_SUPERSAMPLING")) {
+        const int v = std::atoi(e);
+        if (v >= 1 && v <= SW_MAX_INTERNAL_SCALE) {
+            g_video_scale = v;
+            std::fprintf(stdout, "psxrecomp: PSX_SUPERSAMPLING=%d overrides the configured internal scale\n", v);
+        } else {
+            std::fprintf(stdout, "psxrecomp: PSX_SUPERSAMPLING=\"%s\" ignored (1..%d)\n", e, SW_MAX_INTERNAL_SCALE);
+        }
+    }
     if (g_video_scale < 1) g_video_scale = 1;
     if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
     if (net_cfg.enabled && s_netplay_gl_present && gl_renderer_cpu_auth_dual()) {
