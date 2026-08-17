@@ -1963,7 +1963,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         }
     }
 
-    return GameConfig{
+    GameConfig gc{
         /*config_path*/      config_path,
         /*project_root*/     root,
         /*name*/             name,
@@ -2071,6 +2071,28 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_init_func*/     ws_bg2d_init_func,
         /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
     };
+
+    // [disc_tree] — extracted disc tree + the title's hardcoded LBA tables.
+    if (cfg.contains("disc_tree")) {
+        const toml::value& dt = toml::find(cfg, "disc_tree");
+        if (dt.contains("dir"))
+            gc.disc_tree_dir = fs::absolute(root / toml::find<std::string>(dt, "dir"));
+        if (dt.contains("lba_table")) {
+            for (const toml::value& v : toml::find(dt, "lba_table").as_array()) {
+                GameConfig::DiscTreeLbaTable t;
+                t.address = parse_hex(toml::find<std::string>(v, "address"), "disc_tree.lba_table.address");
+                t.count   = (uint32_t)toml::find<int64_t>(v, "count");
+                t.stride  = (uint32_t)toml::find<int64_t>(v, "stride");
+                if (v.contains("lba_offset"))  t.lba_offset  = (int32_t)toml::find<int64_t>(v, "lba_offset");
+                if (v.contains("size_offset")) t.size_offset = (int32_t)toml::find<int64_t>(v, "size_offset");
+                if (v.contains("lba_is_msf"))  t.lba_is_msf  = toml::find<bool>(v, "lba_is_msf");
+                if (t.stride == 0 || t.count == 0)
+                    throw std::runtime_error("disc_tree.lba_table: count and stride must be > 0");
+                gc.disc_tree_lba_tables.push_back(t);
+            }
+        }
+    }
+    return gc;
 }
 
 // ---- GameOptions (game_options.toml) — the game's own native settings ----

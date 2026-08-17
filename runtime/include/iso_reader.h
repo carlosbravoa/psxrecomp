@@ -5,6 +5,9 @@
 #include <fstream>
 #include <memory>
 #include <vector>
+#include <filesystem>
+
+#include "disc_tree.h"
 
 /**
  * ISO/BIN/CUE Reader for PS1 CD-ROM images
@@ -84,10 +87,39 @@ public:
 
     /**
      * Open an ISO/BIN file for reading
-     * @param filename Path to .iso, .bin, .img, .car, .cue, or .chd file
+     * @param filename Path to .iso, .bin, .img, .car, .cue, or .chd file, or a
+     *                 disc-tree DIRECTORY (holds disc.toml; see disc_tree.h) —
+     *                 the tree is mounted as a synthesized raw multi-track disc.
      * @return true if opened successfully, false otherwise
      */
     bool Open(const std::string& filename);
+
+    /**
+     * Per-title hints applied to every disc tree mounted afterwards (boot EXE
+     * name + hardcoded LBA tables to patch when files move). Set once from
+     * game.toml before the CD-ROM mount; harmless for image mounts.
+     */
+    static void SetDiscTreeHints(const DiscTreeHints& hints);
+
+    /**
+     * Snapshot of the most recently mounted disc tree (empty when the last
+     * mount was an image): layout notes, EXE RAM patches, geometry. Lets the
+     * host log the layout and bless the patched bytes without a second mount.
+     */
+    struct DiscTreeMountInfo {
+        bool mounted = false;
+        std::filesystem::path dir;
+        bool pristine_layout = true;
+        uint32_t data_sectors = 0;
+        uint32_t total_sectors = 0;
+        std::vector<std::string> notes;
+        std::vector<DiscTreeRamPatch> ram_patches;
+        std::string layout;
+    };
+    static const DiscTreeMountInfo& LastDiscTreeMount();
+
+    /** The disc tree behind this reader, or nullptr for image mounts. */
+    const DiscTree* Tree() const { return tree_.get(); }
 
     /**
      * Close the currently open file
@@ -222,6 +254,7 @@ private:
     std::vector<CDTrack> tracks_;   // from the .cue TOC; >=1 entry after Open()
     std::vector<BinSegment> segments_;  // cue FILE entries in disc order; >=1 after Open()
     std::unique_ptr<CHDState> chd_; // present only for a directly mounted CHD
+    std::unique_ptr<DiscTree> tree_; // present only for a mounted disc tree
 };
 
 } // namespace PS1

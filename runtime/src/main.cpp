@@ -183,6 +183,8 @@ extern "C" uint32_t memory_get_bios_checksum(void);
 extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
                                                   const uint8_t *bytes,
                                                   uint32_t len);
+extern "C" void     dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes,
+                                         uint32_t len);
 
 /* Arm the dirty-RAM text-image guard with the boot EXE bytes. The guard is
  * load-bearing: dispatch native-safety (dirty_ram_text_native_ok) and the
@@ -10871,6 +10873,10 @@ int main(int argc, char** argv) {
     std::string resolved_language = "en";
     std::vector<PSXRecompV4::RuntimeConfig::LanguageOption> lang_menu_options;
     std::filesystem::path resolved_disc;
+    /* [disc_tree] dir from game.toml (docs/DISC_TREE.md); substituted for the
+     * disc image right before the mount so the launcher/settings never see it. */
+    std::filesystem::path cfg_disc_tree_dir;
+    std::filesystem::path active_disc_tree;   /* non-empty = a disc tree is in force for this session */
     std::string window_title = PSX_WINDOW_TITLE;
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
     std::string game_name;
@@ -10929,6 +10935,41 @@ int main(int argc, char** argv) {
                 gc.netplay_required_leadout_lba;
             g_netplay_disc_expect.required_disc_fp = gc.netplay_required_disc_fp;
             if (!gc.discs.empty()) resolved_disc = gc.discs.front();
+            /* Extracted disc tree: remember the dir and hand the title's
+             * boot-EXE name + hardcoded LBA tables to the tree mounter. */
+            cfg_disc_tree_dir = gc.disc_tree_dir;
+            /* Decide now whether the tree is in force ([disc_tree] dir, or
+             * PSX_DISC_TREE=<dir>; "0" disables; an explicit --disc wins), so
+             * the launcher can show and verify it like any disc. */
+            {
+                std::filesystem::path tree_dir = cfg_disc_tree_dir;
+                if (const char* env = std::getenv("PSX_DISC_TREE")) {
+                    if (std::strcmp(env, "0") == 0) tree_dir.clear();
+                    else if (env[0]) tree_dir = env;
+                }
+                if (!tree_dir.empty() && !(disc_override_path && disc_override_path[0])) {
+                    if (PS1::DiscTree::IsTree(tree_dir)) {
+                        active_disc_tree = tree_dir;
+                        std::fprintf(stdout, "psxrecomp: disc tree %s -> mounting in place of the disc image\n",
+                                     tree_dir.string().c_str());
+                    } else {
+                        std::fprintf(stdout, "psxrecomp: disc tree %s not present (no disc.toml); using the disc image\n",
+                                     tree_dir.string().c_str());
+                    }
+                }
+            }
+            {
+                PS1::DiscTreeHints th;
+                th.exe_name = gc.exe_path.filename().string();
+                for (const auto& t : gc.disc_tree_lba_tables) {
+                    PS1::DiscTreeLbaTable lt;
+                    lt.address = t.address; lt.count = t.count; lt.stride = t.stride;
+                    lt.lba_offset = t.lba_offset; lt.size_offset = t.size_offset;
+                    lt.lba_is_msf = t.lba_is_msf;
+                    th.lba_tables.push_back(lt);
+                }
+                PS1::ISOReader::SetDiscTreeHints(th);
+            }
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
@@ -11902,7 +11943,8 @@ int main(int argc, char** argv) {
             std::string assets_dir_str = exe_dir_from_argv(argv[0]).string();
             /* Same keybinds.ini / config.ini the runtime reads — never cwd. */
             ae_rui_set_sidecar_paths(argv[0]);
-            std::string rui_initial_disc = resolved_disc.string();
+            std::string rui_initial_disc =
+                (!active_disc_tree.empty() ? active_disc_tree : resolved_disc).string();
             std::string rui_title = (game_name.empty() ? std::string("PSX") : game_name)
                                      + " - Launcher";
 
@@ -12139,7 +12181,10 @@ int main(int argc, char** argv) {
             if (lr == 0) {
                 seed.netplay_player_name = ls.netplay_player_name;
                 seed.has_netplay_player_name = true;
-                if (rui_out_disc[0]) {
+                /* Never persist the disc tree as the user's disc path: it is a
+                 * project setting, not a dump location. */
+                if (rui_out_disc[0] && (active_disc_tree.empty() ||
+                                        std::filesystem::path(rui_out_disc) != active_disc_tree)) {
                     seed.disc_path = rui_out_disc;
                     seed.has_disc_path = true;
                 }
@@ -12588,6 +12633,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
         return 1;
     }
+    /* Extracted disc tree ([disc_tree] dir, or PSX_DISC_TREE=<dir>; "0"
+     * disables): mounted in place of the disc image when it exists. An explicit
+     * --disc always wins. See docs/DISC_TREE.md. */
+    if (!active_disc_tree.empty()) resolved_disc = active_disc_tree;
     if (game_config_path || disc_override_path || !resolved_disc.empty()) {
         resolved_disc = resolve_disc_for_runtime(resolved_disc, disc_override_path, game_id, argv[0]);
         if (game_config_path && resolved_disc.empty()) {
@@ -12896,6 +12945,20 @@ session_reboot:
     if (game_config_path)
         arm_text_image_guard(text_guard_exe_path, text_guard_load_addr,
                              disc_path_str);
+    /* Disc tree: report the synthesized layout and bless the boot-EXE LBA
+     * table bytes it rewrote, so the guard sees them as intentional. */
+    {
+        const PS1::ISOReader::DiscTreeMountInfo& tm = PS1::ISOReader::LastDiscTreeMount();
+        if (tm.mounted && cdrom_has_disc()) {
+            std::fprintf(stdout, "psxrecomp: disc tree mounted: %s (%s layout, %u data + %u total sectors)\n",
+                         tm.dir.string().c_str(), tm.pristine_layout ? "pristine" : "MODIFIED",
+                         tm.data_sectors, tm.total_sectors);
+            for (const std::string& n : tm.notes)
+                std::fprintf(stdout, "psxrecomp:   disc tree: %s\n", n.c_str());
+            for (const PS1::DiscTreeRamPatch& p : tm.ram_patches)
+                dirty_ram_text_bless(p.address & 0x1FFFFFFFu, p.bytes.data(), (uint32_t)p.bytes.size());
+        }
+    }
     /* Executable/overlay patches from enabled mods, applied once the guard is
      * armed so a patched image is never mistaken for a divergent one. */
     mod_runtime_enable_disc_patches();
@@ -13918,6 +13981,9 @@ soft_return_lobby:
             host_volume_set(ls.volume);
             if (rui_out_disc[0]) {
                 resolved_disc = normalize_disc_path_for_launch(rui_out_disc);
+                /* The launcher hands back the image path; a disc tree in
+                 * force for this session keeps precedence over it. */
+                if (!active_disc_tree.empty()) resolved_disc = active_disc_tree;
                 disc_path_str = resolved_disc.string();
             }
             if (ls.netplay_launch.enabled) {

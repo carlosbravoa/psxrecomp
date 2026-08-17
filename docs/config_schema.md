@@ -108,6 +108,31 @@ respective files.
 | `disc` | game (single-disc) | path to .cue, relative to project root |
 | `discs` | game (multi-disc) | array of .cue paths; `disc` is sugar for `discs = [disc]` |
 
+## Disc tree block (`[disc_tree]`)
+
+Run from an **extracted disc tree** instead of the bin/cue — see
+`docs/DISC_TREE.md`. When `dir` exists (holds `disc.toml`) it is mounted in
+place of `[game] disc` / the launcher's disc path (`--disc` still wins;
+`PSX_DISC_TREE=0` disables, `PSX_DISC_TREE=<dir>` overrides).
+
+```toml
+[disc_tree]
+dir = "game-assets/disc"           # tools/disc_tree.py extract "<dump>.cue" game-assets/disc
+[[disc_tree.lba_table]]            # optional, repeatable: the title's hardcoded file table
+address     = "0x80136F7C"         # RAM address of entry 0
+count       = 139
+stride      = 12                   # bytes per entry
+lba_offset  = 0                    # u32 LE sector number (BCD MSF when lba_is_msf = true)
+size_offset = 4                    # u32 LE size in the entry's own unit; -1 = none
+```
+
+| Field | Meaning |
+|---|---|
+| `dir` | tree directory, relative to the project root |
+| `lba_table[].address/count/stride` | geometry of a `{LBA, size, ...}` file table in the boot EXE |
+| `lba_table[].lba_offset/size_offset` | byte offsets inside one entry; the size unit (bytes / sectors×2336 / ×2048 / ×2352 / sectors) is inferred from the pristine value |
+| `lba_table[].lba_is_msf` | the entry stores BCD `MM:SS:FF` instead of a sector number |
+
 ## Recompiler block
 
 ```toml

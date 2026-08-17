@@ -115,6 +115,14 @@ static bool read_chd_raw(CHDState& chd, uint32_t lba, uint8_t* buffer,
     return true;
 }
 
+namespace {
+DiscTreeHints g_tree_hints;
+ISOReader::DiscTreeMountInfo g_last_tree_mount;
+}
+
+void ISOReader::SetDiscTreeHints(const DiscTreeHints& hints) { g_tree_hints = hints; }
+const ISOReader::DiscTreeMountInfo& ISOReader::LastDiscTreeMount() { return g_last_tree_mount; }
+
 ISOReader::ISOReader()
     : is_open_(false) {
     root_dir_.lba = 0;
@@ -132,6 +140,43 @@ bool ISOReader::Open(const std::string& filename) {
     // Check if file exists
     if (!std::filesystem::exists(filename)) {
         return false;
+    }
+
+    // A disc tree (directory + disc.toml): synthesize the disc from extracted
+    // files. See disc_tree.h / docs/DISC_TREE.md.
+    if (DiscTree::IsTree(filename)) {
+        auto tree = std::make_unique<DiscTree>();
+        std::string err;
+        if (!tree->Open(filename, &g_tree_hints, &err)) {
+            std::fprintf(stdout, "psxrecomp: disc tree %s rejected: %s\n",
+                         filename.c_str(), err.c_str());
+            g_last_tree_mount = ISOReader::DiscTreeMountInfo{};
+            return false;
+        }
+        for (const DiscTreeTrack& t : tree->Tracks()) {
+            CDTrack c;
+            c.number = t.number; c.is_audio = t.is_audio;
+            c.start_lba = t.start_lba; c.pregap_lba = t.pregap_lba;
+            tracks_.push_back(c);
+        }
+        g_last_tree_mount = ISOReader::DiscTreeMountInfo{};
+        g_last_tree_mount.mounted = true;
+        g_last_tree_mount.dir = filename;
+        g_last_tree_mount.pristine_layout = tree->IsPristineLayout();
+        g_last_tree_mount.data_sectors = tree->DataTrackSectors();
+        g_last_tree_mount.total_sectors = tree->SectorCount();
+        g_last_tree_mount.notes = tree->Notes();
+        g_last_tree_mount.ram_patches = tree->RamPatches();
+        g_last_tree_mount.layout = tree->DescribeLayout();
+        bin_path_ = filename;
+        tree_ = std::move(tree);
+        is_open_ = true;
+        if (!ParseVolumeDescriptor()) {
+            volume_id_.clear();
+            root_dir_.lba = 0;
+            root_dir_.size = 0;
+        }
+        return true;
     }
 
     if (PSXRecompV4::path_has_extension_ci(
@@ -342,6 +387,7 @@ bool ISOReader::Open(const std::string& filename) {
 
 void ISOReader::Close() {
     chd_.reset();
+    tree_.reset();
     for (BinSegment& seg : segments_) {
         if (seg.file.is_open()) {
             seg.file.close();
@@ -369,6 +415,13 @@ BinSegment* ISOReader::SegmentForLBA(uint32_t lba) {
 bool ISOReader::ReadSector(uint32_t lba, uint8_t* buffer) {
     if (!is_open_ || !buffer) {
         return false;
+    }
+
+    if (tree_) {
+        uint8_t raw[RAW_SECTOR_SIZE];
+        if (!tree_->ReadRaw(lba, raw)) return false;
+        std::memcpy(buffer, raw + RAW_DATA_OFFSET, SECTOR_SIZE);
+        return true;
     }
 
     if (chd_) {
@@ -430,6 +483,7 @@ bool ISOReader::ReadRawSector(uint32_t lba, uint8_t* buffer) {
         return false;
     }
 
+    if (tree_) return tree_->ReadRaw(lba, buffer);
     if (chd_) return read_chd_raw(*chd_, lba, buffer, nullptr);
 
     BinSegment* seg = SegmentForLBA(lba);
@@ -469,6 +523,7 @@ uint32_t ISOReader::GetSectorCount() {
     if (!is_open_) {
         return 0;
     }
+    if (tree_) return tree_->SectorCount();
     if (chd_) return chd_->disc_sector_count;
     if (segments_.empty()) return 0;
 

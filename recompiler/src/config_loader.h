@@ -1045,6 +1045,23 @@ struct GameConfig {
     //   reveal pixels once before the new stage background is submitted.
     uint32_t ws_bg2d_init_func    = 0;
     uint32_t ws_bg2d_packet_cap       = 1000;
+
+    // [disc_tree] — run from an EXTRACTED disc tree instead of the bin/cue
+    // (docs/DISC_TREE.md). `dir` is resolved against the project root; when it
+    // exists (holds disc.toml) it is mounted in place of [game] disc unless the
+    // command line names a --disc or PSX_DISC_TREE=0. lba_table entries describe
+    // the title's hardcoded {LBA,size} file table(s) so a relocated/resized file
+    // is followed by the game.
+    std::filesystem::path disc_tree_dir;
+    struct DiscTreeLbaTable {
+        uint32_t address = 0;
+        uint32_t count = 0;
+        uint32_t stride = 8;
+        int32_t  lba_offset = 0;
+        int32_t  size_offset = 4;
+        bool     lba_is_msf = false;
+    };
+    std::vector<DiscTreeLbaTable> disc_tree_lba_tables;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

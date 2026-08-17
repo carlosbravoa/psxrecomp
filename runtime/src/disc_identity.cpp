@@ -242,9 +242,14 @@ DiscIdentity identify_disc(const fs::path& path,
 
     const fs::path data_path = resolved.data;
     PS1::ISOReader disc;
-    if (is_chd_path(resolved.mount)) {
+    /* CHD images and extracted disc trees have no flat data-track file to
+     * scan: identify them through the reader (sector reads), which is the same
+     * view the CD-ROM controller gets. */
+    const bool is_tree = PS1::DiscTree::IsTree(resolved.mount);
+    if (is_chd_path(resolved.mount) || is_tree) {
         if (!disc.Open(resolved.mount.string())) {
-            v.detail = "Could not open or decode the CHD disc image.";
+            v.detail = is_tree ? "Could not mount the extracted disc tree (see the runtime log for the disc.toml error)."
+                               : "Could not open or decode the CHD disc image.";
             return v;
         }
         v.opened = true;
@@ -254,8 +259,9 @@ DiscIdentity identify_disc(const fs::path& path,
             v.has_header = true;
         }
         if (!v.has_header) {
-            v.detail =
-                "No ISO9660 CD001 header was found in the CHD data track.";
+            v.detail = is_tree
+                ? "No ISO9660 CD001 header was found in the disc tree's volume descriptor."
+                : "No ISO9660 CD001 header was found in the CHD data track.";
             v.region = region_from_serial(expected_serial);
             return v;
         }
@@ -294,18 +300,22 @@ DiscIdentity identify_disc(const fs::path& path,
                      v.detected_serial == serial_id);
             }
         } else {
-            v.detail = "The CHD header is present, but its data track could not be scanned.";
+            v.detail = is_tree ? "The disc tree mounted, but its data track could not be scanned."
+                               : "The CHD header is present, but its data track could not be scanned.";
         }
         v.region = region_from_serial(
             !v.detected_serial.empty() ? v.detected_serial : expected_serial);
         if (compute_crc) {
             v.crc_computed = crc32_chd(disc, v.crc);
             if (!v.crc_computed) {
-                v.detail = "The CHD opened, but a raw sector could not be decoded.";
+                v.detail = is_tree ? "The disc tree mounted, but a sector could not be synthesized."
+                                   : "The CHD opened, but a raw sector could not be decoded.";
             } else if (has_expected_crc) {
                 v.crc_matches = v.crc == expected_crc;
             }
         }
+        if (netplay_expect)
+            apply_netplay_disc_expect(v, *netplay_expect);
         return v;
     }
 

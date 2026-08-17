@@ -1,6 +1,7 @@
 // disc_path.cpp — see disc_path.h.
 
 #include "disc_path.h"
+#include "disc_tree.h"
 
 #include "cue_sheet.h"
 
@@ -125,6 +126,13 @@ DiscPathResolution resolve_disc_path(const fs::path& picked) {
     // CHD is already a complete image + table of contents. It must not be
     // upgraded to a same-stem cue or treated as that cue's raw payload.
     if (is_chd(r.picked)) return r;
+
+    // An extracted disc tree (directory + disc.toml) carries its full
+    // multi-track TOC like a cue does; the reader mounts the directory itself.
+    if (PS1::DiscTree::IsTree(r.picked)) {
+        r.from_cue = true;
+        return r;
+    }
 
     if (is_cue(r.picked)) {
         const CueSheet sheet = parse_cue_sheet(r.picked);

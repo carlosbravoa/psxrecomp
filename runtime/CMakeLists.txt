@@ -168,8 +168,9 @@ if(BUILD_TESTING)
         tests/test_disc_path_resolve.cpp
         src/disc_path.cpp
         src/cue_sheet.cpp
-        src/iso_reader.cpp)
-    target_include_directories(disc_path_resolve_test PRIVATE include)
+        src/iso_reader.cpp
+        src/disc_tree.cpp)
+    target_include_directories(disc_path_resolve_test PRIVATE include ../recompiler/lib/toml11)
     target_link_libraries(disc_path_resolve_test PRIVATE chdr-static)
     add_test(NAME disc_path_resolve_test COMMAND disc_path_resolve_test)
 
@@ -184,10 +185,23 @@ if(BUILD_TESTING)
     add_executable(iso_reader_cdda_test
         tests/test_iso_reader_cdda.cpp
         src/iso_reader.cpp
-        src/cue_sheet.cpp)
-    target_include_directories(iso_reader_cdda_test PRIVATE include)
+        src/cue_sheet.cpp
+        src/disc_tree.cpp)
+    target_include_directories(iso_reader_cdda_test PRIVATE include ../recompiler/lib/toml11)
     target_link_libraries(iso_reader_cdda_test PRIVATE chdr-static)
     add_test(NAME iso_reader_cdda_test COMMAND iso_reader_cdda_test)
+
+    # Disc tree (docs/DISC_TREE.md): EDC/ECC against known-good sectors, a
+    # synthetic tree that must reproduce its own source image byte-for-byte,
+    # relocation of a grown file with the LBA-table patch, CD-DA WAV serving.
+    add_executable(disc_tree_test
+        tests/test_disc_tree.cpp
+        src/disc_tree.cpp
+        src/iso_reader.cpp
+        src/cue_sheet.cpp)
+    target_include_directories(disc_tree_test PRIVATE include ../recompiler/lib/toml11)
+    target_link_libraries(disc_tree_test PRIVATE chdr-static)
+    add_test(NAME disc_tree_test COMMAND disc_tree_test)
 
     add_executable(mod_packages_test
         tests/test_mod_packages.cpp
@@ -206,6 +220,7 @@ if(BUILD_TESTING)
         src/disc_path.cpp
         src/cue_sheet.cpp
         src/iso_reader.cpp
+        src/disc_tree.cpp
         src/crc32.c
         src/psx_sha256.c)
     target_include_directories(mod_runtime_test PRIVATE
