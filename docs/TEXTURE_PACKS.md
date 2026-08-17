@@ -165,7 +165,9 @@ texpack.py starter  DUMPDIR PACKDIR --scale N   one <tex_id>.png (+ .clut) per t
 texpack.py merge    OUTDUMP DUMP...              union of dumps (first PNG/.clut per pair, draw counts summed)
 texpack.py coverage PACKDIR TSV...              covered texel ids / exact-palette pairs, --missing out.tsv
 texpack.py validate PACKDIR [--tsv TSV]         names, alpha channel, integer-multiple sizes, .clut sizes
-texpack.py sheet    DIR OUT.png                 contact sheet of a dump or a pack
+texpack.py sheet    DIR OUT.png [--names TSV] [--group PREFIX]   contact sheet (captioned by names)
+texpack.py export   PACKDIR OUTDIR [--names] [--group PREFIX]  working copies under human names
+texpack.py import   OUTDIR PACKDIR [--names]     the repainted copies back to <tex>[-<pal>].png
 ```
 
 Workflow: play (or script) through the game with `texture_dump` armed →
@@ -290,6 +292,32 @@ savestates with 100 % of lookups hitting. Loading is parallel (8 threads:
 ~1.2 s for 46 k images, +215 MB RSS); the GL atlas (8192², ~64 M px) holds
 this pack at 2× — larger packs (or 4×) exceed it and the overflow falls back
 to native texels (a lazy / tiled atlas is B13).
+
+## Names (B12)
+
+Texel ids are hashes; artists want `megaman_run_03.png`. A game's asset tool
+can name texel ids it can reproduce offline — the id is content-derived, so
+whatever the game draws from a known table gets a stable name — and write
+`names.tsv` (`tex_id name aliases`). Mega Man 8's `tools/pac_texpack.py`
+names every background tile (`STAGE00/tile0123`, aliases for the same art
+in other stages) and every metasprite cell of the streamed characters
+(`PLAYER/strip057_cell07`, `BOSSAQU/strip003_cell00`); its player cells
+were checked against a play dump (all 15 cells drawn in the pause menu
+resolve to their strip/cell names). `merge` unions `names.tsv` across dumps,
+`starter` copies it into the pack, and then:
+
+```
+texpack.py export game-assets/textures/pack work/ --group PLAYER/   # work/PLAYER/strip057_cell07[-<pal>].png
+   ... repaint in work/ (keep sizes; alpha 0 = transparent) ...
+texpack.py import work/ game-assets/textures/pack                   # back to <tex>[-<pal>].png
+texpack.py sheet  game-assets/textures/pack player.png --group PLAYER/strip05 --cols 16
+```
+
+`export` hardlinks when it can (no copies of a 300 MB pack), writes
+`index.tsv` so renamed folders still map back, and puts ids without a name
+under `_unnamed/`; `import` resolves `<name>[-<pal>].png` through
+`names.tsv` / `index.tsv`. Names never reach the runtime — the pack stays
+keyed by ids, so a name change is never a pack change.
 
 ## Software ↔ OpenGL parity (B11)
 

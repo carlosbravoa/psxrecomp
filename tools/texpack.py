@@ -14,6 +14,16 @@ A dump directory (runtime `texture_dump`) holds <tex_id>-<pal_id>.png files
     texpack.py coverage PACKDIR TSV [TSV...]           which dumped textures the pack covers
     texpack.py validate PACKDIR [--tsv TSV]            filenames / sizes / alpha sanity
     texpack.py sheet    DIR OUT.png [--cols 48]        contact sheet of a dump or pack
+                        [--names TSV] [--group PREFIX] (captioned / filtered by human names)
+    texpack.py export   PACKDIR OUTDIR [--names TSV] [--group PREFIX]
+                                                      working copies under human names:
+                                                      OUTDIR/<name>[-<pal>].png (unnamed -> _unnamed/)
+    texpack.py import   OUTDIR PACKDIR [--names TSV]  the repainted copies back to <tex>[-<pal>].png
+
+Names: `names.tsv` (tex_id, name, aliases) written by a game's asset tool
+(Mega Man 8: tools/pac_texpack.py — STAGE00/tile0123, PLAYER/strip014_cell02);
+merge unions it, starter copies it into the pack, export/import default to
+PACKDIR/names.tsv.
 
 Only Pillow is required (`pip install pillow`).
 """
@@ -30,7 +40,7 @@ import sys
 from pathlib import Path
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
 except ImportError:  # pragma: no cover
     sys.exit("texpack.py needs Pillow (pip install pillow)")
 
@@ -175,8 +185,90 @@ def cmd_starter(a):
             clut = d / f"{r['tex_id']}-{r['pal_id']}.clut"
             if clut.exists():
                 (out / (name[:-4] + ".clut")).write_bytes(clut.read_bytes())
+    if (d / "names.tsv").exists():
+        shutil.copyfile(d / "names.tsv", out / "names.tsv")
     print(f"starter pack: {n} images at {a.scale}x -> {out}" + (f" ({nvar} recolour variants)" if nvar else ""))
     return 0
+
+
+def read_names(path):
+    """tex_id (lower) -> name; aliases ignored (first name wins)."""
+    out = {}
+    if not path or not Path(path).exists():
+        return out
+    for r in read_tsv(Path(path)):
+        out.setdefault(r["tex_id"].lower(), r["name"])
+    return out
+
+
+def cmd_export(a):
+    pack, out = Path(a.pack), Path(a.out)
+    names = read_names(a.names or (pack / "names.tsv"))
+    if not names:
+        sys.exit("no names (pass --names or put names.tsv in the pack)")
+    idx = pack_index(pack)
+    n = un = 0
+    for tex, variants in idx.items():
+        name = names.get(tex)
+        if a.group and not (name or "").startswith(a.group):
+            continue
+        for pal, src in variants.items():
+            if name:
+                rel = Path(name + (f"-{pal}" if pal else "") + ".png")
+            else:
+                rel = Path("_unnamed") / src.name
+                un += 1
+            dst = out / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    shutil.copyfile(src, dst)
+            n += 1
+    with open(out / "index.tsv", "w") as f:
+        f.write("name\ttex_id\n")
+        for tex, name in sorted(names.items(), key=lambda kv: kv[1]):
+            if tex in idx and (not a.group or name.startswith(a.group)):
+                f.write(f"{name}\t{tex}\n")
+    print(f"exported {n} images ({un} unnamed) -> {out}; index.tsv maps names back")
+    return 0
+
+
+def cmd_import(a):
+    src_root, pack = Path(a.src), Path(a.pack)
+    names = read_names(a.names or (pack / "names.tsv"))
+    by_name = {v: k for k, v in names.items()}
+    idx_file = src_root / "index.tsv"
+    if idx_file.exists():
+        for r in read_tsv(idx_file):
+            by_name.setdefault(r["name"], r["tex_id"].lower())
+    n = bad = 0
+    for p in src_root.rglob("*.png"):
+        rel = p.relative_to(src_root).with_suffix("")
+        parts = rel.as_posix()
+        if parts.startswith("_unnamed/"):
+            m = NAME_RE.match(p.name)
+            if not m:
+                continue
+            dst = pack / p.name
+        else:
+            pal = None
+            m = re.match(r"^(.*)-([0-9a-fA-F]{16})$", parts)
+            if m:
+                parts, pal = m.group(1), m.group(2).lower()
+            tex = by_name.get(parts)
+            if not tex:
+                print(f"  no texel id for {parts} (not in names / index) — skipped", file=sys.stderr)
+                bad += 1
+                continue
+            dst = pack / (f"{tex}-{pal}.png" if pal else f"{tex}.png")
+        if dst.exists() and os.path.samefile(p, dst):
+            continue
+        shutil.copyfile(p, dst)
+        n += 1
+    print(f"imported {n} images into {pack}" + (f", {bad} unresolved" if bad else ""))
+    return 1 if bad else 0
 
 
 def cmd_merge(a):
@@ -184,6 +276,7 @@ def cmd_merge(a):
     out.mkdir(parents=True, exist_ok=True)
     seen: dict = {}
     draws = collections.Counter()
+    merged_names: dict = {}
     header = None
     rows_out = []
     for d in a.dumps:
@@ -222,6 +315,10 @@ def cmd_merge(a):
         if pairs.exists():
             for r in read_tsv(pairs):
                 draws[(r["tex_id"].lower(), r["pal_id"].lower())] += int(r["draws"])
+        nm = d / "names.tsv"
+        if nm.exists():
+            for r in read_tsv(nm):
+                merged_names.setdefault(r["tex_id"].lower(), (r["name"], r.get("aliases", "")))
         print(f"{d}: {n_new} new pairs")
     with open(out / "textures.tsv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=header or ["tex_id", "pal_id", "w", "h", "bpp", "texpage_x", "texpage_y", "clut_x", "clut_y", "u", "v", "first_frame"], delimiter="\t")
@@ -232,7 +329,12 @@ def cmd_merge(a):
         f.write("tex_id\tpal_id\tdraws\n")
         for (t, p), n in draws.items():
             f.write(f"{t}\t{p}\t{n}\n")
-    print(f"merged: {len(rows_out)} pairs, {len({t for t, _ in seen})} texel ids -> {out}")
+    if merged_names:
+        with open(out / "names.tsv", "w") as f:
+            f.write("tex_id\tname\taliases\n")
+            for t, (nm, al) in merged_names.items():
+                f.write(f"{t}\t{nm}\t{al}\n")
+    print(f"merged: {len(rows_out)} pairs, {len({t for t, _ in seen})} texel ids -> {out}" + (f", {len(merged_names)} named" if merged_names else ""))
     return 0
 
 
@@ -312,17 +414,30 @@ def cmd_validate(a):
 
 def cmd_sheet(a):
     d = Path(a.dir)
+    names = read_names(a.names or (d / "names.tsv"))
     files = sorted(p for p in d.iterdir() if NAME_RE.match(p.name))
+    if names:
+        files.sort(key=lambda p: names.get(NAME_RE.match(p.name).group(1).lower(), "~" + p.name))
+    if a.group:
+        files = [p for p in files if names.get(NAME_RE.match(p.name).group(1).lower(), "").startswith(a.group)]
     if not files:
-        sys.exit("no <tex_id>[-<pal_id>].png files")
+        sys.exit("no <tex_id>[-<pal_id>].png files" + (f" in group {a.group}" if a.group else ""))
     ims = [Image.open(p).convert("RGBA") for p in files]
+    cap = 10 if names else 0                       # caption row height
+    caps = [names.get(NAME_RE.match(p.name).group(1).lower(), "").split("/")[-1] for p in files] if names else []
     cw = max(im.width for im in ims) + 2
-    ch = max(im.height for im in ims) + 2
+    if caps:
+        cw = max(cw, 6 * max(len(c) for c in caps) + 2)   # default bitmap font ~6 px per char
+    ch = max(im.height for im in ims) + 2 + cap
     cols = a.cols
     rows = (len(ims) + cols - 1) // cols
     sheet = Image.new("RGBA", (cols * cw, rows * ch), (40, 40, 60, 255))
-    for i, im in enumerate(ims):
-        sheet.alpha_composite(im, ((i % cols) * cw + 1, (i // cols) * ch + 1))
+    draw = ImageDraw.Draw(sheet) if names else None
+    for i, (im, p) in enumerate(zip(ims, files)):
+        x, y = (i % cols) * cw + 1, (i // cols) * ch + 1
+        sheet.alpha_composite(im, (x, y))
+        if draw:
+            draw.text((x, y + im.height), caps[i], fill=(200, 200, 200, 255))
     sheet.convert("RGB").save(a.out)
     print(f"sheet: {len(ims)} images -> {a.out} ({sheet.width}x{sheet.height})")
     return 0
@@ -342,7 +457,12 @@ def main():
     p.add_argument("--missing", help="write the uncovered texel ids to this TSV"); p.set_defaults(fn=cmd_coverage)
     p = sub.add_parser("validate"); p.add_argument("pack"); p.add_argument("--tsv"); p.set_defaults(fn=cmd_validate)
     p = sub.add_parser("sheet"); p.add_argument("dir"); p.add_argument("out"); p.add_argument("--cols", type=int, default=48)
+    p.add_argument("--names"); p.add_argument("--group", help="only names starting with this prefix (e.g. STAGE00/ or PLAYER/)")
     p.set_defaults(fn=cmd_sheet)
+    p = sub.add_parser("export"); p.add_argument("pack"); p.add_argument("out"); p.add_argument("--names"); p.add_argument("--group")
+    p.set_defaults(fn=cmd_export)
+    p = sub.add_parser("import"); p.add_argument("src"); p.add_argument("pack"); p.add_argument("--names")
+    p.set_defaults(fn=cmd_import)
     a = ap.parse_args()
     return a.fn(a)
 
