@@ -13,7 +13,8 @@
  * the asset set (Mega Man 8: 9,845 (texel,palette) pairs but far fewer texel
  * ids from boot to the intro stage).
  *
- * Dump mode ({"cmd":"texture_dump","op":"arm","dir":D} or PSX_TEXTURE_DUMP=D)
+ * Dump mode ({"cmd":"texture_dump","op":"arm","dir":D} or PSX_TEXTURE_DUMP=D;
+ * PSX_TEXTURE_PACK=D is applied by the host at startup)
  * writes each (texel,palette) pair the first time it is seen as
  * D/<tex_id>-<pal_id>.png (RGBA, colour 0 = transparent) and appends a row to
  * D/textures.tsv (tex_id, pal_id, w, h, bpp, texpage x, y, clut x, y, u, v,
@@ -40,15 +41,39 @@ typedef struct {
     int w, h;                 /* pixels */
     const uint8_t *rgba;      /* w*h*4, top-down */
     int atlas_x, atlas_y;     /* renderer-owned: placement in its atlas (-1 = not resident) */
+    /* an entry may carry the CLUT it was authored against (<tex_id>.clut or
+     * <tex_id>-<pal_id>.clut sidecar, BGR555 LE): with it, a different live
+     * CLUT (fade, flash) modulates the replacement instead of showing it at
+     * full brightness, and the lookup can pick the variant whose palette the
+     * live one is a fade of. ref_n = 0 -> none. */
+    int ref_n;
+    uint16_t ref_clut[256];
+    uint64_t hits;            /* draws that used this image */
 } TexPackImage;
 
 int  texture_pack_load(const char *dir);        /* returns number of images, 0 = none/failed */
 void texture_pack_unload(void);
-/* Identify the primitive's texel rect and return its replacement (or NULL). */
+/* Identify the primitive's texel rect and return its replacement (or NULL).
+ * mod[6] (may be NULL) receives the colour transform to apply to the
+ * replacement (scale rgb, offset rgb): identity for an exact palette variant
+ * or without a reference CLUT; otherwise the uniform fade the live palette
+ * applies to the reference (fades then dim the HD art like native texels). */
 const TexPackImage *texture_pack_lookup_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
                                              int u, int v, int w, int h);
-/* {"loaded":N,"dir":"..","lookups":N,"hits":N} */
+const TexPackImage *texture_pack_lookup_rect_mod(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
+                                                 int u, int v, int w, int h, float mod[6]);
+/* Fit the live CLUT against a reference CLUT: mod[0..2] = per-channel scale,
+ * mod[3..5] = per-channel offset in 0..255 units (colour' = colour*scale + offset,
+ * clamped). Returns the residual (rms over entry-channels, 5-bit levels) of the
+ * accepted model — multiplicative or subtractive, whichever is closer, below
+ * 2 levels — or TEXPACK_NO_FIT with mod = identity when the change is not a
+ * uniform fade (palette cycling / recolours keep the authored art). */
+#define TEXPACK_NO_FIT 99.0f
+float texture_pack_palette_mod(const uint16_t *ref, int n, uint16_t clut_x, uint16_t clut_y, float mod[6]);
+/* {"loaded":N,"dir":"..","lookups":N,"hits":N,"used":N} (used = images drawn at least once) */
 int  texture_pack_stats_json(char *buf, int cap);
+/* Write <path> (TSV: tex_id, pal_id, w, h, hits) for every loaded image; returns rows or -1. */
+int  texture_pack_write_usage(const char *path);
 /* Bumped by every load/unload; renderers rebuild their atlas when it changes. */
 uint32_t texture_pack_generation(void);
 /* Visit every loaded image (renderers place them in an atlas and record atlas_x/y). */

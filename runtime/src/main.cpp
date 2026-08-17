@@ -12989,6 +12989,10 @@ session_reboot:
     /* HD texture pack ([video] texture_pack + the "HD textures" toggle). The
      * PSX_TEXTURE_PACK environment override is honoured by texture_pack.c on
      * first use and wins over this. Off = nothing loaded, byte-identical. */
+    if (const char* tp_env = std::getenv("PSX_TEXTURE_PACK")) {
+        /* explicit one-run override: wins over game.toml and the launcher toggle */
+        if (tp_env[0]) { g_texture_pack_dir = tp_env; g_texture_pack_enabled = 1; }
+    }
     if (!g_texture_pack_dir.empty()) {
         if (g_texture_pack_enabled) {
             const int n = texture_pack_load(g_texture_pack_dir.c_str());

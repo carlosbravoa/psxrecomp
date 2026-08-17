@@ -1,11 +1,11 @@
-# Texture packs — identity and dump (B1/B2)
+# Texture packs
 
-Groundwork for **upscaled / redrawn textures**: an opt-in, present-time
-enhancement in the spirit of `SHADOW_ENHANCEMENTS.md` (the faithful renderer
-stays authoritative and byte-identical with the feature off). This document
-covers what exists now — the texture *identity* and the *dump* — and pins the
-design the replacement path (B3+) builds on. Status and plan: the game repo's
-`ROADMAP.md`, track B.
+**Upscaled / redrawn textures** as an opt-in, present-time enhancement in the
+spirit of `SHADOW_ENHANCEMENTS.md` (the faithful renderer stays authoritative
+and byte-identical with the feature off). This document covers the texture
+*identity* and *dump* (B1/B2), the replacement path on both renderers (B3/B4),
+configuration and authoring (B7) and palettes/fades/usage accounting (B9).
+Status and plan: the game repo's `ROADMAP.md`, track B.
 
 ## Where the hook is
 
@@ -52,10 +52,15 @@ PSX_TEXTURE_DUMP=/abs/dir                              environment
 
 While armed, the first time a (texel, palette) pair is seen it is written as
 `<dir>/<tex_id>-<pal_id>.png` (RGBA, colour 0 = transparent, STP bit not
-recorded in the pixels) and a row is appended to `<dir>/textures.tsv`:
+recorded in the pixels) plus `<tex_id>-<pal_id>.clut` (the CLUT's 16 or 256
+halfwords, BGR555 LE — the palette the PNG was rendered with), and a row is
+appended to `<dir>/textures.tsv`:
 `tex_id pal_id w h bpp texpage_x texpage_y clut_x clut_y u v first_frame`.
-Stats: notes total / this frame, unique pairs, unique texel ids, files
-written. The seen-set holds 32 K entries per run.
+`stats` / `disarm` also write `<dir>/pairs.tsv` (`tex_id pal_id draws`): how
+many primitives drew each pair, which is what tells a settled palette from a
+fade step (a 16×16 title tile: 4,429 draws with its palette, 10–20 with each
+of the 31 flash/fade palettes). Stats: notes total / this frame, unique pairs,
+unique texel ids, files written. The seen-set holds 32 K entries per run.
 
 Typical use: run through the game once (or a scripted headless route), then
 group the TSV by `tex_id` to see the asset set, pick the canonical palette per
@@ -71,8 +76,10 @@ PSX_TEXTURE_PACK=/abs/pack                                environment (loaded on
 A pack is a directory of `<tex_id>.png` (any palette) and/or
 `<tex_id>-<pal_id>.png` (that palette only), each an **integer multiple N of
 the native texel rectangle** it replaces (a dump directory is therefore a
-valid 1× pack). Lookup: exact palette variant first, then the palette-agnostic
-file; images whose size is not a whole multiple of the rectangle are ignored.
+valid 1× pack), optionally with `.clut` sidecars (see *Palettes and fades*).
+Lookup: exact palette variant first, then the entry whose reference palette
+the live one is a fade of, then the palette-agnostic file; images whose size
+is not a whole multiple of the rectangle are ignored.
 
 Where it draws: the software renderer's **hi-res mirror and native-wide
 surface only** (`[video] supersampling` ≥ 2, `renderer = "software"`; the
@@ -80,9 +87,12 @@ present path shows the hi-res surface). `sw_draw_textured_rect / _scaled /
 _triangle` identify the primitive (same texel id as the dump), fetch the
 replacement, and the S× rasterisers sample it at the primitive's texel
 coordinates instead of VRAM. Per pixel: replacement alpha < 128 → nothing is
-drawn; else its 15-bit colour, with the **native texel's STP bit** so
-semi-transparency behaves as on PSX; colour modulation, mask bits and blend
-modes are the existing `put_textured` path. Native VRAM (`t->s == 1`) never
+drawn, and neither is a pixel whose **native texel is 0x0000** (index 0 or a
+palette entry faded to black — transparent on the PSX); else its 15-bit
+colour, with the **native texel's STP bit** so semi-transparency behaves as on
+PSX (a replacement that comes out black over a drawn texel stays opaque
+black); colour modulation, mask bits and blend modes are the existing
+`put_textured` path. Native VRAM (`t->s == 1`) never
 sees the pack, so VRAM→CPU reads, savestates, netplay digests and the 1×
 picture are byte-identical (verified: `screenshot` equal with/without the
 pack, `screenshot_hires` differs).
@@ -93,20 +103,19 @@ HUD and tiles it covers; uncovered ids fall back to native texels; 17,780
 lookups → 15,715 hits over ~90 frames (~200 lookups/frame; each is one hash
 of a 16×16 rect).
 
-Not yet: shaded-textured triangles (3D titles), the GL renderer (B4), a
-`[video] texture_pack` key + launcher row (B7), fade handling (a
-palette-agnostic replacement shows at full brightness during a palette fade —
-supply `<tex>-<pal>.png` variants for the settled palette, or wait for B9's
-palette-aware modulation), coverage tooling.
+Not yet: shaded-textured triangles (3D titles). The GL renderer is B4, the
+`[video] texture_pack` key + launcher row B7, fade handling B9 (all below).
 
 ## Replacement — OpenGL renderer (B4)
 
 The GL backend (`gpu_gl_renderer.c`) carries the same replacement through
-its textured program: two extra flat vertex attributes per primitive
+its textured program: four extra flat vertex attributes per primitive
 (`a_rep_org` = the prim's texel rect u0,v0,w,h; `a_rep_atlas` = its rect in
-the **pack atlas**), and the fragment shader samples the atlas (RGBA8,
-nearest, `texelFetch`) at `(uv - org) / size` when `a_rep_atlas.w > 0`:
-alpha < 0.5 discards, the STP bit still comes from the native texel, colour
+the **pack atlas**; `a_rep_mod` / `a_rep_off` = the palette-fade scale and
+offset of B9), and the fragment shader samples the atlas (RGBA8, nearest,
+`texelFetch`) at `(uv - org) / size` when `a_rep_atlas.w > 0`: alpha < 0.5
+discards, a native texel of 0x0000 discards (PSX transparency), the STP bit
+still comes from the native texel, `rgb = clamp(rgb * mod + off)`, colour
 modulation / semi-transparency / mask passes are the existing ones. The
 atlas is shelf-packed from every loaded image whenever the pack generation
 changes (up to 8192², images that do not fit fall back to native texels and
@@ -148,11 +157,13 @@ Supersampling) — at 1× the renderers draw native texels.
 
 ```
 texpack.py summary  DUMPDIR                     pairs / texel ids / sizes / pages
-texpack.py starter  DUMPDIR PACKDIR --scale N   one <tex_id>.png per texel id, N x nearest —
-                                                the pixel-identical skeleton artists repaint
-                                                (--palette all keeps every <tex>-<pal>.png variant)
+texpack.py starter  DUMPDIR PACKDIR --scale N   one <tex_id>.png (+ .clut) per texel id, N x nearest —
+                                                the pixel-identical skeleton artists repaint —
+                                                plus <tex_id>-<pal_id>.png (+ .clut) for genuine recolours;
+                                                --palette common (default, most-drawn palette per pairs.tsv)
+                                                | first | last | all | <pal_id>; --no-variants
 texpack.py coverage PACKDIR TSV...              covered texel ids / exact-palette pairs, --missing out.tsv
-texpack.py validate PACKDIR [--tsv TSV]         names, alpha channel, integer-multiple sizes
+texpack.py validate PACKDIR [--tsv TSV]         names, alpha channel, integer-multiple sizes, .clut sizes
 texpack.py sheet    DIR OUT.png                 contact sheet of a dump or a pack
 ```
 
@@ -162,20 +173,85 @@ multiple of the native rect; alpha 0 = transparent) → `validate` →
 `coverage` against new dumps as you play further → drop the pack directory
 where `[video] texture_pack` points and toggle it in the launcher.
 
-## Next (B9+)
+## Palettes, fades and usage (B9)
 
-DEGRADED logging when a pack entry's native hash no longer matches;
-fade-aware palette handling; bilinear pack sampling; SW-vs-GL parity tool.
+A pack image is keyed by texel content, but the colours the player sees come
+from the *live* CLUT — and PSX games fade, flash and dim by rewriting CLUTs
+(Mega Man 8 fades every stage in over ~32 palette steps; its title screen
+adds a white flash that steps back over ~60 frames, both by re-uploading the
+palette bank every frame). Without B9 a replacement showed at full authored
+brightness through all of that.
+
+**Reference palettes.** Every pack entry may carry the CLUT it was authored
+against: `<tex_id>.clut` next to `<tex_id>.png`, `<tex_id>-<pal_id>.clut`
+next to a variant (32 bytes for 4bpp, 512 for 8bpp, BGR555 little-endian —
+exactly what the dump writes, so `starter` just copies them). Entries without
+a sidecar behave as before (as authored, any palette).
+
+**Fade model.** When the live palette id differs from the reference's, the
+runtime fits the live CLUT against the reference per channel with two uniform
+models and keeps the closer one if its residual is below 2 levels rms:
+*multiplicative* `cur = ref × k` (dimming) and *subtractive*
+`cur = clamp(ref − d)` (the classic PSX fade / flash: every channel steps by
+the same amount, clamping at 0 or 31 — the step is estimated from the
+unclamped entries, all-clamped means fully black / fully white). The
+replacement is then drawn as `clamp(rgb × scale + offset)` — on the software
+path in `rep_sample`, on GL through the `a_rep_mod` / `a_rep_off` attributes.
+A palette that is not a uniform fade of the reference (permutation, cycle,
+recolour) leaves the entry as authored (identity).
+
+**Variant selection.** Lookup order per primitive: (1) the exact
+`<tex>-<pal>` variant; (2) among all entries of that texel id that carry a
+sidecar, the one whose reference the live palette is a fade of (smallest
+residual) — so a stage fade-in of a *recolour* dims that recolour, not the
+common art; (3) the palette-agnostic entry as authored. `starter --palette
+common` (the default) writes the most-drawn palette per texel id (from
+`pairs.tsv`) as `<tex>.png` and every palette the fade model cannot reach as
+a `<tex>-<pal>.png` variant with its sidecar (Mega Man 8, boot → intro
+stage: 776 ids, 10 recolour variants — mostly solid tiles whose texels are
+the same index everywhere and legitimately mean different colours in
+different places).
+
+**Result.** With a 2× nearest starter pack (pixel-identical art) the software
+hi-res picture is **pixel-identical to native** through the title fade-in,
+the white flash and its fade back, and the intro stage; on OpenGL the
+difference is the documented ≤ 2/255 of 5→8-bit expansion. Verified with the
+game repo's `tools/mm8_headless.sh`-style scripts capturing `screenshot_hires`
+with and without `PSX_TEXTURE_PACK` (the config pack must be empty for the
+"native" run — a `[video] texture_pack` directory loads at boot).
+
+**Usage accounting.** `texture_pack stats` reports `used` (images drawn at
+least once) next to lookups/hits, `{"cmd":"texture_pack","op":"usage",
+"path":...}` writes `tex_id pal_id hits` per image, and unloading logs
+"N of M images were drawn" — the numbers that tell an artist which of the
+files they painted the game actually reached. `PSX_TEXTURE_PACK` is applied
+at startup (it overrides the config pack and the launcher toggle for that run).
+
+**Debug aid.** `vram_peek` takes `"hires":1` to read the software hi-res
+mirror at the same native coordinates — the quickest way to tell a renderer
+divergence from a pack one.
+
+Limits: the fit is per primitive per draw (a few hundred per frame, 16 or 256
+entries each — negligible); 15bpp textures have no CLUT and no fade support;
+palette *cycling* (water, energy) is a recolour to the model and needs
+variants; recolour detection in `starter` needs the `.clut` files of a fresh
+dump (`--no-variants` skips it).
+
+## Next
+
+DEGRADED logging when a pack entry's native hash no longer matches; bilinear
+pack sampling; SW-vs-GL parity tool; shaded-textured triangles.
 
 ## Files
 
 `runtime/include/texture_pack.h`, `runtime/src/texture_pack.c` (identity,
 dump, pack loading — private static `stb_image` PNG decoder),
 `runtime/src/gpu_render.c` (identity hooks), `runtime/src/gpu_sw_renderer.c`
-(replacement sampling in the S× rasterisers), `runtime/src/gpu_gl_renderer.c`
-(atlas + shader path), `runtime/src/png_write.h`
-(`png_write_rgba`), `runtime/src/debug_server.c` (`texture_dump`,
-`texture_pack`; `screenshot_hires` pitch fix), `runtime/tests/test_texture_pack.c`,
+(replacement sampling + fade modulation in the S× rasterisers),
+`runtime/src/gpu_gl_renderer.c` (atlas + shader path + fade attributes),
+`runtime/src/png_write.h` (`png_write_rgba`), `runtime/src/debug_server.c`
+(`texture_dump`, `texture_pack` incl. `usage`; `screenshot_hires` pitch fix;
+`vram_peek hires`), `runtime/tests/test_texture_pack.c`,
 `recompiler/src/config_loader.{h,cpp}` (`[video] texture_pack`, settings),
 `runtime/src/main.cpp` (load + launcher glue), `tools/texpack.py`, and in
 recomp-ui `recomp_launcher.h` / `launcher_model.{h,c}` / `launcher_imgui.cpp`

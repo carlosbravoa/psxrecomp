@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 int g_texture_pack_active = 0;
 int g_texture_pack_replace = 0;
@@ -34,18 +35,38 @@ static int tex_seen_insert(uint64_t id) {
 }
 
 
-static int seen_insert(uint64_t id) {          /* 1 = newly inserted */
+/* (texel, palette) pairs, with the pair's ids and a draw counter: pairs.tsv
+ * lets tools pick the palette a texture is drawn with MOST of the time (the
+ * settled one) rather than a fade/flash step. */
+static uint64_t s_seen_tex[SEEN_CAP], s_seen_pal[SEEN_CAP];
+static uint32_t s_seen_count[SEEN_CAP];
+
+static int seen_insert(uint64_t id, uint64_t tex, uint64_t pal) {   /* 1 = newly inserted */
     if (id == 0) id = 1;
     uint32_t i = (uint32_t)(id ^ (id >> 29)) & (SEEN_CAP - 1);
     for (uint32_t k = 0; k < SEEN_CAP; k++) {
-        if (s_seen[i] == id) return 0;
+        if (s_seen[i] == id) { s_seen_count[i]++; return 0; }
         if (s_seen[i] == 0) {
             if (s_seen_n + 1 >= SEEN_CAP / 2) return 0;   /* full: stop dumping new ones */
-            s_seen[i] = id; s_seen_n++; return 1;
+            s_seen[i] = id; s_seen_tex[i] = tex; s_seen_pal[i] = pal; s_seen_count[i] = 1; s_seen_n++; return 1;
         }
         i = (i + 1) & (SEEN_CAP - 1);
     }
     return 0;
+}
+
+static void write_pairs_tsv(void) {
+    if (!s_dir[0]) return;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/pairs.tsv", s_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "tex_id\tpal_id\tdraws\n");
+    for (uint32_t i = 0; i < SEEN_CAP; i++)
+        if (s_seen[i])
+            fprintf(f, "%016llx\t%016llx\t%u\n", (unsigned long long)s_seen_tex[i],
+                    (unsigned long long)s_seen_pal[i], s_seen_count[i]);
+    fclose(f);
 }
 
 void texture_pack_set_vram(const uint16_t *v) { s_vram = v; }
@@ -55,8 +76,8 @@ static void check_env(void) {
     s_env_checked = 1;
     const char *d = getenv("PSX_TEXTURE_DUMP");
     if (d && d[0]) texture_dump_arm(d);
-    const char *pk = getenv("PSX_TEXTURE_PACK");
-    if (pk && pk[0]) texture_pack_load(pk);
+    /* PSX_TEXTURE_PACK is applied by the host at startup (main.cpp), where it
+     * overrides [video] texture_pack; nothing to do here. */
 }
 
 int texture_dump_arm(const char *dir) {
@@ -73,6 +94,7 @@ int texture_dump_arm(const char *dir) {
     fflush(f);
     snprintf(s_dir, sizeof s_dir, "%s", dir);
     memset(s_seen, 0, sizeof s_seen); s_seen_n = 0;
+    memset(s_seen_count, 0, sizeof s_seen_count);
     memset(s_tex_seen, 0, sizeof s_tex_seen); s_tex_unique = 0;
     s_notes = s_frame_notes = s_dumped = 0;
     g_texture_pack_active = 1;
@@ -80,12 +102,14 @@ int texture_dump_arm(const char *dir) {
 }
 
 void texture_dump_disarm(void) {
+    write_pairs_tsv();
     if (s_tsv) { fclose(s_tsv); s_tsv = NULL; }
     s_dir[0] = 0;
     g_texture_pack_active = 0;
 }
 
 int texture_dump_stats_json(char *buf, int cap) {
+    write_pairs_tsv();     /* keep pairs.tsv current whenever someone looks */
     return snprintf(buf, (size_t)cap,
         "{\"active\":%d,\"dir\":\"%s\",\"notes\":%llu,\"unique\":%u,\"unique_texels\":%u,\"dumped\":%llu,\"frame_notes\":%llu}",
         g_texture_pack_active, s_dir, (unsigned long long)s_notes, s_seen_n, s_tex_unique,
@@ -167,6 +191,18 @@ static void dump_png(uint64_t id, uint64_t pal, uint16_t texpage, uint16_t clut_
     FILE *f = fopen(path, "wb");
     if (f) { png_write_rgba(f, rgba, (uint32_t)w, (uint32_t)h); fclose(f); s_dumped++; }
     free(rgba);
+    if (depth < 2) {   /* the CLUT the texture was seen with (BGR555 LE), for fade-aware packs */
+        snprintf(path, sizeof path, "%s/%016llx-%016llx.clut", s_dir, (unsigned long long)id, (unsigned long long)pal);
+        FILE *cf = fopen(path, "wb");
+        if (cf) {
+            const int n = depth == 0 ? 16 : 256;
+            for (int i = 0; i < n; i++) {
+                const uint16_t c = s_vram[(size_t)(clut_y & 511) * 1024 + ((clut_x + i) & 1023)];
+                fputc(c & 0xFF, cf); fputc(c >> 8, cf);
+            }
+            fclose(cf);
+        }
+    }
     if (s_tsv) {
         fprintf(s_tsv, "%016llx\t%016llx\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%llu\n",
                 (unsigned long long)id, (unsigned long long)pal, w, h, depth == 0 ? 4 : depth == 1 ? 8 : 15,
@@ -186,7 +222,7 @@ static void note(uint16_t texpage, uint16_t clut_x, uint16_t clut_y, int u, int 
     uint64_t id, pal;
     hash_rect(texpage, clut_x, clut_y, u, v, w, h, depth, &id, &pal);
     tex_seen_insert(id);
-    if (s_dir[0] && seen_insert(id ^ (pal * 0x9E3779B97F4A7C15ull)))
+    if (s_dir[0] && seen_insert(id ^ (pal * 0x9E3779B97F4A7C15ull), id, pal))
         dump_png(id, pal, texpage, clut_x, clut_y, u, v, w, h, depth);
 }
 
@@ -256,6 +292,13 @@ static int parse_hex16(const char *p, uint64_t *out) {
 }
 
 void texture_pack_unload(void) {
+    if (s_pack_n) {
+        int used = 0;
+        for (unsigned b = 0; b < PACK_BUCKETS; b++)
+            for (const PackEntry *e = s_pack[b]; e; e = e->next) used += e->img.hits ? 1 : 0;
+        fprintf(stdout, "psxrecomp: HD texture pack %s: %d of %d images were drawn (%llu lookups, %llu hits)\n",
+                s_pack_dir, used, s_pack_n, (unsigned long long)s_lookups, (unsigned long long)s_hits);
+    }
     for (unsigned b = 0; b < PACK_BUCKETS; b++) {
         PackEntry *e = s_pack[b];
         while (e) { PackEntry *n = e->next; free((void*)e->img.rgba); free(e); e = n; }
@@ -290,6 +333,21 @@ int texture_pack_load(const char *dir) {
         if (!e) { stbi_image_free(px); break; }
         e->tex = tex; e->pal = pal; e->img.w = w; e->img.h = h; e->img.rgba = px;
         e->img.atlas_x = e->img.atlas_y = -1;
+        e->img.ref_n = 0; e->img.hits = 0;
+        {
+            /* <tex>.clut / <tex>-<pal>.clut: the CLUT this image was authored against */
+            snprintf(path, sizeof path, "%s/%.*s.clut", dir, (int)(len - 4), n);
+            FILE *cf = fopen(path, "rb");
+            if (cf) {
+                uint8_t raw[512];
+                size_t got = fread(raw, 1, sizeof raw, cf);
+                fclose(cf);
+                if (got == 32 || got == 512) {
+                    e->img.ref_n = (int)(got / 2);
+                    for (int i = 0; i < e->img.ref_n; i++) e->img.ref_clut[i] = (uint16_t)(raw[i * 2] | (raw[i * 2 + 1] << 8));
+                }
+            }
+        }
         unsigned b = (unsigned)(tex ^ (tex >> 23)) & (PACK_BUCKETS - 1);
         e->next = s_pack[b]; s_pack[b] = e; s_pack_n++;
     }
@@ -300,27 +358,128 @@ int texture_pack_load(const char *dir) {
     return s_pack_n;
 }
 
-const TexPackImage *texture_pack_lookup_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
-                                             int u, int v, int w, int h) {
+float texture_pack_palette_mod(const uint16_t *ref, int n, uint16_t clut_x, uint16_t clut_y, float mod[6]) {
+    mod[0] = mod[1] = mod[2] = 1.0f; mod[3] = mod[4] = mod[5] = 0.0f;
+    if (!ref || n <= 0 || !s_vram) return TEXPACK_NO_FIT;
+    /* Two uniform-fade models, fitted per channel over the entries whose
+     * reference is neither transparent nor black:
+     *   multiplicative  cur = ref * k          (dimming, brightness)
+     *   subtractive     cur = clamp(ref - d)   (the classic PSX fade: every
+     *                                           channel steps down by d)
+     * The model whose per-entry residual is smaller wins, and only if that
+     * residual is small; otherwise the palette is a permutation / cycle /
+     * recolour and the authored colours are kept (identity). */
+    float mul[3] = {1, 1, 1}, sub[3] = {0, 0, 0};
+    float err_mul = 0.0f, err_sub = 0.0f;
+    int   any = 0;
+    for (int k = 0; k < 3; k++) {
+        float sr = 0, sc = 0, sd = 0; int cnt = 0, cntd = 0;
+        for (int i = 0; i < n; i++) {
+            const uint16_t r = ref[i];
+            if ((r & 0x7FFF) == 0) continue;
+            const uint16_t c = s_vram[(size_t)(clut_y & 511) * 1024 + ((clut_x + i) & 1023)];
+            const int rv = (r >> (5 * k)) & 31, cv = (c >> (5 * k)) & 31;
+            if (rv <= 0) continue;
+            sr += (float)rv; sc += (float)cv; cnt++;
+            if (cv > 0 && cv < 31) { sd += (float)(rv - cv); cntd++; }   /* unclamped entries define the step */
+        }
+        if (!cnt) continue;
+        any = 1;
+        mul[k] = sr > 0 ? sc / sr : 1.0f;
+        if (cntd) sub[k] = sd / (float)cntd;
+        else      sub[k] = sc / (float)cnt <= 0.5f ? 31.0f : -31.0f;   /* all clamped: fully black / white */
+        for (int i = 0; i < n; i++) {
+            const uint16_t r = ref[i];
+            if ((r & 0x7FFF) == 0) continue;
+            const uint16_t c = s_vram[(size_t)(clut_y & 511) * 1024 + ((clut_x + i) & 1023)];
+            const int rv = (r >> (5 * k)) & 31, cv = (c >> (5 * k)) & 31;
+            if (rv <= 0) continue;
+            float pm = (float)rv * mul[k]; if (pm > 31.0f) pm = 31.0f;
+            float ps = (float)rv - sub[k]; if (ps < 0.0f) ps = 0.0f; if (ps > 31.0f) ps = 31.0f;
+            err_mul += ((float)cv - pm) * ((float)cv - pm);
+            err_sub += ((float)cv - ps) * ((float)cv - ps);
+        }
+    }
+    if (!any) return TEXPACK_NO_FIT;
+    /* residual per entry-channel; a fit is accepted below ~2 levels rms */
+    int m = 0;
+    for (int i = 0; i < n; i++) if ((ref[i] & 0x7FFF) != 0) m += 3;
+    const float rms_mul = m ? (float)sqrt((double)err_mul / m) : 99.0f;
+    const float rms_sub = m ? (float)sqrt((double)err_sub / m) : 99.0f;
+    if (rms_sub <= rms_mul && rms_sub < 2.0f) {
+        for (int k = 0; k < 3; k++) { mod[k] = 1.0f; mod[3 + k] = -sub[k] * (255.0f / 31.0f); }
+        return rms_sub;
+    } else if (rms_mul < 2.0f) {
+        for (int k = 0; k < 3; k++) { float f = mul[k]; if (f > 2.0f) f = 2.0f; if (f < 0.0f) f = 0.0f; mod[k] = f; mod[3 + k] = 0.0f; }
+        return rms_mul;
+    }
+    return TEXPACK_NO_FIT;
+}
+
+static int img_fits_rect(const TexPackImage *im, int w, int h) {
+    return im->w % w == 0 && im->h % h == 0 && im->w / w == im->h / h;
+}
+
+const TexPackImage *texture_pack_lookup_rect_mod(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
+                                                 int u, int v, int w, int h, float mod[6]) {
+    if (mod) { mod[0] = mod[1] = mod[2] = 1.0f; mod[3] = mod[4] = mod[5] = 0.0f; }
     if (!g_texture_pack_replace || !s_vram || w <= 0 || h <= 0) return NULL;
     if (w > 256) w = 256;
     if (h > 256) h = 256;
     uint64_t tex, pal;
-    hash_rect(texpage, clut_x, clut_y, u, v, w, h, (texpage >> 7) & 3, &tex, &pal);
+    const int depth = (texpage >> 7) & 3;
+    hash_rect(texpage, clut_x, clut_y, u, v, w, h, depth, &tex, &pal);
     s_lookups++;
-    const PackEntry *any = NULL;
-    for (const PackEntry *e = s_pack[(unsigned)(tex ^ (tex >> 23)) & (PACK_BUCKETS - 1)]; e; e = e->next) {
-        if (e->tex != tex) continue;
-        if (e->pal == pal) {
-            /* an exact palette variant must be a whole multiple of the rect */
-            if (e->img.w % w == 0 && e->img.h % h == 0 && e->img.w / w == e->img.h / h) { s_hits++; return &e->img; }
-        } else if (e->pal == 0 && !any) any = e;
+    /* 1. the exact palette variant; 2. else the entry whose reference CLUT
+     *    best explains the live one as a uniform fade (palette-agnostic or a
+     *    <tex>-<pal> variant with a .clut sidecar) — a stage fade-in of a
+     *    genuine recolour then dims THAT recolour; 3. else the palette-agnostic
+     *    entry as authored. Every candidate must be a whole multiple of the rect. */
+    PackEntry *any = NULL, *best = NULL;
+    float best_rms = TEXPACK_NO_FIT, best_mod[6];
+    PackEntry *chain = s_pack[(unsigned)(tex ^ (tex >> 23)) & (PACK_BUCKETS - 1)];
+    for (PackEntry *e = chain; e; e = e->next) {
+        if (e->tex != tex || !img_fits_rect(&e->img, w, h)) continue;
+        if (e->pal == pal) { s_hits++; e->img.hits++; return &e->img; }
+        if (e->pal == 0 && !any) any = e;
     }
-    if (any && any->img.w % w == 0 && any->img.h % h == 0 && any->img.w / w == any->img.h / h) { s_hits++; return &any->img; }
+    if (mod && depth < 2) {
+        for (PackEntry *e = chain; e; e = e->next) {
+            if (e->tex != tex || e->img.ref_n <= 0 || !img_fits_rect(&e->img, w, h)) continue;
+            float m[6];
+            float rms = texture_pack_palette_mod(e->img.ref_clut, e->img.ref_n, clut_x, clut_y, m);
+            if (rms < best_rms) { best_rms = rms; best = e; memcpy(best_mod, m, sizeof m); }
+        }
+    }
+    if (best) { s_hits++; best->img.hits++; memcpy(mod, best_mod, sizeof best_mod); return &best->img; }
+    if (any)  { s_hits++; any->img.hits++; return &any->img; }
     return NULL;
 }
 
+const TexPackImage *texture_pack_lookup_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
+                                             int u, int v, int w, int h) {
+    return texture_pack_lookup_rect_mod(texpage, clut_x, clut_y, u, v, w, h, NULL);
+}
+
+int texture_pack_write_usage(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "tex_id\tpal_id\tw\th\thits\n");
+    int rows = 0;
+    for (unsigned b = 0; b < PACK_BUCKETS; b++)
+        for (const PackEntry *e = s_pack[b]; e; e = e->next) {
+            fprintf(f, "%016llx\t%016llx\t%d\t%d\t%llu\n", (unsigned long long)e->tex,
+                    (unsigned long long)e->pal, e->img.w, e->img.h, (unsigned long long)e->img.hits);
+            rows++;
+        }
+    fclose(f);
+    return rows;
+}
+
 int texture_pack_stats_json(char *buf, int cap) {
-    return snprintf(buf, (size_t)cap, "{\"loaded\":%d,\"dir\":\"%s\",\"lookups\":%llu,\"hits\":%llu}",
-                    s_pack_n, s_pack_dir, (unsigned long long)s_lookups, (unsigned long long)s_hits);
+    int used = 0;
+    for (unsigned b = 0; b < PACK_BUCKETS; b++)
+        for (const PackEntry *e = s_pack[b]; e; e = e->next) used += e->img.hits ? 1 : 0;
+    return snprintf(buf, (size_t)cap, "{\"loaded\":%d,\"dir\":\"%s\",\"lookups\":%llu,\"hits\":%llu,\"used\":%d}",
+                    s_pack_n, s_pack_dir, (unsigned long long)s_lookups, (unsigned long long)s_hits, used);
 }

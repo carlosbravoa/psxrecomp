@@ -6,8 +6,9 @@ A dump directory (runtime `texture_dump`) holds <tex_id>-<pal_id>.png files
 <tex_id>-<pal_id>.png (one palette) at an integer multiple of the native size.
 
     texpack.py summary  DUMPDIR                        what the dump contains
-    texpack.py starter  DUMPDIR PACKDIR --scale N      one <tex_id>.png per texel id, N x nearest
-                        [--palette first|all|<pal_id>] (the pixel-identical skeleton artists repaint)
+    texpack.py starter  DUMPDIR PACKDIR --scale N      one <tex_id>.png (+ .clut sidecar) per texel id, plus
+                        [--palette common|first|last|all|<pal_id>]  <tex_id>-<pal_id>.png for genuine recolours;
+                        [--no-variants]                 N x nearest: the pixel-identical skeleton artists repaint
     texpack.py coverage PACKDIR TSV [TSV...]           which dumped textures the pack covers
     texpack.py validate PACKDIR [--tsv TSV]            filenames / sizes / alpha sanity
     texpack.py sheet    DIR OUT.png [--cols 48]        contact sheet of a dump or pack
@@ -69,6 +70,42 @@ def cmd_summary(a):
     return 0
 
 
+def read_clut(path: Path):
+    b = path.read_bytes()
+    return [int.from_bytes(b[i:i + 2], "little") for i in range(0, len(b), 2)]
+
+
+def fade_fits(ref, live):
+    """Mirror of texture_pack_palette_mod (runtime/src/texture_pack.c): is `live`
+    a uniform fade of `ref` — multiplicative (cur = ref*k) or subtractive
+    (cur = clamp(ref - d)) per channel, rms residual < 2 levels — or a genuine
+    recolour? Keep in sync with the C."""
+    import math
+    idx = [i for i in range(len(ref)) if ref[i] & 0x7FFF]
+    if not idx:
+        return True
+    err_mul = err_sub = 0.0
+    m = 0
+    for k in range(3):
+        rv = [(ref[i] >> (5 * k)) & 31 for i in idx]
+        cv = [(live[i] >> (5 * k)) & 31 for i in idx]
+        pairs = [(r, c) for r, c in zip(rv, cv) if r > 0]
+        if not pairs:
+            continue
+        sr = sum(r for r, _ in pairs)
+        sc = sum(c for _, c in pairs)
+        unc = [(r - c) for r, c in pairs if 0 < c < 31]
+        mul = sc / sr if sr else 1.0
+        sub = sum(unc) / len(unc) if unc else (31.0 if sc / len(pairs) <= 0.5 else -31.0)
+        for r, c in pairs:
+            err_mul += (c - min(31.0, r * mul)) ** 2
+            err_sub += (c - min(31.0, max(0.0, r - sub))) ** 2
+            m += 1
+    if not m:
+        return True
+    return min(math.sqrt(err_mul / m), math.sqrt(err_sub / m)) < 2.0
+
+
 def cmd_starter(a):
     d, out = Path(a.dump), Path(a.pack)
     rows = read_tsv(d / "textures.tsv")
@@ -76,10 +113,40 @@ def cmd_starter(a):
     by_tex = collections.defaultdict(list)
     for r in rows:
         by_tex[r["tex_id"]].append(r)
-    n = 0
+    n = nvar = 0
+    # pairs.tsv (written by texture_dump on stats/disarm) counts how often each
+    # (texel, palette) pair was DRAWN: the most-drawn palette is the settled one
+    draws = {}
+    pairs = d / "pairs.tsv"
+    if pairs.exists():
+        for r in read_tsv(pairs):
+            draws[(r["tex_id"].lower(), r["pal_id"].lower())] = int(r["draws"])
+    elif a.palette == "common":
+        print("note: no pairs.tsv in the dump (end the dump with texture_dump op=stats/disarm); using --palette first", file=sys.stderr)
     for tex, rs in by_tex.items():
-        if a.palette == "first":
+        if a.palette == "common":
+            best = max(rs, key=lambda r: draws.get((r["tex_id"].lower(), r["pal_id"].lower()), 0))
+            picks = [(best, None)]
+            # palettes that are NOT a fade of the common one are genuine recolours
+            # (enemy variants, the same tile in another stage): keep them as
+            # <tex>-<pal>.png variants with their own .clut, so the runtime shows
+            # (and fades) the right colours instead of the common ones
+            bc = d / f"{best['tex_id']}-{best['pal_id']}.clut"
+            if bc.exists() and not a.no_variants:
+                ref = read_clut(bc)
+                for r in rs:
+                    if r is best:
+                        continue
+                    c = d / f"{r['tex_id']}-{r['pal_id']}.clut"
+                    if c.exists() and not fade_fits(ref, read_clut(c)):
+                        picks.append((r, r["pal_id"]))
+                        nvar += 1
+        elif a.palette == "first":
             picks = [(rs[0], None)]
+        elif a.palette == "last":
+            # the palette seen LAST is the settled one after a fade-in (fades step
+            # through many palettes first) — the right reference for fade-aware packs
+            picks = [(max(rs, key=lambda r: int(r["first_frame"])), None)]
         elif a.palette == "all":
             picks = [(r, r["pal_id"]) for r in rs]
         else:
@@ -94,7 +161,13 @@ def cmd_starter(a):
             name = f"{tex}.png" if pal is None else f"{tex}-{pal}.png"
             im.save(out / name)
             n += 1
-    print(f"starter pack: {n} images at {a.scale}x -> {out}")
+            # every entry carries the CLUT it was authored against so the runtime
+            # can dim/flash it with the live palette and pick the variant a fade
+            # belongs to (docs/TEXTURE_PACKS.md, "Palettes and fades")
+            clut = d / f"{r['tex_id']}-{r['pal_id']}.clut"
+            if clut.exists():
+                (out / (name[:-4] + ".clut")).write_bytes(clut.read_bytes())
+    print(f"starter pack: {n} images at {a.scale}x -> {out}" + (f" ({nvar} recolour variants)" if nvar else ""))
     return 0
 
 
@@ -141,6 +214,12 @@ def cmd_validate(a):
             native.setdefault(r["tex_id"].lower(), (int(r["w"]), int(r["h"])))
     ok = bad = skipped = 0
     for p in sorted(pack.iterdir()):
+        if p.suffix.lower() == ".clut":
+            sz = p.stat().st_size
+            if sz not in (32, 512) or not re.match(r"^[0-9a-fA-F]{16}(-[0-9a-fA-F]{16})?\.clut$", p.name):
+                print(f"  BAD {p.name}: a .clut sidecar must be <tex_id>[-<pal_id>].clut of 32 (4bpp) or 512 (8bpp) bytes")
+                bad += 1
+            continue
         if p.suffix.lower() != ".png":
             continue
         m = NAME_RE.match(p.name)
@@ -189,7 +268,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("summary"); p.add_argument("dump"); p.set_defaults(fn=cmd_summary)
     p = sub.add_parser("starter"); p.add_argument("dump"); p.add_argument("pack")
-    p.add_argument("--scale", type=int, default=2); p.add_argument("--palette", default="first")
+    p.add_argument("--scale", type=int, default=2)
+    p.add_argument("--palette", default="common", help="common (most-drawn palette + genuine recolour variants, needs pairs.tsv; default) | first | last | all | <pal_id>")
+    p.add_argument("--no-variants", action="store_true", help="with --palette common: do not emit <tex>-<pal>.png recolour variants")
     p.set_defaults(fn=cmd_starter)
     p = sub.add_parser("coverage"); p.add_argument("pack"); p.add_argument("tsv", nargs="+")
     p.add_argument("--missing", help="write the uncovered texel ids to this TSV"); p.set_defaults(fn=cmd_coverage)

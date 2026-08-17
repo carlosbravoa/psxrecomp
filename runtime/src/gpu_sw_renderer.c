@@ -334,6 +334,7 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
 
 static const TexPackImage *g_rep = NULL;
 static int g_rep_u0, g_rep_v0, g_rep_w, g_rep_h;
+static float g_rep_mod[6] = {1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f};   /* palette fade: scale rgb, offset rgb (texture_pack.h) */
 
 /* Sample the replacement at texel-space (fu, fv) (fractional native texel
  * coordinates inside the primitive's span). Returns 0 = draw nothing here,
@@ -347,8 +348,19 @@ static inline int rep_sample(float fu, float fv, uint16_t native_texel, uint16_t
     if (ry < 0) ry = 0; if (ry >= g_rep->h) ry = g_rep->h - 1;
     const uint8_t *p = g_rep->rgba + ((size_t)ry * g_rep->w + rx) * 4;
     if (p[3] < 128) return 0;
-    uint16_t c = (uint16_t)((p[0] >> 3) | ((p[1] >> 3) << 5) | ((p[2] >> 3) << 10));
-    if (c == 0) c = 0x0001;                       /* opaque black must not read as "transparent" */
+    int r8 = (int)(p[0] * g_rep_mod[0] + g_rep_mod[3] + 0.5f);
+    int g8 = (int)(p[1] * g_rep_mod[1] + g_rep_mod[4] + 0.5f);
+    int b8 = (int)(p[2] * g_rep_mod[2] + g_rep_mod[5] + 0.5f);
+    if (r8 > 255) r8 = 255; if (g8 > 255) g8 = 255; if (b8 > 255) b8 = 255;
+    if (r8 < 0) r8 = 0; if (g8 < 0) g8 = 0; if (b8 < 0) b8 = 0;
+    uint16_t c = (uint16_t)((r8 >> 3) | ((g8 >> 3) << 5) | ((b8 >> 3) << 10));
+    /* Transparency is the NATIVE texel's: 0x0000 (index 0, or a palette entry
+     * faded to black) draws nothing on the PSX, so neither do we. Otherwise a
+     * replacement that comes out black stays opaque black (0x8000 = black+STP
+     * is already non-zero; plain black gets the 1-LSB floor so put_textured does
+     * not read it as a cutout). */
+    if (native_texel == 0) return 0;
+    if (c == 0 && !(native_texel & 0x8000)) c = 0x0001;
     *out = (uint16_t)(c | (native_texel & 0x8000));
     return 1;
 }
@@ -1052,7 +1064,7 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
         int rw = umax - umin, rh = vmax - vmin;
         if (rw <= 0 || (rw & 7)) rw += 1;
         if (rh <= 0 || (rh & 7)) rh += 1;
-        g_rep = texture_pack_lookup_rect(texpage, clut_x, clut_y, umin, vmin, rw, rh);
+        g_rep = texture_pack_lookup_rect_mod(texpage, clut_x, clut_y, umin, vmin, rw, rh, g_rep_mod);
         g_rep_u0 = umin; g_rep_v0 = vmin; g_rep_w = rw; g_rep_h = rh;
     }
     if (g_hr) {
@@ -1369,7 +1381,7 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
     RTarget n = rt_native();
     raster_textured_rect(&n, x, y, w, h, u, v, clut_x, clut_y, texpage);
     if (g_texture_pack_replace && (g_hr || g_wide_cur)) {
-        g_rep = texture_pack_lookup_rect(texpage, clut_x, clut_y, u, v, w, h);
+        g_rep = texture_pack_lookup_rect_mod(texpage, clut_x, clut_y, u, v, w, h, g_rep_mod);
         g_rep_u0 = u; g_rep_v0 = v; g_rep_w = w; g_rep_h = h;
     }
     if (g_hr) {
@@ -1472,7 +1484,7 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
     raster_textured_rect_scaled(&n, x, y, w, h, u0, v0, u1, v1,
                                 clut_x, clut_y, texpage);
     if (g_texture_pack_replace && (g_hr || g_wide_cur) && u1 > u0 && v1 > v0) {
-        g_rep = texture_pack_lookup_rect(texpage, clut_x, clut_y, u0, v0, u1 - u0, v1 - v0);
+        g_rep = texture_pack_lookup_rect_mod(texpage, clut_x, clut_y, u0, v0, u1 - u0, v1 - v0, g_rep_mod);
         g_rep_u0 = u0; g_rep_v0 = v0; g_rep_w = u1 - u0; g_rep_h = v1 - v0;
     }
     if (g_hr) {
@@ -1755,6 +1767,16 @@ int sw_render_display(uint32_t *out_pixels, int out_pitch,
     }
 
     return count;
+}
+
+/* Debug peek of the hi-res mirror: the S× block at native (x,y) — 0 = mirror
+ * disabled. Lets probes diff g_hr against native VRAM (vram_peek "hires"). */
+uint16_t sw_hires_peek(int x, int y, int sx, int sy) {
+    if (!g_hr || g_scale <= 1) return 0;
+    int s = g_scale;
+    x = ((x & (VRAM_WIDTH - 1)) * s + (sx % s)) % g_hr_w;
+    y = ((y & (VRAM_HEIGHT - 1)) * s + (sy % s)) % g_hr_h;
+    return g_hr[(size_t)y * g_hr_w + x];
 }
 
 int sw_render_display_hires(uint32_t *out_pixels, int out_pitch,

@@ -380,7 +380,7 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
  * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
  * fragment shader read the noperspective varying — i.e. bit-identical to the
  * pre-feature pipeline. */
-#define TEXV 28   /* 20 + rep_org(4) + rep_atlas(4): texture-pack replacement (docs/TEXTURE_PACKS.md) */
+#define TEXV 36   /* 20 + rep_org(4) + rep_atlas(4) + rep_mod(4) + rep_off(4): texture-pack replacement (docs/TEXTURE_PACKS.md) */
 static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
 static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
 
@@ -963,6 +963,8 @@ static const char *TEX_VS =
     "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
     "layout(location=10) in vec4 a_rep_org;   /* texture-pack: prim texel rect u0,v0,w,h */\n"
     "layout(location=11) in vec4 a_rep_atlas; /* texture-pack: atlas rect x,y,w,h; w=0 none */\n"
+    "layout(location=12) in vec3 a_rep_mod;   /* texture-pack: palette fade scale */\n"
+    "layout(location=13) in vec3 a_rep_off;   /* texture-pack: palette fade offset (0..1 units) */\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
@@ -973,9 +975,9 @@ static const char *TEX_VS =
     "flat out int v_persp;\n"
     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
     "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
-    "flat out vec4 v_rep_org; flat out vec4 v_rep_atlas;\n"
+    "flat out vec4 v_rep_org; flat out vec4 v_rep_atlas; flat out vec3 v_rep_mod; flat out vec3 v_rep_off;\n"
     "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
-    "  v_rep_org = a_rep_org; v_rep_atlas = a_rep_atlas;\n"
+    "  v_rep_org = a_rep_org; v_rep_atlas = a_rep_atlas; v_rep_mod = a_rep_mod; v_rep_off = a_rep_off;\n"
     "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
     "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
     "  v_depth = int(a_depth + 0.5); v_raw = int(a_raw + 0.5);\n"
@@ -1009,6 +1011,8 @@ static const char *TEX_FS =
     "flat in int v_semi;      /* GP0 command has semi-transparency enabled */\n"
     "flat in vec4 v_rep_org;  /* texture-pack replacement: prim texel rect (u0,v0,w,h) */\n"
     "flat in vec4 v_rep_atlas;/* ... its atlas rect (x,y,w,h); w == 0 -> native texels */\n"
+    "flat in vec3 v_rep_mod;  /* ... palette fade scale (1,1,1 = as authored) */\n"
+    "flat in vec3 v_rep_off;  /* ... palette fade offset (0 = as authored) */\n"
     "uniform usampler2D u_vram;\n"
     "uniform sampler2D u_atlas; /* texture-pack atlas (RGBA8) */\n"
     "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
@@ -1057,8 +1061,9 @@ static const char *TEX_FS =
     "    vec4 rc = texelFetch(u_atlas, ap, 0);\n"
     "    if (rc.a < 0.5) discard;\n"
     "    int rawn = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
+    "    if (rawn == 0) discard;   /* transparency is the native texel's (index 0 / palette faded to 0) */\n"
     "    stp = (rawn >> 15) & 1;\n"
-    "    rgb = rc.rgb;\n"
+    "    rgb = clamp(rc.rgb * v_rep_mod + v_rep_off, 0.0, 1.0);\n"
     "  } else if (u_filter == 0) {\n"
     "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
     "    if (raw == 0) discard;\n"
@@ -2021,18 +2026,23 @@ static void gl_atlas_sync(void) {
         fprintf(stdout, "psxrecomp: texture pack atlas %dx%d: %d images placed, %d did not fit\n",
                      size, size, s_atlas_placed, s_atlas_dropped);
 }
-/* Fill rep[8] = {u0,v0,w,h, ax,ay,aw,ah} for a prim's texel rect; aw = 0 when
- * there is no replacement. */
+/* Fill rep[14] = {u0,v0,w,h, ax,ay,aw,ah, scale rgb, offset rgb (0..1)} for a
+ * prim's texel rect; aw = 0 when there is no replacement. */
+#define GL_REP_N 14
 static void gl_rep_for_rect(uint16_t texpage, uint16_t clut_x, uint16_t clut_y,
-                            int u, int v, int w, int h, float rep[8]) {
-    rep[0] = rep[1] = rep[2] = rep[3] = rep[4] = rep[5] = rep[6] = rep[7] = 0.0f;
+                            int u, int v, int w, int h, float rep[GL_REP_N]) {
+    for (int k = 0; k < 8; k++) rep[k] = 0.0f;
+    rep[8] = rep[9] = rep[10] = 1.0f; rep[11] = rep[12] = rep[13] = 0.0f;
     if (!g_texture_pack_replace) return;
     gl_atlas_sync();
     if (!s_atlas_tex) return;
-    const TexPackImage *im = texture_pack_lookup_rect(texpage, clut_x, clut_y, u, v, w, h);
+    float mod[6];
+    const TexPackImage *im = texture_pack_lookup_rect_mod(texpage, clut_x, clut_y, u, v, w, h, mod);
     if (!im || im->atlas_x < 0) return;
     rep[0] = (float)u; rep[1] = (float)v; rep[2] = (float)w; rep[3] = (float)h;
     rep[4] = (float)im->atlas_x; rep[5] = (float)im->atlas_y; rep[6] = (float)im->w; rep[7] = (float)im->h;
+    rep[8] = mod[0]; rep[9] = mod[1]; rep[10] = mod[2];
+    rep[11] = mod[3] / 255.0f; rep[12] = mod[4] / 255.0f; rep[13] = mod[5] / 255.0f;
 }
 
 static void gpu_textured_triangle(const int *xs, const int *ys,
@@ -2126,6 +2136,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
             vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
             for (int k = 0; k < 8; k++) vp[20 + k] = rep ? rep[k] : 0.0f;   /* a_rep_org, a_rep_atlas */
+            vp[28] = rep ? rep[8] : 1.0f; vp[29] = rep ? rep[9] : 1.0f; vp[30] = rep ? rep[10] : 1.0f; vp[31] = 0.0f; /* a_rep_mod */
+            vp[32] = rep ? rep[11] : 0.0f; vp[33] = rep ? rep[12] : 0.0f; vp[34] = rep ? rep[13] : 0.0f; vp[35] = 0.0f; /* a_rep_off */
         }
         s_tb_n += 3;
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
@@ -2219,7 +2231,7 @@ static void gpu_textured_rect(int x,int y,int w,int h,
     psx_uv_rect_limits(u0, v0, u1, v1, lim);
     /* texture-pack replacement: identify the ORIGINAL (unbumped) texel span;
      * a mirrored rect (u0 > u1) samples the same image, mirrored by its uvs */
-    float rep[8];
+    float rep[GL_REP_N];
     {
         int ru = u0 < u1 ? u0 : u1, rv = v0 < v1 ? v0 : v1;
         int rw = u0 < u1 ? u1 - u0 : u0 - u1, rh = v0 < v1 ? v1 - v0 : v0 - v1;
@@ -2441,7 +2453,7 @@ static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
     /* texture-pack replacement: uv bbox with the same inclusive/exclusive
      * span rule as texture_pack_note_tri / the software renderer */
-    float rep[8];
+    float rep[GL_REP_N];
     {
         int umin = u0 < u1 ? (u0 < u2 ? u0 : u2) : (u1 < u2 ? u1 : u2);
         int umax = u0 > u1 ? (u0 > u2 ? u0 : u2) : (u1 > u2 ? u1 : u2);
@@ -2832,6 +2844,8 @@ static int init_gpu_raster(void) {
         p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
         p_glVertexAttribPointer(10, 4, GL_FLOAT, GL_FALSE, st, (void*)(20*sizeof(float))); p_glEnableVertexAttribArray(10); /* rep_org   */
         p_glVertexAttribPointer(11, 4, GL_FLOAT, GL_FALSE, st, (void*)(24*sizeof(float))); p_glEnableVertexAttribArray(11); /* rep_atlas */
+        p_glVertexAttribPointer(12, 3, GL_FLOAT, GL_FALSE, st, (void*)(28*sizeof(float))); p_glEnableVertexAttribArray(12); /* rep_mod   */
+        p_glVertexAttribPointer(13, 3, GL_FLOAT, GL_FALSE, st, (void*)(32*sizeof(float))); p_glEnableVertexAttribArray(13); /* rep_off   */
     }
 
     p_glGenVertexArrays(1, &s_blit_vao);

@@ -90,6 +90,7 @@ int sw_render_display(uint32_t* out_pixels, int out_pitch,
 /* Like sw_render_display, but reads the hi-res mirror and emits the region
    at (disp_w*scale x disp_h*scale). Falls back to sw_render_display when
    supersampling is disabled. Returns number of pixels written. */
+uint16_t sw_hires_peek(int x, int y, int sx, int sy);
 int sw_render_display_hires(uint32_t* out_pixels, int out_pitch,
                             int disp_x, int disp_y, int disp_w, int disp_h);
 

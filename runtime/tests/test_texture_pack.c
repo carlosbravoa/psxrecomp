@@ -85,6 +85,87 @@ int main(void) {
     assert(strstr(st, "\"loaded\":2") && strstr(st, "\"hits\":1"));
     texture_pack_unload();
     assert(!g_texture_pack_replace && texture_pack_lookup_rect(tpage(512, 0, 0), 0, 480, 0, 0, 16, 16) == NULL);
+    /* B9: fade-aware palette factor. Reference CLUT = CLUT A; live CLUT D at (48,480) = A at half
+     * brightness -> factor ~0.5 per channel; against A itself -> exactly 1. */
+    {
+        uint16_t ref[16];
+        for (int i = 0; i < 16; i++) {
+            ref[i] = (uint16_t)(0x8000 | ((i * 2) & 31) | (((i * 2) & 31) << 5) | (((i * 2) & 31) << 10));
+            vram[480 * 1024 + i] = ref[i];                                        /* CLUT A (rewrite) */
+            const int hv = (i * 2) / 2;
+            vram[480 * 1024 + 48 + i] = (uint16_t)(0x8000 | hv | (hv << 5) | (hv << 10)); /* CLUT D = half */
+        }
+        float m[6];
+        texture_pack_palette_mod(ref, 16, 0, 480, m);
+        assert(m[0] == 1.0f && m[1] == 1.0f && m[2] == 1.0f && m[3] == 0.0f);
+        texture_pack_palette_mod(ref, 16, 48, 480, m);
+        /* half brightness: the multiplicative fit wins (offset 0) with ~0.5 */
+        assert(m[3] == 0.0f && m[0] > 0.4f && m[0] < 0.6f && m[1] > 0.4f && m[1] < 0.6f && m[2] > 0.4f && m[2] < 0.6f);
+        /* subtractive PSX fade: CLUT E at (64,480) = A minus 6 per channel, clamped -> offset ~ -6*255/31 */
+        for (int i = 0; i < 16; i++) {
+            int v = (i * 2) & 31; int d = v - 6; if (d < 0) d = 0;
+            vram[480 * 1024 + 64 + i] = (uint16_t)(0x8000 | d | (d << 5) | (d << 10));
+        }
+        texture_pack_palette_mod(ref, 16, 64, 480, m);
+        assert(m[0] == 1.0f && m[3] < -40.0f && m[3] > -58.0f && m[4] == m[3] && m[5] == m[3]);
+        /* a permuted palette (reversed) is NOT a fade: identity */
+        for (int i = 0; i < 16; i++) vram[480 * 1024 + 80 + i] = ref[15 - i];
+        texture_pack_palette_mod(ref, 16, 80, 480, m);
+        assert(m[0] == 1.0f && m[1] == 1.0f && m[2] == 1.0f && m[3] == 0.0f);
+        /* a palette-agnostic entry with a .clut sidecar: dumped .clut is copied as <tex>.clut */
+        char src[400], dst[400];
+        snprintf(src, sizeof src, "%s/%016llx-%016llx.clut", dir, (unsigned long long)t1, (unsigned long long)p1);
+        snprintf(dst, sizeof dst, "%s/%016llx.clut", dir, (unsigned long long)t1);
+        FILE *fi = fopen(src, "rb"); assert(fi);
+        uint8_t raw[32]; assert(fread(raw, 1, 32, fi) == 32); fclose(fi);
+        FILE *fo = fopen(dst, "wb"); assert(fo); fwrite(raw, 1, 32, fo); fclose(fo);
+        char any[400];
+        snprintf(any, sizeof any, "%s/%016llx.png", dir, (unsigned long long)t1);
+        snprintf(src, sizeof src, "%s/%016llx-%016llx.png", dir, (unsigned long long)t1, (unsigned long long)p1);
+        assert(rename(src, any) == 0);           /* make it the palette-agnostic image */
+        assert(texture_pack_load(dir) >= 1);
+        /* the texture at (512,0) still has palette A live: exact hash -> factor 1 */
+        const TexPackImage *im2 = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 0, 480, 0, 0, 16, 16, m);
+        assert(im2 && im2->ref_n == 16 && m[0] == 1.0f);
+        /* draw the same texels with the half-bright CLUT D -> ~0.5 factor, and hits counted */
+        im2 = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 48, 480, 0, 0, 16, 16, m);
+        assert(im2 && m[0] > 0.4f && m[0] < 0.6f && im2->hits == 2);
+        texture_pack_stats_json(st, sizeof st);
+        assert(strstr(st, "\"used\":1"));
+        char up[400]; snprintf(up, sizeof up, "%s/usage.tsv", dir);
+        assert(texture_pack_write_usage(up) >= 1);
+        texture_pack_unload();
+
+        /* Genuine recolour variant: <tex>-<palR>.png + .clut where R = the reversed
+         * palette (not a fade of A). Live CLUT F = R minus 4 (a fade of the
+         * RECOLOUR): the lookup must pick the variant, with a subtractive mod,
+         * not the palette-agnostic entry. */
+        uint16_t refR[16];
+        for (int i = 0; i < 16; i++) refR[i] = ref[15 - i];
+        for (int i = 0; i < 16; i++) vram[480 * 1024 + 80 + i] = refR[i];          /* CLUT R (80,480) */
+        const uint64_t pR = texture_pack_hash_palette(tpage(512, 0, 0), 80, 480);
+        char var[400], varc[400];
+        snprintf(var, sizeof var, "%s/%016llx-%016llx.png", dir, (unsigned long long)t1, (unsigned long long)pR);
+        snprintf(varc, sizeof varc, "%s/%016llx-%016llx.clut", dir, (unsigned long long)t1, (unsigned long long)pR);
+        snprintf(cmd, sizeof cmd, "cp '%s' '%s'", any, var); assert(system(cmd) == 0);
+        fo = fopen(varc, "wb"); assert(fo);
+        for (int i = 0; i < 16; i++) { uint8_t b2[2] = { (uint8_t)(refR[i] & 0xFF), (uint8_t)(refR[i] >> 8) }; fwrite(b2, 1, 2, fo); }
+        fclose(fo);
+        for (int i = 0; i < 16; i++) {                                              /* CLUT F (96,480) = R - 4 */
+            int r = refR[i] & 31, g = (refR[i] >> 5) & 31, b = (refR[i] >> 10) & 31;
+            r -= 4; g -= 4; b -= 4; if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0;
+            vram[480 * 1024 + 96 + i] = (uint16_t)(0x8000 | r | (g << 5) | (b << 10));
+        }
+        assert(texture_pack_load(dir) >= 2);
+        const TexPackImage *imR = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 80, 480, 0, 0, 16, 16, m);
+        const TexPackImage *imA = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 0, 480, 0, 0, 16, 16, m);
+        assert(imR && imA && imR != imA);                                           /* exact variants */
+        const TexPackImage *imF = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 96, 480, 0, 0, 16, 16, m);
+        assert(imF == imR && m[0] == 1.0f && m[3] < -25.0f && m[3] > -40.0f);        /* fade of R -> R, offset ~ -4*255/31 */
+        imF = texture_pack_lookup_rect_mod(tpage(512, 0, 0), 48, 480, 0, 0, 16, 16, m);
+        assert(imF == imA && m[0] > 0.4f && m[0] < 0.6f);                            /* half of A -> A */
+        texture_pack_unload();
+    }
     puts("texture_pack_test: OK");
     return 0;
 }

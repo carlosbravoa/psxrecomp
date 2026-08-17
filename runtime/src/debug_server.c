@@ -26,7 +26,8 @@
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
-#include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
+#include "gpu_render.h"
+#include "gpu_sw_renderer.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
 #include "present_ring.h"
 #include "load_transition_ring.h"
 #include "cdrom.h"
@@ -6061,6 +6062,13 @@ static void handle_texture_pack(int id, const char *json)
         if (texture_pack_load(dir) <= 0) { send_err(id, "no <tex_id>[-<pal_id>].png images found"); return; }
     } else if (strcmp(op, "unload") == 0) {
         texture_pack_unload();
+    } else if (strcmp(op, "usage") == 0) {
+        /* {"op":"usage","path":"/abs/usage.tsv"}: per-image draw counts, so a
+         * pack author sees which images were never drawn (stale ids). */
+        char path[1024] = "";
+        json_get_str(json, "path", path, sizeof(path));
+        if (!path[0]) { send_err(id, "missing path"); return; }
+        if (texture_pack_write_usage(path) < 0) { send_err(id, "cannot write path"); return; }
     }
     char st[512];
     texture_pack_stats_json(st, sizeof st);
@@ -9091,13 +9099,14 @@ static void handle_vram_peek(int id, const char *json)
     if (h < 1) h = 1;
     if (w > 128) w = 128;
     if (h > 128) h = 128;
+    int hires = json_get_int(json, "hires", 0);   /* 1 = software hi-res mirror (top-left subsample) */
     size_t hex_len = (size_t)w * h * 4 + 1;
     char *hex = (char *)malloc(hex_len);
     if (!hex) { send_err(id, "alloc failed"); return; }
     int pos = 0;
     for (int row = 0; row < h; row++) {
         for (int col = 0; col < w; col++) {
-            uint16_t p = gpu_vram_peek(x + col, y + row);
+            uint16_t p = hires ? sw_hires_peek(x + col, y + row, 0, 0) : gpu_vram_peek(x + col, y + row);
             pos += snprintf(hex + pos, hex_len - pos, "%04x", p);
         }
     }
