@@ -69,6 +69,18 @@ struct WidescreenCullKeepSite {
     uint32_t result = 0;   // forced comparison result (0 or 1)
 };
 
+// One screen-EDGE bound in a 2D title's game logic: an `addi[u] rt,rs,imm`
+// (or `subu rd,rs,rt` for the left side) that computes camX-relative keep-
+// alive / on-screen / spawn bounds from the 4:3 width. `side` names which
+// reveal moves it: 0 left (bound -= left margin), 1 right (bound += right
+// margin), 2 width (a right bound derived from the left bound: += left+right).
+// Full-word guarded so overlay variants at the same VA are untouched.
+struct WidescreenCullEdgeSite {
+    uint32_t address = 0;
+    uint32_t expected = 0; // guarded ADDI/ADDIU/SUBU instruction
+    uint32_t side = 0;     // 0 left, 1 right, 2 width
+};
+
 // Aspect-scaled 12-bit angular half-extent. These sites load a positive angle
 // constant with `addi[u] rt,zero,imm`; the runtime widens tan(angle) by the
 // live horizontal reveal factor. Full-word guards prevent overlay-address
@@ -850,6 +862,12 @@ struct GameConfig {
     // where maximal overdraw is preferable to range guessing. Each entry is
     // guarded by the complete MIPS word; 4:3 executes the vanilla comparison.
     std::vector<WidescreenCullKeepSite> ws_cull_keep_sites;
+    // [[widescreen.cull.edge]] — camX-relative screen-edge bounds in a 2D
+    // title's game logic (keep-alive, on-screen, spawn strips) that carry the
+    // 4:3 width as an immediate; moved by the per-side reveal so objects live,
+    // act and spawn just off the WIDE edge exactly as they did off the 4:3
+    // one. Empty by default; identity at 4:3; regen required.
+    std::vector<WidescreenCullEdgeSite> ws_cull_edge_sites;
     // Exact 12-bit angular half-extents used by terrain-cell frusta.
     std::vector<WidescreenAngleSite> ws_cull_angle_sites;
     // Full-word-guarded model-participation cosine compares widened only in
@@ -967,6 +985,17 @@ struct GameConfig {
     // fill the wide frame, so it stops pillarboxing at the reveal margins.
     // Runtime-only — no regen. Off by default.
     bool ws_nw_backdrop = false;
+
+    // [widescreen] nw_anchor — how the native-wide reveal splits between the
+    // sides: "center" (default: half each side), "left" (the wide frame's left
+    // edge is the 4:3 left edge; the whole reveal is on the right) or "right".
+    // A side-scroller whose gameplay is authored against the 4:3 left edge
+    // keeps every left-side alignment with "left". Runtime-only — no regen.
+    int ws_nw_anchor = 0;   // 0 center, 1 left, 2 right
+    // [widescreen] nw_anchor_gate — "always" (default) or "bg2d": the anchor
+    // applies only on frames the [widescreen.bg2d] tile renderer ran (the
+    // stage world); other frames (menus, title, results) use the centred split.
+    int ws_nw_anchor_gate = 0;   // 0 always, 1 bg2d
 
     // [widescreen] clear_reveal — opt a title into synthetic native-wide margin
     // cleanup. A game-specific stage/map boundary can clear only proven-void

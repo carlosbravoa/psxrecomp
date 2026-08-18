@@ -311,7 +311,10 @@ static VkFramebuffer  s_wide_fb[VK_WIDE_MAX_SURF];
 static VkImageLayout  s_wide_layout[VK_WIDE_MAX_SURF];
 static int            s_wide_base[VK_WIDE_MAX_SURF] = { -1, -1, -1, -1 };
 static int            s_wide_w = 0;        /* wide width (native px); 0 = disabled */
-static int            s_wide_offset = 0;   /* centering OFFSET (native px) */
+static int            s_wide_offset = 0;   /* LEFT reveal / x-translation (native px) */
+static int            s_wide_native_w = 0; /* canonical framebuffer width (native px) */
+static inline int wide_left_margin(void)  { return s_wide_offset; }
+static inline int wide_right_margin(void) { return s_wide_w - s_wide_offset - s_wide_native_w; }
 static int            s_wide_cur = -1;     /* active mirror surface index, -1 = none */
 static int            s_wide_cur_base = 0;
 static void wide_free_all(void);           /* defined with the wide helpers below */
@@ -1851,7 +1854,7 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
 
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
-    int native_w = s_wide_w - 2 * s_wide_offset;
+    int native_w = s_wide_native_w;
     if (native_w <= 0) native_w = s_wide_w;
     VkOffset3D dst[2];
     letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
@@ -2828,7 +2831,7 @@ static void vkb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
      * margins are dimmed/faded too. Same detection as GL/SW. */
     int overlay = 0;
     if (s_wide_cur >= 0) {
-        int native_w = s_wide_w - 2 * s_wide_offset;
+        int native_w = s_wide_native_w;
         int lx = x - s_wide_cur_base, rx = x + w - s_wide_cur_base;
         overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
     }
@@ -3117,14 +3120,15 @@ static void vkb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
  * disable (wide_w <= 0). No-ops when nothing changed (gpu.c calls this on
  * every draw-area set via ws_nw_sync_target — Part-A lesson: the wide entry
  * points sit inside guest emulation, keep the common path free). */
-static void vkb_wide_configure(int wide_w, int offset) {
+static void vkb_wide_configure(int wide_w, int offset, int native_w) {
     if (!s_ready) return;
-    if (wide_w == s_wide_w && offset == s_wide_offset) return;
+    if (wide_w == s_wide_w && offset == s_wide_offset && native_w == s_wide_native_w) return;
     flush_tex_batch(); flush_geometry();
-    if (wide_w <= 0) { wide_free_all(); s_wide_w = 0; s_wide_offset = 0; return; }
+    if (wide_w <= 0) { wide_free_all(); s_wide_w = 0; s_wide_offset = 0; s_wide_native_w = 0; return; }
     if (wide_w != s_wide_w) wide_free_all();
     s_wide_w = wide_w;
     s_wide_offset = offset;
+    s_wide_native_w = native_w;
 }
 
 /* Select the wide surface to mirror into for the back buffer at base_x. */
@@ -3184,17 +3188,21 @@ static void vkb_wide_clear(int base_x, int y, int h, uint16_t color) {
 /* Clear only the two synthetic reveal strips, leaving the guest-owned centre
  * intact. Mirrors the software/OpenGL opt-in transition cleanup. */
 static void vkb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
-    if (!s_ready || s_wide_w <= 0 || s_wide_offset <= 0) return;
+    if (!s_ready || s_wide_w <= 0 ||
+        (wide_left_margin() <= 0 && wide_right_margin() <= 0)) return;
     flush_tex_batch(); flush_geometry();
     int i = wide_surf_for(base_x);
     if (i < 0) return;
     s_perf_cur.wide_clears++;
     int S = s_scale, H = VRAM_H * S;
-    int W = s_wide_w * S, margin = s_wide_offset * S;
+    int W = s_wide_w * S;
+    int lm = wide_left_margin() * S, rm = wide_right_margin() * S;
+    if (lm < 0) lm = 0;
+    if (rm < 0) rm = 0;
     int y0 = y * S, y1 = (y + h) * S;
     if (y0 < 0) y0 = 0;
     if (y1 > H) y1 = H;
-    if (y1 <= y0 || margin * 2 >= W) return;
+    if (y1 <= y0 || lm + rm >= W) return;
     VkCommandBuffer cb = begin_oneshot();
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     color_self_barrier(cb, s_wide_img[i]);
@@ -3215,10 +3223,10 @@ static void vkb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     ca[1].clearValue.depthStencil.stencil = (color >> 15) & 1;
     VkClearRect cr[2];
     uint32_t ncr = 0;
-    if (sides & 1)
-        cr[ncr++] = (VkClearRect){ { { 0, y0 }, { (uint32_t)margin, (uint32_t)(y1 - y0) } }, 0, 1 };
-    if (sides & 2)
-        cr[ncr++] = (VkClearRect){ { { W - margin, y0 }, { (uint32_t)margin, (uint32_t)(y1 - y0) } }, 0, 1 };
+    if ((sides & 1) && lm > 0)
+        cr[ncr++] = (VkClearRect){ { { 0, y0 }, { (uint32_t)lm, (uint32_t)(y1 - y0) } }, 0, 1 };
+    if ((sides & 2) && rm > 0)
+        cr[ncr++] = (VkClearRect){ { { W - rm, y0 }, { (uint32_t)rm, (uint32_t)(y1 - y0) } }, 0, 1 };
     if (ncr) p_vkCmdClearAttachments(cb, 2, ca, ncr, cr);
     p_vkCmdEndRenderPass(cb);
     end_oneshot(cb);

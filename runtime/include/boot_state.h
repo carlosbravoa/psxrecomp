@@ -142,6 +142,26 @@ int  boot_state_check_buffer(const uint8_t* file, size_t file_len,
                              uint32_t bios_checksum, uint32_t entry_pc,
                              char* reason, size_t reason_cap);
 
+/* Flag for the _ex variants: accept an image whose build key (codegen hash /
+ * ABI tag / codegen version) differs from this build. Correct for USER
+ * savestates and bookmarks — the image is a complete hardware snapshot and
+ * every host-side structure is re-derived from the restored guest RAM — so a
+ * recompiler rebuild does not orphan the player's saves. The fast-boot
+ * snapshot, the rewind ring and netplay pins keep the strict key. BIOS
+ * checksum and entry PC are always required. */
+#define BOOT_STATE_ANY_BUILD 1u
+int  boot_state_check_buffer_ex(const uint8_t* file, size_t file_len,
+                                uint32_t bios_checksum, uint32_t entry_pc,
+                                char* reason, size_t reason_cap,
+                                unsigned flags);
+int  boot_state_load_buffer_ex(const uint8_t* file, size_t file_len,
+                               uint32_t bios_checksum, uint32_t entry_pc,
+                               CPUState* cpu, unsigned flags);
+int  boot_state_load_ex(const char* path, uint32_t bios_checksum,
+                        uint32_t entry_pc, CPUState* cpu, unsigned flags);
+/* 1 if the image's build key equals this build's (diagnostic). */
+int  boot_state_buffer_build_matches(const uint8_t* file, size_t file_len);
+
 /* Register a deferred capture: when boot_state_trigger_capture() fires (from
  * fntrace at game-start), serialize to path. One-shot. */
 void boot_state_set_capture(const char* path, uint32_t bios_checksum,

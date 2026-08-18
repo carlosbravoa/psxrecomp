@@ -184,6 +184,14 @@ int psx_ws_backdrop_x(int x) {
 int psx_ws_x_margin(void) {
     return g_cbs.ws_x_margin ? g_cbs.ws_x_margin() : 0;
 }
+/* Per-side reveal margins (ABI v22, [widescreen] nw_anchor). A host that
+ * predates them is symmetric: both sides equal psx_ws_x_margin(). */
+int psx_ws_x_margin_left(void) {
+    return g_cbs.ws_x_margin_left ? g_cbs.ws_x_margin_left() : psx_ws_x_margin();
+}
+int psx_ws_x_margin_right(void) {
+    return g_cbs.ws_x_margin_right ? g_cbs.ws_x_margin_right() : psx_ws_x_margin();
+}
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x).
  * The recompiler emits `rt = psx_ws_cull_sltiu(sx, imm)` at every width-compare
  * cull site, INCLUDING in overlay-resident code, so the overlay DLL must define
@@ -192,24 +200,24 @@ int psx_ws_x_margin(void) {
  * depends only on psx_ws_x_margin() above. Identity at 4:3 (margin 0). MUST stay
  * byte-for-byte identical to gpu.c psx_ws_cull_sltiu. */
 int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
-    int m = psx_ws_x_margin();
-    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
-            < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
+    int ml = psx_ws_x_margin_left(), mr = psx_ws_x_margin_right();
+    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + ml)
+            < (uint32_t)((int32_t)imm + ml + mr)) ? 1 : 0;
 }
 /* Signed-funnel variants (min/max + center±halfwidth idioms). Same contract:
  * self-contained, identity at margin 0, MUST stay byte-for-byte identical to
  * the gpu.c implementations. */
 int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
-    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin_right()) ? 1 : 0;
 }
 int psx_ws_cull_bltz(uint32_t v) {
-    return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)v < -psx_ws_x_margin_left()) ? 1 : 0;
 }
 int psx_ws_cull_vxrange(uint32_t x, uint32_t imm) {
-    int32_t margin = psx_ws_x_margin();
+    int32_t ml = psx_ws_x_margin_left(), mr = psx_ws_x_margin_right();
     uint32_t bound = (uint32_t)(int32_t)(int16_t)(uint16_t)imm;
-    return (((x + (uint32_t)margin) & 0xFFFFu) <
-            (bound + 2u * (uint32_t)margin)) ? 1 : 0;
+    return (((x + (uint32_t)ml) & 0xFFFFu) <
+            (bound + (uint32_t)(ml + mr))) ? 1 : 0;
 }
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);

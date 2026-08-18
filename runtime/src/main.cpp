@@ -1654,6 +1654,29 @@ static void headless_capture_present(void) {
     if (di.depth24 && g_fmv_pack_active && fmv_pack_current(&fpx, &fw, &fh)) {
         px = fpx; ow = fw; oh = fh;
     } else
+    /* Native-wide game frame: the wide compositor surface, exactly what the
+     * windowed software present shows (w + nw_extra wide, at gr_scale()). */
+    if (const bool wide = (!di.depth24 && g_ws_engaged && !gpu_ws_present_native_43() &&
+                           ws_native_wide_active() && gr_wide_supported() && ws_nw_extra() > 0);
+        wide) {
+        const int s = gr_scale() > 0 ? gr_scale() : 1;
+        const int pw = w + ws_nw_extra();
+        std::vector<uint32_t> wsurf((size_t)pw * s * (size_t)h * s);
+        if (gr_render_wide_display(wsurf.data(), (int)(pw * s * sizeof(uint32_t)),
+                                   (int)di.display_x, (int)di.display_y, h) > 0) {
+            src.swap(wsurf); px = src.data(); ow = pw * s; oh = h * s;
+            if (s > 1 && video_filter_applies_at_scale(kind, s)) {
+                filtered.resize((size_t)ow * oh);
+                if (video_filter_apply_cpu_ss(kind, px, ow, ow, oh, filtered.data(), ow, s))
+                    px = filtered.data();
+            } else if (s == 1 && kind != VF_NONE && n > 1) {
+                filtered.resize((size_t)ow * n * (size_t)oh * n);
+                if (video_filter_apply_cpu(kind, px, ow, ow, oh, filtered.data(), ow * n) == n) {
+                    px = filtered.data(); ow *= n; oh *= n;
+                }
+            }
+        }
+    } else
     /* Supersampled present (software hi-res mirror): capture what the windowed
      * present would show — the S× picture with the display looks in place,
      * upscalers stood down (video_filter.h, "supersampled source"). */
@@ -6718,6 +6741,26 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     }
 #endif
 
+    /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. Runs
+     * BEFORE the headless early-out on purpose: a mod-selected wide aspect
+     * engages exactly as in a window, so headless scripts can verify the
+     * native-wide cull/bg2d/spawn helpers and capture the wide frame
+     * (present_capture). It used to sit after the early-out, so a headless
+     * run always reported mode 0 — indistinguishable from a broken config. */
+    if (!g_ws_engaged) {
+        extern int fntrace_is_game_started(void);
+        if (fntrace_is_game_started()) {
+            g_ws_engaged = true;
+            int mode = g_ws_native_wide ? 2 : 1;
+            /* Native-wide: GTE drawn un-squashed — feed it the 4:3 ratio
+             * (identity squash). Squash mode: feed the real wide aspect. */
+            gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
+                                   mode == 1 ? g_video_aspect_den : 3);
+            gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
+                             g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0, mode);
+        }
+    }
+
     if (g_headless) {
         ep.skip_pace = 1;
         /* Windowless present capture (bug_report screen.png / present_capture):
@@ -6893,21 +6936,6 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * sticks and depth24_fix_trailing_margin blanks the whole FMV forever. */
     if (gpu_depth24_present_hold_tick())
         return ep;
-    /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
-    if (!g_ws_engaged) {
-        extern int fntrace_is_game_started(void);
-        if (fntrace_is_game_started()) {
-            g_ws_engaged = true;
-            int mode = g_ws_native_wide ? 2 : 1;
-            /* Native-wide: GTE drawn un-squashed — feed it the 4:3 ratio
-             * (identity squash). Squash mode: feed the real wide aspect. */
-            gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
-                                   mode == 1 ? g_video_aspect_den : 3);
-            gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
-                             g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0, mode);
-        }
-    }
-
     /* Rollback resim (§33/§47): short catch-up keeps hold-last; long catch-up
      * periodically presents live Replay VRAM so the display shows progress
      * while sim stays uncapped. TipHold invent-cap stall uses hold-last from
@@ -11328,6 +11356,9 @@ int main(int argc, char** argv) {
                                                 gc.ws_nw_left_hud_packet_hi);
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen] nw_anchor — centre / left / right split of the reveal. */
+            gpu_ws_set_nw_anchor(gc.ws_nw_anchor);
+            gpu_ws_set_nw_anchor_gate(gc.ws_nw_anchor_gate);
             /* [widescreen] nw_flat_backdrop — stretch flat sky/backdrop prims
              * in the native-wide mirror, preserving the canonical 4:3 image. */
             gpu_ws_set_nw_flat_backdrop(gc.ws_nw_flat_backdrop ? 1 : 0);
@@ -11371,6 +11402,16 @@ int main(int argc, char** argv) {
                 gc.ws_cull_plane_nx_sites.data(), (int)gc.ws_cull_plane_nx_sites.size());
             gpu_ws_set_xclip_load_sites(
                 gc.ws_cull_xclip_load_sites.data(), (int)gc.ws_cull_xclip_load_sites.size());
+            {
+                std::vector<uint32_t> addresses, expected, sides;
+                for (const auto& site : gc.ws_cull_edge_sites) {
+                    addresses.push_back(site.address);
+                    expected.push_back(site.expected);
+                    sides.push_back(site.side);
+                }
+                gpu_ws_set_cull_edge_sites(addresses.data(), expected.data(),
+                                           sides.data(), (int)addresses.size());
+            }
             {
                 std::vector<uint32_t> addresses, expected, results;
                 addresses.reserve(gc.ws_cull_keep_sites.size());

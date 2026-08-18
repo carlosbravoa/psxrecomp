@@ -4,7 +4,11 @@
 software renderer, unpaced (as fast as the host goes), launcher skipped. The
 debug server (debug builds) still listens; savestates, the software present,
 CPU video filters and telemetry (bug_report) all work; only the OpenGL/Vulkan
-presenters do not exist (no window).
+presenters do not exist (no window). Widescreen engages exactly as in a
+window (a mod-selected aspect goes native-wide at game entry — the engage step
+runs before the headless early-out) and `present_capture` writes the wide
+compositor frame, so `[widescreen]` work is verifiable headless: `gpu_state`
+reports `ws.mode/nw_extra/nw_left/nw_right/nw_anchor`.
 
 ## Session script (`runtime/src/psx_script.c`)
 

@@ -169,8 +169,8 @@ void gr_set_draw_offset(int x, int y)                { g_b->set_draw_offset(x, y
 
 /* Native-wide compositor — present only on backends that supply it. */
 int  gr_wide_supported(void) { return g_b->render_wide_display != 0; }
-void gr_wide_configure(int wide_w, int offset) {
-    if (g_b->wide_configure) g_b->wide_configure(wide_w, offset);
+void gr_wide_configure(int wide_w, int offset, int native_w) {
+    if (g_b->wide_configure) g_b->wide_configure(wide_w, offset, native_w);
 }
 void gr_wide_set_target(int base_x) {
     if (g_b->wide_set_target) g_b->wide_set_target(base_x);

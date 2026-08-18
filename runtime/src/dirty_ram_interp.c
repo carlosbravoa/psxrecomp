@@ -1685,10 +1685,15 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             return 0;
         case 0x22: /* SUB - overflow traps are delegated if they occur. */
         case 0x23: /* SUBU */
+            {
+            int32_t edge = 0;
             if (rs == 0 && psx_ws_is_cull_negsub_site(pc))
                 cpu->gpr[rd] = 0u - cpu->gpr[rt] - (uint32_t)psx_ws_x_margin();
+            else if (psx_ws_cull_edge_site(pc, insn, &edge))
+                cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt] + (uint32_t)edge;
             else
                 cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
+            }
             cpu->gpr[0] = 0;
             return 0;
         case 0x24: /* AND */
@@ -1852,8 +1857,11 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     case 0x08: /* ADDI rt, rs, simm — same as ADDIU, sans overflow trap (we don't model traps here) */
     {
         uint32_t widened = 0;
+        int32_t edge = 0;
         if (psx_ws_angle_site(pc, insn, &widened))
             cpu->gpr[rt] = widened;
+        else if (psx_ws_cull_edge_site(pc, insn, &edge))
+            cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm + (uint32_t)edge;
         else
             cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
                          + (psx_ws_is_cull_bias_site(pc)
@@ -1864,8 +1872,11 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     case 0x09: /* ADDIU rt, rs, simm */
     {
         uint32_t widened = 0;
+        int32_t edge = 0;
         if (psx_ws_angle_site(pc, insn, &widened))
             cpu->gpr[rt] = widened;
+        else if (psx_ws_cull_edge_site(pc, insn, &edge))
+            cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm + (uint32_t)edge;
         else
             cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
                          + (psx_ws_is_cull_bias_site(pc)

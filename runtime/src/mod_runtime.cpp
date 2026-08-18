@@ -43,6 +43,9 @@ extern "C" uint32_t psx_mod_memory_alloc(uint32_t size, uint32_t alignment);
 extern "C" uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size,
                                                   uint32_t alignment);
 extern "C" int psx_ws_x_margin(void);
+extern "C" int psx_ws_x_margin_left(void);
+extern "C" int psx_ws_x_margin_right(void);
+extern "C" void gpu_ws_set_nw_anchor_world(int on);
 extern "C" void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 extern "C" int fntrace_is_game_started(void);
 
@@ -1286,6 +1289,15 @@ extern "C" uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t size,
 
 extern "C" int32_t psx_mod_widescreen_x_margin(void) {
     return (int32_t)psx_ws_x_margin();
+}
+extern "C" int32_t psx_mod_widescreen_x_margin_left(void) {
+    return (int32_t)psx_ws_x_margin_left();
+}
+extern "C" int32_t psx_mod_widescreen_x_margin_right(void) {
+    return (int32_t)psx_ws_x_margin_right();
+}
+extern "C" void psx_mod_widescreen_set_world(int in_world) {
+    gpu_ws_set_nw_anchor_world(in_world);
 }
 
 extern "C" int psx_mod_register_function_entry_plugin(

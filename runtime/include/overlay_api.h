@@ -85,7 +85,12 @@
  *      model participation with queue-safe guard/hysteresis policy. */
 /* v21: ws_angle_widen forwarder for exact, aspect-scaled 12-bit terrain
  *      frustum half-angle constants. */
-#define PSX_OVERLAY_ABI_VERSION 21
+/* v22: ws_x_margin_left / ws_x_margin_right forwarders — the per-side reveal
+ *      margins of an anchored native-wide ([widescreen] nw_anchor); the
+ *      preamble's psx_ws_cull_* helpers and the [[widescreen.cull.edge]]
+ *      emits (psx_ws_x_margin_left/right in overlay-resident code) use them.
+ *      NULL falls back to the symmetric ws_x_margin (centred anchor). */
+#define PSX_OVERLAY_ABI_VERSION 22
 
 /* Process-lifetime overlay candidate capacity.  Every accepted manifest F
  * record consumes one slot, even when another DLL carries an identical
@@ -291,6 +296,11 @@ typedef struct {
 
     /* Aspect-scaled terrain-frustum angle helper (ABI v21). */
     uint32_t (*ws_angle_widen)(uint32_t vanilla);
+
+    /* Per-side native-wide reveal margins (ABI v22; [widescreen] nw_anchor).
+     * NULL = symmetric (both sides equal ws_x_margin). */
+    int  (*ws_x_margin_left)(void);
+    int  (*ws_x_margin_right)(void);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

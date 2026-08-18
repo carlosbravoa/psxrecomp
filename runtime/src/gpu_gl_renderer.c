@@ -519,7 +519,10 @@ static GLuint s_wide_rb[WIDE_MAX_SURF];      /* depth-stencil RB per surface (ma
                                               * attached the pass costs ~2us. */
 static int    s_wide_base[WIDE_MAX_SURF];    /* base_x per surface (-1 = free) */
 static int    g_wide_w        = 0;           /* wide width (native px); 0 = disabled */
-static int    g_wide_off      = 0;           /* centering OFFSET (native px) */
+static int    g_wide_off      = 0;           /* LEFT reveal / x-translation (native px) */
+static int    g_wide_native_w = 0;           /* canonical framebuffer width (native px) */
+static inline int wide_left_margin(void)  { return g_wide_off; }
+static inline int wide_right_margin(void) { return g_wide_w - g_wide_off - g_wide_native_w; }
 static GLuint g_wide_cur      = 0;           /* active mirror FBO (0 = no mirror) */
 static int    g_wide_cur_base = 0;           /* base_x of g_wide_cur */
 /* Set by gpu_flat_rect for the full-screen-overlay case so the generic
@@ -1587,7 +1590,7 @@ static int bd_prim_gate(const int *xs, int n, int textured) {
     if (!textured && gpu_ws_nw_flat_backdrop_enabled()) return 1;
     if (g_ws_bd_phase_mode != 0) return psx_ws_prim_in_backdrop();  /* default: precise address gate */
     /* mode 0: legacy tag+narrow heuristic (kept for comparison) */
-    int native_w = g_wide_w - 2 * g_wide_off;
+    int native_w = g_wide_native_w;
     if (native_w <= 0) return 0;
     if (psx_ws_prim_is_tagged()) return 0;
     int base = g_wide_cur_base, lo = xs[0], hi = xs[0];
@@ -1618,7 +1621,7 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * prim adds nothing to either reveal margin and its mirror can be skipped. */
 static int mirror_x_center_only(int lo, int hi) {
     if (!s_wide_fast) return 0;
-    int base = g_wide_cur_base, native_w = g_wide_w - 2 * g_wide_off;
+    int base = g_wide_cur_base, native_w = g_wide_native_w;
     if (native_w <= 0) return 0;
     return (lo >= base) && (hi < base + native_w);
 }
@@ -1636,7 +1639,7 @@ static void wide_set_bd_scale(GLint uScale, GLint uCenter) {
     extern int g_ws_tex_edge_pct;
     float scale = 1.0f, center = 0.0f;
     if (s_bd_gate && g_ws_bd_stretch_on && g_wide_w > 0) {
-        int native_w = g_wide_w - 2 * g_wide_off;
+        int native_w = g_wide_native_w;
         if (native_w > 0) {
             scale  = g_ws_bd_stretch_pct > 0 ? (float)g_ws_bd_stretch_pct / 100.0f
                                              : (float)g_wide_w / (float)native_w;
@@ -2217,7 +2220,7 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
      * native-wide (g_wide_cur != 0), so 4:3 is unaffected. */
     int overlay = 0;
     if (g_wide_cur) {
-        int native_w = g_wide_w - 2 * g_wide_off;
+        int native_w = g_wide_native_w;
         int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
         overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
     }
@@ -2906,7 +2909,7 @@ static int init_gpu_raster(void) {
     for (int i = 0; i < WIDE_MAX_SURF; i++) {
         s_wide_tex[i] = 0; s_wide_fbo[i] = 0; s_wide_base[i] = -1;
     }
-    g_wide_w = 0; g_wide_off = 0; g_wide_cur = 0; g_wide_cur_base = 0;
+    g_wide_w = 0; g_wide_off = 0; g_wide_native_w = 0; g_wide_cur = 0; g_wide_cur_base = 0;
 
     s_raster_ok = 1;
     gl_perf_init();   /* frame_perf GPU/CPU phase timing (no-op if queries absent) */
@@ -3373,14 +3376,15 @@ static GLuint wide_fbo_for(int base_x) {
 /* Enable native-wide with a wide width + centering offset (native px), or
  * disable (wide_w <= 0). Re-allocates if the width changed. Mirrors
  * sw_wide_configure. */
-static void glb_wide_configure(int wide_w, int offset) {
+static void glb_wide_configure(int wide_w, int offset, int native_w) {
     if (!s_raster_ok) return;
     double t0 = cw_ms(); s_cw_wide_cfgs++;
     flush_tex_batch();   /* a queued batch's wide mirror targets the CURRENT surfaces */
-    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; s_cw_wide_ms += cw_ms() - t0; return; }
+    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; g_wide_native_w = 0; s_cw_wide_ms += cw_ms() - t0; return; }
     if (wide_w != g_wide_w) wide_free_all();
     g_wide_w = wide_w;
     g_wide_off = offset;
+    g_wide_native_w = native_w;
     s_cw_wide_ms += cw_ms() - t0;
 }
 
@@ -3433,7 +3437,8 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
 /* Clear only the two synthetic reveal strips, preserving the centred canonical
  * framebuffer. This is an opt-in transition cleanup driven by gpu.c. */
 static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
-    if (!s_raster_ok || s_ws_ablate == 1 || g_wide_off <= 0) return;
+    if (!s_raster_ok || s_ws_ablate == 1 ||
+        (wide_left_margin() <= 0 && wide_right_margin() <= 0)) return;
     double t0 = cw_ms(); s_cw_wide_clears++;
     flush_tex_batch();
     GLuint fbo = wide_fbo_for(base_x);
@@ -3441,11 +3446,13 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     gl_perf_mirror_begin();
     int H = VRAM_H * s_scale;
     int W = g_wide_w * s_scale;
-    int margin = g_wide_off * s_scale;
+    int lm = wide_left_margin() * s_scale, rm = wide_right_margin() * s_scale;
+    if (lm < 0) lm = 0;
+    if (rm < 0) rm = 0;
     int y0 = y * s_scale, y1 = (y + h) * s_scale;
     if (y0 < 0) y0 = 0;
     if (y1 > H) y1 = H;
-    if (y1 <= y0 || margin * 2 >= W) {
+    if (y1 <= y0 || lm + rm >= W) {
         gl_perf_mirror_end();
         s_cw_wide_ms += cw_ms() - t0;
         return;
@@ -3460,12 +3467,12 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     glClearColor(r, g, b, a);
     glClearStencil((color >> 15) & 1);
     glStencilMask(0xFF);
-    if (sides & 1) {
-        glScissor(0, y0, margin, y1 - y0);
+    if ((sides & 1) && lm > 0) {
+        glScissor(0, y0, lm, y1 - y0);
         glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
-    if (sides & 2) {
-        glScissor(W - margin, y0, margin, y1 - y0);
+    if ((sides & 2) && rm > 0) {
+        glScissor(W - rm, y0, rm, y1 - y0);
         glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
     glDisable(GL_SCISSOR_TEST);
@@ -4782,7 +4789,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
  * mirror drew the full surface, as before). Shared by both present paths. */
 static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h) {
     if (!s_wide_fast || g_wide_w <= 0) return;
-    int native_w = g_wide_w - 2 * g_wide_off;
+    int native_w = g_wide_native_w;
     if (native_w <= 0) return;
     int S = s_scale;
     (void)disp_y; (void)disp_h;

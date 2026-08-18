@@ -214,6 +214,20 @@ int  gpu_ws_present_native_43(void);
 /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);
+/* Per-side variants: equal to psx_ws_x_margin() for the centred native-wide
+ * anchor (and in squash mode); a left/right anchor puts the whole reveal on
+ * one side and 0 on the other. Right-edge cull sites take _right, left-edge
+ * ones _left. */
+int  psx_ws_x_margin_left(void);
+int  psx_ws_x_margin_right(void);
+/* [widescreen] nw_anchor: 0 centre (default), 1 left, 2 right. */
+void gpu_ws_set_nw_anchor(int anchor);
+/* [widescreen] nw_anchor_gate: 0 always, 1 = only on frames the [widescreen.bg2d]
+ * tile renderer ran (stage world); other frames take the centred split. */
+void gpu_ws_set_nw_anchor_gate(int gate);
+/* Mod veto: 0 = the frames being built are not the game world (centre). */
+void gpu_ws_set_nw_anchor_world(int on);
+int  gpu_ws_get_nw_anchor(void);   /* effective anchor this frame */
 void gpu_ws_set_cull_guard_pixels(int pixels);
 /* Bias/range activation-window margin. This may include an additional
  * resident-object lead while render/terrain paths retain psx_ws_x_margin(). */
@@ -224,6 +238,12 @@ void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
                                     const uint32_t *range, int nrange);
 void gpu_ws_set_slti_lower_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_negsub_cull_sites(const uint32_t *sites, int nsites);
+/* [[widescreen.cull.edge]] full-word-guarded camX-relative screen-edge bounds
+ * (side 0 left / 1 right / 2 width). psx_ws_cull_edge_site() reports the
+ * signed delta the interpreter adds to the vanilla ADDI/ADDIU/SUBU result. */
+void gpu_ws_set_cull_edge_sites(const uint32_t *addresses, const uint32_t *expected,
+                                const uint32_t *sides, int nsites);
+int  psx_ws_cull_edge_site(uint32_t pc, uint32_t instr, int32_t *delta);
 void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_plane_nx_sites(const uint32_t *sites, int nsites);
@@ -410,6 +430,12 @@ typedef struct {
     int      xnum, xden;        /* squash factor */
     int      mode;              /* 0 = off, 1 = squash, 2 = native-wide */
     int      nw_extra;          /* native-wide frame growth (display px), 0 if off */
+    int      nw_left, nw_right; /* how nw_extra splits per side (nw_anchor) */
+    int      nw_anchor;         /* EFFECTIVE anchor: 0 centre, 1 left, 2 right */
+    int      nw_anchor_cfg;     /* configured [widescreen] nw_anchor */
+    int      nw_anchor_gate;    /* 0 always, 1 bg2d frames only */
+    int      nw_anchor_world;   /* mod veto (psx_mod_widescreen_set_world) */
+    uint32_t bg2d_last_frame;   /* frame of the last bg2d count hook */
     uint64_t cur_frame;
     uint32_t last_tag_frame;    /* frame of newest tagged prim */
     uint32_t last_3d_frame;     /* frame of newest shaded prim (diagnostic) */

@@ -316,6 +316,64 @@ model queues have fixed capacity. Both values are restricted to `[0, 256]`
 and contribute to native-overlay cache identity. Changing the activation
 guard requires regenerating the game and overlay code.
 
+### Native-wide anchor (2D side-scrollers)
+
+By default the native-wide reveal is split evenly (OFFSET each side). A 2D
+title whose gameplay is authored against the 4:3 LEFT edge — camera clamps,
+player walls, spawn windows, stage-start positions — can anchor the reveal
+instead, so the wide frame's left edge IS the 4:3 left edge and the whole
+extra width is on the right (`"right"` mirrors it):
+
+```toml
+[widescreen]
+nw_anchor      = "left"     # "center" (default) | "left" | "right"
+nw_anchor_gate = "bg2d"     # "always" (default) | "bg2d"
+```
+
+- `nw_anchor` is runtime-only (no regen). The compositor, the draw-area
+  widening, the cull helpers (`psx_ws_cull_*`), the `[widescreen.bg2d]`
+  column widen, HUD corner re-anchoring and the mod API
+  (`psx_mod_widescreen_x_margin_left/right`) all take the per-side split;
+  `psx_ws_x_margin()` keeps its symmetric per-side meaning for the 3D helpers.
+- `nw_anchor_gate = "bg2d"` applies the anchor only on frames the
+  `[widescreen.bg2d]` tile renderer ran (the stage world); any other frame —
+  a pause menu, NOW LOADING, results screen drawn as a fixed 320-wide layout —
+  takes the centred split, so it sits in the middle of the wide frame. The
+  flip is re-derived before every draw command and lands between two frames'
+  primitives, never inside one.
+- A trusted mod plugin can veto the anchor for frames it knows are not the
+  world (`psx_mod_widescreen_set_world(0)`; MM8: title / stage select are
+  built by the same tile renderer as the stages).
+- Identity at 4:3; a headless run engages native-wide exactly like a window
+  and `present_capture` writes the wide frame (see HEADLESS.md).
+
+### Screen-edge bounds in 2D game logic
+
+A 2D title's actor logic keeps objects alive, flags them on-screen and spawns
+them relative to camX with the 4:3 width baked in as immediates. Those bounds
+move with the per-side reveal so nothing pops in or out inside the revealed
+area:
+
+```toml
+[widescreen.cull]
+edge = [
+  { address = "0x801047D4", expected = "0x24A3FFC8", side = "left"  },  # addiu v1,a1,-56  (bound -= left)
+  { address = "0x801047E4", expected = "0x24A30178", side = "right" },  # addiu v1,a1,376  (bound += right)
+  { address = "0x80104A94", expected = "0x24620180", side = "width" },  # addiu v0,v1,384  (a right bound derived from the left one: += left+right)
+  { address = "0x80104834", expected = "0x00E51823", side = "left"  },  # subu v1,a3,a1    (camX-mx: -= left)
+]
+```
+
+- `expected` must be `ADDI`/`ADDIU` (any side) or `SUBU` (side `left`).
+- Full-word guarded: an overlay entry applies only where the stage's code holds
+  exactly that instruction; the same VA may be listed once per variant word.
+- Identity at 4:3 (both margins 0). Native generated code, overlay shards and
+  the dirty-RAM interpreter implement the same arithmetic. Regenerate after
+  changing the list (part of overlay cache identity).
+- Camera-relative *spawn windows* passed in registers are the plugin's job:
+  a function-entry hook moves each bound by the reveal on its own side (see
+  the Mega Man 8 project's `mm8_widescreen_plugin.c`).
+
 ## Runtime block
 
 Consumed by the cmake macro `psxrecomp_v4_add_runtime_target` (eventually)

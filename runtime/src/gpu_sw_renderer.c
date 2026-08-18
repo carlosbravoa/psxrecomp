@@ -71,7 +71,11 @@ static uint32_t  g_perspective_triangles = 0;
 static uint16_t *g_wide_surf[WIDE_MAX_SURF];   /* lazily-allocated surfaces */
 static int       g_wide_base[WIDE_MAX_SURF];   /* base_x per surface (-1 = free) */
 static int       g_wide_w        = 0;          /* wide width (native px); 0 = disabled */
-static int       g_wide_off      = 0;          /* centering OFFSET (native px) */
+static int       g_wide_off      = 0;          /* LEFT reveal / x-translation (native px) */
+static int       g_wide_native_w = 0;          /* canonical framebuffer width (native px) */
+/* Per-side reveal widths of the wide surface (native px). */
+static inline int wide_left_margin(void)  { return g_wide_off; }
+static inline int wide_right_margin(void) { return g_wide_w - g_wide_off - g_wide_native_w; }
 static uint16_t *g_wide_cur      = NULL;       /* active mirror surface (NULL = no mirror) */
 static int       g_wide_cur_base = 0;          /* base_x of g_wide_cur */
 static void      wide_free_all(void);          /* defined with the surface helpers below */
@@ -191,7 +195,7 @@ static inline WideBd wide_bd_get(void) {
     extern int psx_ws_prim_in_backdrop(void);
     extern int g_ws_bd_stretch_on, g_ws_bd_stretch_pct;
     if (g_ws_bd_stretch_on && g_wide_w > 0 && g_wide_cur && psx_ws_prim_in_backdrop()) {
-        int native_w = g_wide_w - 2 * g_wide_off;
+        int native_w = g_wide_native_w;
         if (native_w > 0) {
             b.on = 1;
             b.scale = g_ws_bd_stretch_pct > 0 ? (float)g_ws_bd_stretch_pct / 100.0f
@@ -1345,7 +1349,7 @@ void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
          * 1:1 as before. native_w = the 4:3 framebuffer width (g_wide_w less the
          * per-side reveal on both sides); g_wide_cur_base is its VRAM left edge.
          * Only runs in native-wide (g_wide_cur != NULL), so 4:3 is unaffected. */
-        int native_w = g_wide_w - 2 * g_wide_off;
+        int native_w = g_wide_native_w;
         int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
         WideBd bd = wide_bd_get();
         if (native_w > 0 && lx <= 0 && rx >= native_w)
@@ -1863,11 +1867,12 @@ static uint16_t *wide_surf_for(int base_x) {
 
 /* Enable native-wide with a wide width + centering offset (native px), or
  * disable (wide_w <= 0). Re-allocates if the width changed. */
-void sw_wide_configure(int wide_w, int offset) {
-    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
+void sw_wide_configure(int wide_w, int offset, int native_w) {
+    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; g_wide_native_w = 0; return; }
     if (wide_w != g_wide_w) wide_free_all();
     g_wide_w = wide_w;
     g_wide_off = offset;
+    g_wide_native_w = native_w;
 }
 
 /* Select the wide surface to mirror into for the back buffer at base_x. */
@@ -1904,15 +1909,17 @@ void sw_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) 
     int s = g_scale;
     int W = g_wide_w * s;
     int H = VRAM_HEIGHT * s;
-    int margin = g_wide_off * s;
+    int lm = wide_left_margin() * s, rm = wide_right_margin() * s;
     int y0 = y * s, y1 = (y + h) * s;
-    if (margin <= 0 || margin * 2 >= W) return;
+    if (lm < 0) lm = 0;
+    if (rm < 0) rm = 0;
+    if ((lm <= 0 && rm <= 0) || lm + rm >= W) return;
     if (y0 < 0) y0 = 0;
     if (y1 > H) y1 = H;
     for (int row = y0; row < y1; row++) {
         uint16_t *dst = surf + (size_t)row * W;
-        if (sides & 1) for (int col = 0; col < margin; col++) dst[col] = color;
-        if (sides & 2) for (int col = W - margin; col < W; col++) dst[col] = color;
+        if (sides & 1) for (int col = 0; col < lm; col++) dst[col] = color;
+        if (sides & 2) for (int col = W - rm; col < W; col++) dst[col] = color;
     }
 }
 

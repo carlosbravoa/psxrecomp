@@ -496,8 +496,10 @@ int savestate_slot_compatible(int slot, char* reason, size_t reason_cap) {
             snprintf(reason, reason_cap, "missing");
         return 0;
     }
-    ok = boot_state_check_buffer(data, size, s_bios_checksum, s_entry_pc,
-                                 reason, reason_cap);
+    /* User slots survive a recompiler rebuild (BOOT_STATE_ANY_BUILD): only
+     * the BIOS and the game EXE entry must match. */
+    ok = boot_state_check_buffer_ex(data, size, s_bios_checksum, s_entry_pc,
+                                    reason, reason_cap, BOOT_STATE_ANY_BUILD);
     free(data);
     return ok;
 }
@@ -775,8 +777,9 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         path[0] = '\0';
         if (s_load_blob && s_load_blob_len > 0) {
             const size_t blob_len = s_load_blob_len;
-            loaded = boot_state_load_buffer(s_load_blob, blob_len,
-                                            s_bios_checksum, s_entry_pc, cpu);
+            loaded = boot_state_load_buffer_ex(s_load_blob, blob_len,
+                                               s_bios_checksum, s_entry_pc, cpu,
+                                               BOOT_STATE_ANY_BUILD);
             clear_load_blob();
             if (!loaded) {
                 fprintf(stderr,
@@ -786,7 +789,8 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                 psx_frontend_on_savestate_notify(1, slot, 0);
             }
         } else if (savestate_slot_path(slot, path, sizeof(path))) {
-            loaded = boot_state_load(path, s_bios_checksum, s_entry_pc, cpu);
+            loaded = boot_state_load_ex(path, s_bios_checksum, s_entry_pc, cpu,
+                                        BOOT_STATE_ANY_BUILD);
             if (!loaded) {
                 fprintf(stderr,
                         "savestate: LOAD FAILED slot %d %s\n",

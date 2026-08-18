@@ -55,8 +55,24 @@ uint32_t psx_mod_alloc_guest_memory(uint32_t size, uint32_t alignment);
  */
 uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t size, uint32_t alignment);
 
-/* Current per-side widescreen reveal in native game pixels (zero at 4:3). */
+/* Current per-side widescreen reveal in native game pixels (zero at 4:3).
+ * psx_mod_widescreen_x_margin() is the symmetric per-side value; with a
+ * left/right-anchored native-wide ([widescreen] nw_anchor) the reveal is all on
+ * one side — game-logic hooks that widen a LEFT bound take _left and a RIGHT
+ * bound _right (both equal the symmetric value for the centred anchor). */
 int32_t psx_mod_widescreen_x_margin(void);
+int32_t psx_mod_widescreen_x_margin_left(void);
+int32_t psx_mod_widescreen_x_margin_right(void);
+
+/*
+ * Native-wide anchor veto ([widescreen] nw_anchor). A plugin that can tell
+ * whether the frames being built show the game WORLD (anchor applies) or a
+ * fixed 4:3 layout — a title / stage-select screen drawn through the same
+ * tile renderer as the stages — calls this from a per-frame hook: 0 = not the
+ * world (the reveal is split centred), 1 = world (default). Presentation only;
+ * identity at 4:3.
+ */
+void psx_mod_widescreen_set_world(int in_world);
 
 /*
  * Read the committed value of one of this package's declared options, as the

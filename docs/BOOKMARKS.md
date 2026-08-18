@@ -29,6 +29,14 @@ files exists, so a normal install never sees it.
 * Loading uses the normal savestate blob path (`savestate_request_load_blob_protocol`),
   so the usual rules apply: same game / BIOS variant as when the state was
   taken, refused during netplay.
+* Bookmarks and user savestate slots **survive a runtime / recompiler
+  rebuild**: the image is a complete hardware snapshot and every host-side
+  structure is re-derived from the restored guest RAM, so the loader accepts
+  a differing build key (codegen hash / overlay ABI) for them
+  (`BOOT_STATE_ANY_BUILD`, `boot_state.h`) and logs `image was written by
+  another build … loading it anyway`. The fast-boot snapshot, the rewind ring
+  and netplay pins keep the strict key. Only the BIOS checksum and the game
+  EXE entry point are always required.
 
 Bookmarks hold the game's memory image — like memory cards and savestates
 they are local files, shared privately, never committed. A game repo can ship

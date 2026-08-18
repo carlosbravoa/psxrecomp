@@ -113,6 +113,21 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
         h.u32(site.result);
     }
 
+    std::vector<WidescreenCullEdgeSite> edge_sites = c.ws_cull_edge_sites;
+    std::sort(edge_sites.begin(), edge_sites.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.address != b.address) return a.address < b.address;
+                  if (a.expected != b.expected) return a.expected < b.expected;
+                  return a.side < b.side;
+              });
+    h.tag("cull_edge");
+    h.u32((uint32_t)edge_sites.size());
+    for (const auto& site : edge_sites) {
+        h.u32(site.address);
+        h.u32(site.expected);
+        h.u32(site.side);
+    }
+
     std::vector<WidescreenAngleSite> angle_sites = c.ws_cull_angle_sites;
     std::sort(angle_sites.begin(), angle_sites.end(),
               [](const auto& a, const auto& b) {
@@ -1339,6 +1354,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_nw_left_hud_packet_lo = 0;
     uint32_t ws_nw_left_hud_packet_hi = 0;
     bool ws_nw_backdrop = false;
+    int ws_nw_anchor = 0;
+    int ws_nw_anchor_gate = 0;
     bool ws_clear_reveal = false;
     bool ws_nw_flat_backdrop = false;
     bool ws_nw_phase_backdrop = false;
@@ -1525,6 +1542,25 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         }
         if (ws.contains("nw_backdrop"))
             ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
+        if (ws.contains("nw_anchor_gate")) {
+            const std::string g = toml::find<std::string>(ws, "nw_anchor_gate");
+            if (g == "always") ws_nw_anchor_gate = 0;
+            else if (g == "bg2d") ws_nw_anchor_gate = 1;
+            else
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_anchor_gate must be \"always\" or \"bg2d\" (got \"{}\")",
+                    config_path.string(), g));
+        }
+        if (ws.contains("nw_anchor")) {
+            const std::string a = toml::find<std::string>(ws, "nw_anchor");
+            if (a == "center" || a == "centre") ws_nw_anchor = 0;
+            else if (a == "left") ws_nw_anchor = 1;
+            else if (a == "right") ws_nw_anchor = 2;
+            else
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_anchor must be \"center\", \"left\" or \"right\" (got \"{}\")",
+                    config_path.string(), a));
+        }
         if (ws.contains("clear_reveal"))
             ws_clear_reveal = toml::find<bool>(ws, "clear_reveal");
         if (ws.contains("nw_flat_backdrop"))
@@ -1582,6 +1618,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_cull_plane_nx_sites;
     std::vector<uint32_t> ws_cull_xclip_load_sites;
     std::vector<WidescreenCullKeepSite> ws_cull_keep_sites;
+    std::vector<WidescreenCullEdgeSite> ws_cull_edge_sites;
     std::vector<WidescreenAngleSite> ws_cull_angle_sites;
     WidescreenAspectConeConfig ws_aspect_cone;
     int ws_cull_guard_pixels = 0;
@@ -1614,6 +1651,44 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("depth_sites", ws_cull_depth_sites);
             load_sites("plane_nx_sites", ws_cull_plane_nx_sites);
             load_sites("xclip_load_sites", ws_cull_xclip_load_sites);
+            if (cull.contains("edge")) {
+                std::set<uint64_t> seen_pairs;
+                for (const auto& item : toml::find<toml::array>(cull, "edge")) {
+                    WidescreenCullEdgeSite site;
+                    site.address = parse_hex(toml::find<std::string>(item, "address"),
+                                             "widescreen.cull.edge.address");
+                    site.expected = parse_hex(toml::find<std::string>(item, "expected"),
+                                              "widescreen.cull.edge.expected");
+                    const std::string side = toml::find<std::string>(item, "side");
+                    if (side == "left") site.side = 0;
+                    else if (side == "right") site.side = 1;
+                    else if (side == "width") site.side = 2;
+                    else
+                        throw std::runtime_error(fmt::format(
+                            "{}: [[widescreen.cull.edge]] side must be \"left\", \"right\" or \"width\"",
+                            config_path.string()));
+                    const uint32_t op = site.expected >> 26;
+                    const uint32_t fn = site.expected & 0x3Fu;
+                    const bool addi = (op == 0x08u || op == 0x09u);
+                    const bool subu = (op == 0u && fn == 0x23u);
+                    if (!(addi || subu))
+                        throw std::runtime_error(fmt::format(
+                            "{}: [[widescreen.cull.edge]] expected must be ADDI/ADDIU or SUBU",
+                            config_path.string()));
+                    if (subu && site.side != 0)
+                        throw std::runtime_error(fmt::format(
+                            "{}: [[widescreen.cull.edge]] a SUBU site must be side = \"left\"",
+                            config_path.string()));
+                    /* Overlay variants may legitimately list the same VA with a
+                     * different instruction word; only an exact repeat is an error. */
+                    if (!seen_pairs.insert(((uint64_t)(site.address & 0x1FFFFFFFu) << 32) |
+                                           site.expected).second)
+                        throw std::runtime_error(fmt::format(
+                            "{}: duplicate [[widescreen.cull.edge]] site 0x{:08X}/0x{:08X}",
+                            config_path.string(), site.address, site.expected));
+                    ws_cull_edge_sites.push_back(site);
+                }
+            }
             if (cull.contains("keep")) {
                 std::set<uint32_t> seen;
                 for (const auto& item : toml::find<toml::array>(cull, "keep")) {
@@ -2039,6 +2114,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_plane_nx_sites*/ ws_cull_plane_nx_sites,
         /*ws_cull_xclip_load_sites*/ ws_cull_xclip_load_sites,
         /*ws_cull_keep_sites*/    ws_cull_keep_sites,
+        /*ws_cull_edge_sites*/    ws_cull_edge_sites,
         /*ws_cull_angle_sites*/   ws_cull_angle_sites,
         /*ws_aspect_cone*/         ws_aspect_cone,
         /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
@@ -2059,6 +2135,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_nw_left_hud_packet_lo*/ ws_nw_left_hud_packet_lo,
         /*ws_nw_left_hud_packet_hi*/ ws_nw_left_hud_packet_hi,
         /*ws_nw_backdrop*/        ws_nw_backdrop,
+        /*ws_nw_anchor*/          ws_nw_anchor,
+        /*ws_nw_anchor_gate*/     ws_nw_anchor_gate,
         /*ws_clear_reveal*/       ws_clear_reveal,
         /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
         /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,

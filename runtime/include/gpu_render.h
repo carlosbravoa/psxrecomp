@@ -110,7 +110,11 @@ void gr_set_draw_offset(int x, int y);
  * backend implements it; if not, the others are no-ops and the caller keeps
  * the canonical present path. */
 int  gr_wide_supported(void);
-void gr_wide_configure(int wide_w, int offset);
+/* wide_w = total surface width, offset = LEFT reveal (the x-translation of
+ * canonical VRAM into the surface), native_w = the canonical framebuffer
+ * width; the RIGHT reveal is wide_w - offset - native_w (== offset for the
+ * centred anchor, the whole reveal for a left-anchored native-wide). */
+void gr_wide_configure(int wide_w, int offset, int native_w);
 void gr_wide_set_target(int base_x);
 void gr_wide_disable_target(void);
 void gr_wide_clear(int base_x, int y, int h, uint16_t color);
@@ -187,7 +191,7 @@ typedef struct GpuRenderBackend {
     /* Native-wide compositor (optional; NULL on backends without it — the
      * facade then reports gr_wide_supported() == 0 and the caller keeps the
      * canonical present). */
-    void (*wide_configure)(int wide_w, int offset);
+    void (*wide_configure)(int wide_w, int offset, int native_w);
     void (*wide_set_target)(int base_x);
     void (*wide_disable_target)(void);
     void (*wide_clear)(int base_x, int y, int h, uint16_t color);

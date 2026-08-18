@@ -721,8 +721,17 @@ static void boot_state_append_reason(char* reason, size_t reason_cap,
 int boot_state_check_buffer(const uint8_t* file, size_t file_len,
                             uint32_t bios_checksum, uint32_t entry_pc,
                             char* reason, size_t reason_cap) {
+    return boot_state_check_buffer_ex(file, file_len, bios_checksum, entry_pc,
+                                      reason, reason_cap, 0u);
+}
+
+int boot_state_check_buffer_ex(const uint8_t* file, size_t file_len,
+                               uint32_t bios_checksum, uint32_t entry_pc,
+                               char* reason, size_t reason_cap,
+                               unsigned flags) {
     BootStateHeader h;
     char part[96];
+    const int any_build = (flags & BOOT_STATE_ANY_BUILD) != 0;
 
     if (reason && reason_cap)
         reason[0] = '\0';
@@ -762,21 +771,29 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
                  (unsigned)h.entry_pc, (unsigned)entry_pc);
         boot_state_append_reason(reason, reason_cap, part);
     }
-    if (h.codegen_hash != (uint32_t)PSX_OVERLAY_CODEGEN_HASH) {
-        snprintf(part, sizeof(part), "codegen_hash=%08X(want %08X)",
-                 (unsigned)h.codegen_hash,
-                 (unsigned)PSX_OVERLAY_CODEGEN_HASH);
-        boot_state_append_reason(reason, reason_cap, part);
-    }
-    if (h.abi_tag != (int32_t)PSX_OVERLAY_ABI_TAG) {
-        snprintf(part, sizeof(part), "abi_tag=%d(want %d)",
-                 (int)h.abi_tag, (int)PSX_OVERLAY_ABI_TAG);
-        boot_state_append_reason(reason, reason_cap, part);
-    }
-    if (h.codegen_ver != (uint32_t)PSX_OVERLAY_CODEGEN_VER) {
-        snprintf(part, sizeof(part), "codegen_ver=%u(want %u)",
-                 (unsigned)h.codegen_ver, (unsigned)PSX_OVERLAY_CODEGEN_VER);
-        boot_state_append_reason(reason, reason_cap, part);
+    /* Build key. The image is a complete HARDWARE snapshot (host-side /
+     * recompiler-derived state is re-derived from guest RAM on load), so it
+     * does not depend on which emitter build wrote it. The fast-boot snapshot
+     * still requires an exact match (it must never silently outlive an app
+     * update); a USER savestate / bookmark passes BOOT_STATE_ANY_BUILD so a
+     * recompiler change does not orphan every save the player has taken. */
+    if (!any_build) {
+        if (h.codegen_hash != (uint32_t)PSX_OVERLAY_CODEGEN_HASH) {
+            snprintf(part, sizeof(part), "codegen_hash=%08X(want %08X)",
+                     (unsigned)h.codegen_hash,
+                     (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+            boot_state_append_reason(reason, reason_cap, part);
+        }
+        if (h.abi_tag != (int32_t)PSX_OVERLAY_ABI_TAG) {
+            snprintf(part, sizeof(part), "abi_tag=%d(want %d)",
+                     (int)h.abi_tag, (int)PSX_OVERLAY_ABI_TAG);
+            boot_state_append_reason(reason, reason_cap, part);
+        }
+        if (h.codegen_ver != (uint32_t)PSX_OVERLAY_CODEGEN_VER) {
+            snprintf(part, sizeof(part), "codegen_ver=%u(want %u)",
+                     (unsigned)h.codegen_ver, (unsigned)PSX_OVERLAY_CODEGEN_VER);
+            boot_state_append_reason(reason, reason_cap, part);
+        }
     }
 
     if (reason && reason_cap && reason[0])
@@ -784,9 +801,24 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
     return 1;
 }
 
+int boot_state_buffer_build_matches(const uint8_t* file, size_t file_len) {
+    BootStateHeader h;
+    if (!boot_state_parse_header(file, file_len, &h)) return 0;
+    return h.codegen_hash == (uint32_t)PSX_OVERLAY_CODEGEN_HASH &&
+           h.abi_tag == (int32_t)PSX_OVERLAY_ABI_TAG &&
+           h.codegen_ver == (uint32_t)PSX_OVERLAY_CODEGEN_VER;
+}
+
 int boot_state_load_buffer(const uint8_t* file, size_t file_len,
                            uint32_t bios_checksum, uint32_t entry_pc,
                            CPUState* cpu) {
+    return boot_state_load_buffer_ex(file, file_len, bios_checksum, entry_pc,
+                                     cpu, 0u);
+}
+
+int boot_state_load_buffer_ex(const uint8_t* file, size_t file_len,
+                              uint32_t bios_checksum, uint32_t entry_pc,
+                              CPUState* cpu, unsigned flags) {
     const uint8_t* cur;
     const uint8_t* end;
     BootStateHeader h;
@@ -805,12 +837,17 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     double apply_spuram_ms = 0.0;
     double apply_other_ms = 0.0;
 
-    if (!boot_state_check_buffer(file, file_len, bios_checksum, entry_pc,
-                                 reject, sizeof(reject))) {
+    if (!boot_state_check_buffer_ex(file, file_len, bios_checksum, entry_pc,
+                                    reject, sizeof(reject), flags)) {
         fprintf(stderr, "boot_state: reject — %s\n",
                 reject[0] ? reject : "unknown");
         return 0;
     }
+    if ((flags & BOOT_STATE_ANY_BUILD) &&
+        !boot_state_buffer_build_matches(file, file_len))
+        fprintf(stderr, "boot_state: image was written by another build "
+                        "(codegen/ABI key differs) — loading it anyway: it is a "
+                        "complete hardware snapshot, host state is re-derived\n");
     if (!boot_state_parse_header(file, file_len, &h))
         return 0;
 
@@ -908,6 +945,11 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
 int boot_state_load(const char* path, uint32_t bios_checksum,
                     uint32_t entry_pc, CPUState* cpu) {
+    return boot_state_load_ex(path, bios_checksum, entry_pc, cpu, 0u);
+}
+
+int boot_state_load_ex(const char* path, uint32_t bios_checksum,
+                       uint32_t entry_pc, CPUState* cpu, unsigned flags) {
     FILE* f = fopen(path, "rb");
     long sz;
     uint8_t* file = NULL;
@@ -943,7 +985,7 @@ int boot_state_load(const char* path, uint32_t bios_checksum,
     (void)t0;
     (void)t_after_read;
 
-    ok = boot_state_load_buffer(file, file_len, bios_checksum, entry_pc, cpu);
+    ok = boot_state_load_buffer_ex(file, file_len, bios_checksum, entry_pc, cpu, flags);
     free(file);
     return ok;
 }

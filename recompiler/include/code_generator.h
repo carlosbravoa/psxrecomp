@@ -150,6 +150,9 @@ struct CodeGenConfig {
     // while widescreen reveals extra world. 4:3 evaluates the original compare.
     std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep_sites;
 
+    // Full-word-guarded camX-relative screen-edge bounds ([[widescreen.cull.edge]]).
+    std::vector<PSXRecompV4::WidescreenCullEdgeSite> ws_cull_edge_sites;
+
     // Exact `addi[u] rt,zero,imm` 12-bit angular half-extents. The runtime
     // scales tan(angle) by the current horizontal reveal factor.
     std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle_sites;

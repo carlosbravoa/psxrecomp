@@ -357,6 +357,76 @@ static int ws_nw_offset(void) {
 }
 int ws_nw_extra(void) { return 2 * ws_nw_offset(); }
 
+/* Native-wide ANCHOR ([widescreen] nw_anchor): how EXTRA splits between the
+ * two sides. 0 = centre (OFFSET each side — the default and every existing
+ * title), 1 = left (the wide frame's left edge IS the 4:3 left edge and the
+ * whole EXTRA is revealed on the right), 2 = right (mirror). A side-scroller
+ * whose gameplay is authored against the 4:3 left edge (camera clamps,
+ * player bounds, spawn windows, stage-start positions) keeps every left-side
+ * alignment with the left anchor and simply sees further ahead; the centred
+ * split would need the camera moved off its authored positions to hide the
+ * left reveal at map boundaries. The renderers get the LEFT reveal as the
+ * canonical->surface x-translation and the native width; the game-side
+ * helpers (cull, bg2d, HUD, spawn margins) take the per-side values below. */
+static int ws_nw_anchor = 0;
+/* [widescreen] nw_anchor_gate = "bg2d": the anchor applies only on frames the
+ * widened 2D tile renderer ([widescreen.bg2d]) built its layers — i.e. the
+ * stage world is on screen. Any other frame (a title / stage-select / results
+ * / pause-menu screen that draws its own fixed 4:3 layout) takes the CENTRED
+ * split, so those screens sit in the middle of the wide frame instead of
+ * hugging the anchored edge. The stamp is the frame of the last bg2d count
+ * hook; a one-frame grace covers OT-build-in-N / DMA-in-N+1 titles. The
+ * effective anchor is re-derived before every fill/draw command so a flip
+ * lands between two frames' primitives, never inside one. */
+static int ws_nw_anchor_gate = 0;               /* 0 always, 1 bg2d frames */
+static uint32_t ws_bg2d_stamp = (uint32_t)-1000; /* frame of last bg2d cols hook */
+static int ws_nw_anchor_applied = 0;             /* what the renderer is configured for */
+/* Mod veto (psx_mod_widescreen_set_world): a trusted game plugin that knows
+ * which frames show the game world can switch the anchor off for the rest —
+ * a full-2D screen that happens to be drawn through the same tile renderer
+ * (MM8's title / stage select) is then centred like the other menus. */
+static int ws_nw_anchor_world = 1;
+static void ws_nw_anchor_refresh(void);
+void gpu_ws_set_nw_anchor_world(int on) {
+    ws_nw_anchor_world = on ? 1 : 0;
+    ws_nw_anchor_refresh();
+}
+static int ws_nw_anchor_eff(void) {
+    if (!ws_nw_anchor_world) return 0;
+    if (ws_nw_anchor_gate == 1 &&
+        (uint32_t)s_frame_count - ws_bg2d_stamp > 1u) return 0;
+    return ws_nw_anchor;
+}
+/* Re-point the compositor when the effective anchor changed (gate flips). */
+static void ws_nw_anchor_refresh(void) {
+    if (ws_nw_anchor_gate == 0 && ws_nw_anchor_world) return;
+    const int eff = ws_nw_anchor_eff();
+    if (eff == ws_nw_anchor_applied) return;
+    ws_nw_anchor_applied = eff;
+    ws_nw_sync_target();
+}
+void gpu_ws_set_nw_anchor(int anchor) {
+    ws_nw_anchor = (anchor == 1 || anchor == 2) ? anchor : 0;
+    ws_nw_anchor_applied = ws_nw_anchor_eff();
+    ws_nw_sync_target();
+}
+void gpu_ws_set_nw_anchor_gate(int gate) {
+    ws_nw_anchor_gate = gate == 1 ? 1 : 0;
+    ws_nw_anchor_applied = ws_nw_anchor_eff();
+    ws_nw_sync_target();
+}
+int gpu_ws_get_nw_anchor(void) { return ws_nw_anchor_eff(); }
+static int ws_nw_split_left(int off) {
+    const int a = ws_nw_anchor_eff();
+    return a == 1 ? 0 : (a == 2 ? 2 * off : off);
+}
+/* Per-side reveal in screen px while native-wide is ACTIVE (0 otherwise). */
+static int ws_nw_left(void)  { return ws_nw_split_left(ws_nw_offset()); }
+static int ws_nw_right(void) { return ws_nw_extra() - ws_nw_left(); }
+/* Same split for the CONFIGURED viewport (pre-classification setup paths). */
+static int ws_nw_configured_left(void)  { return ws_nw_split_left(ws_nw_configured_offset()); }
+static int ws_nw_configured_right(void) { return 2 * ws_nw_configured_offset() - ws_nw_configured_left(); }
+
 /* Per-side X cull margin in screen/world units (the game's draw classifier
  * works in objX-camX where 1 unit ~= 1 native-4:3 screen pixel). The squash
  * shows a half-view of 160/s pixels (s = squash factor = ws_xnum/ws_xden), so
@@ -546,6 +616,39 @@ void gpu_ws_set_cull_keep_sites(const uint32_t *addresses,
         ws_cull_keep_sites[i].result = results[i] ? 1u : 0u;
     }
 }
+/* [[widescreen.cull.edge]] — full-word-guarded camX-relative screen-edge
+ * bounds (see config_loader.h). The interpreter asks psx_ws_cull_edge_site()
+ * for the signed delta to add to the vanilla result; the recompiler emits the
+ * same arithmetic inline. Identity at 4:3 (both margins 0). */
+typedef struct { uint32_t address, expected, side; } WsCullEdgeSite;
+static WsCullEdgeSite ws_cull_edge_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_cull_edge_n = 0;
+void gpu_ws_set_cull_edge_sites(const uint32_t *addresses, const uint32_t *expected,
+                                const uint32_t *sides, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_cull_edge_n = nsites;
+    for (int i = 0; i < nsites; i++) {
+        ws_cull_edge_sites[i].address = addresses[i] & 0x1FFFFFFFu;
+        ws_cull_edge_sites[i].expected = expected[i];
+        ws_cull_edge_sites[i].side = sides[i];
+    }
+}
+int psx_ws_cull_edge_site(uint32_t pc, uint32_t instr, int32_t *delta) {
+    const uint32_t phys = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < ws_cull_edge_n; i++) {
+        const WsCullEdgeSite *site = &ws_cull_edge_sites[i];
+        if (site->address != phys || site->expected != instr) continue;
+        if (delta) {
+            *delta = site->side == 0 ? -psx_ws_x_margin_left()
+                   : site->side == 1 ?  psx_ws_x_margin_right()
+                                     :  psx_ws_x_margin_left() + psx_ws_x_margin_right();
+        }
+        return 1;
+    }
+    return 0;
+}
+
 uint32_t psx_ws_cull_keep_result(uint32_t vanilla, uint32_t forced) {
     return psx_ws_x_margin() > 0 ? (forced ? 1u : 0u) : vanilla;
 }
@@ -919,6 +1022,19 @@ int psx_ws_x_margin(void) {
            + ws_cull_guard_pixels;
 }
 
+/* Per-SIDE cull margins. Equal to psx_ws_x_margin() for the centred anchor
+ * (and always in squash mode / under the diagnostic override); with a left or
+ * right anchor one side is 0 and the other carries the whole reveal. The cull
+ * guard rides on a side only when that side reveals anything. */
+static int ws_side_margin(int side) {
+    if (ws_margin_override >= 0) return ws_margin_override;
+    if (ws_native_wide_configured())
+        return side > 0 ? side + ws_cull_guard_pixels : 0;
+    return psx_ws_x_margin();
+}
+int psx_ws_x_margin_left(void)  { return ws_side_margin(ws_nw_configured_left()); }
+int psx_ws_x_margin_right(void) { return ws_side_margin(ws_nw_configured_right()); }
+
 int psx_ws_activation_margin(void) {
     const int margin = psx_ws_x_margin();
     return margin > 0 ? margin + ws_activation_guard_pixels : 0;
@@ -1001,21 +1117,25 @@ void gpu_ws_bg2d_set_parent_links(int on) {
     g_bg2d_parent_links = on ? 1 : 0;
 }
 
-static int ws_bg2d_left_cols(void) {
+static int ws_bg2d_side_cols(int off) {
     if (!ws_native_wide_active()) return 0;
     /* Only the ~320 gameplay mode; the engine's 512 hi-res mode (title) draws
      * its own 33 columns and centres itself — never double-shift it. */
     if (ws_disp_w() > 384) return 0;
-    int off = ws_nw_offset();           /* per-side reveal in screen px */
     if (off <= 0) return 0;
     return (off + 15) / 16;             /* ceil to whole tile columns */
 }
+/* Extra tile columns on each side (the per-side reveal, ceil'd to tiles). */
+static int ws_bg2d_left_cols(void)  { return ws_bg2d_side_cols(ws_nw_left()); }
+static int ws_bg2d_right_cols(void) { return ws_bg2d_side_cols(ws_nw_right()); }
 /* Column count: base + both-side reveal. */
 static void mmx6_bg_refill_tick(void);   /* defined below (ring-freshness fix) */
 int psx_ws_bg2d_cols(int base) {
     g_bg2d_native_cols = base;
+    ws_bg2d_stamp = (uint32_t)s_frame_count;   /* anchor gate: world frame */
+    ws_nw_anchor_refresh();
     mmx6_bg_refill_tick();
-    return base + 2 * ws_bg2d_left_cols();
+    return base + ws_bg2d_left_cols() + ws_bg2d_right_cols();
 }
 /* Start tile column: refill before the first column is consumed, then begin LEFT
  * earlier in the ring. The count hook retains the same tick for layouts that load
@@ -1038,9 +1158,10 @@ int psx_ws_bg2d_startx(int x)        { return x - ws_bg2d_left_cols() * 16; }
  * Identity (no extra streaming) at 4:3 / 512 hi-res, so the ring is byte-identical
  * there. The 64-col ring has ample slack (visible ~21 cols) for ±LEFT more. */
 int psx_ws_bg2d_stream_left(int x)  { return x - ws_bg2d_left_cols() * 16; }
-int psx_ws_bg2d_stream_right(int x) { return x + ws_bg2d_left_cols() * 16; }
+int psx_ws_bg2d_stream_right(int x) { return x + ws_bg2d_right_cols() * 16; }
 int psx_ws_bg2d_undercap(int counter, int native_cap) {
-    int cap = ws_bg2d_left_cols() > 0 ? (int)g_bg2d_packet_cap : native_cap;
+    int cap = (ws_bg2d_left_cols() > 0 || ws_bg2d_right_cols() > 0)
+              ? (int)g_bg2d_packet_cap : native_cap;
     return counter < cap;
 }
 
@@ -1223,8 +1344,8 @@ long gpu_ws_mmx6_refill_cols(void)    { return g_mmx6_refill_cols; }
 void psx_ws_mmx6_bg_refill_all(void) {
     if (!g_mmx6_freshfix) return;
     if (!ws_native_wide_active() || ws_disp_w() > 384) return;
-    int left = ws_bg2d_left_cols();
-    if (left <= 0) return;
+    int left = ws_bg2d_left_cols(), right = ws_bg2d_right_cols();
+    if (left <= 0 && right <= 0) return;
     g_mmx6_refill_cols = 0;
     for (uint32_t layer = 0; layer < g_bg2d_layer_count; layer++) {
         uint32_t lbase = g_bg2d_layer_base + layer * g_bg2d_layer_struct_stride;
@@ -1241,7 +1362,7 @@ void psx_ws_mmx6_bg_refill_all(void) {
         int sxr = sx;
         if (sxr < 0) sxr += 0xf;
         int start_col = sxr >> 4;
-        for (int ci = -left; ci < g_bg2d_native_cols + left; ci++) {
+        for (int ci = -left; ci < g_bg2d_native_cols + right; ci++) {
             int world_x = sx + ci * 16;
             if (world_x < 0) {
                 bg2d_clear_column((int)layer, start_col + ci, sy - 0x10);
@@ -1298,9 +1419,9 @@ int gpu_ws_mmx6_validate(int *bad_out) {
  * shifts by +margin so BOTH 16:9 margins pass; at 4:3 margin==0 so it reduces
  * bit-for-bit to the vanilla `(uint16)sx < imm`. */
 int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
-    int m = psx_ws_x_margin();
-    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
-            < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
+    int ml = psx_ws_x_margin_left(), mr = psx_ws_x_margin_right();
+    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + ml)
+            < (uint32_t)((int32_t)imm + ml + mr)) ? 1 : 0;
 }
 
 /* Signed right-edge widen for the min/max funnel idiom (`slti v, minSX, W`):
@@ -1308,27 +1429,27 @@ int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
  * bound moves out by ONE margin only. Operand is an already sign-extended /
  * computed 32-bit screen X. Identity at margin 0 (4:3). */
 int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
-    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin_right()) ? 1 : 0;
 }
 
 /* Signed fixed lower-bound widen (`slti v, x, -W`): move the reject edge left
  * by one live reveal margin. The encoded immediate must be sign-extended. */
 int psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm) {
     int32_t bound = (int32_t)(int16_t)(uint16_t)imm;
-    return ((int32_t)sx < bound - psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)sx < bound - psx_ws_x_margin_left()) ? 1 : 0;
 }
 
 /* Signed left-edge widen for the funnel's `bltz maxSX, reject`: reject only
  * when the prim ends left of the REVEALED edge (maxSX < -margin). Returns the
  * branch predicate. Identity at margin 0 (4:3). */
 int psx_ws_cull_bltz(uint32_t v) {
-    return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
+    return ((int32_t)v < -psx_ws_x_margin_left()) ? 1 : 0;
 }
 int psx_ws_cull_vxrange(uint32_t x, uint32_t imm) {
-    int32_t margin = psx_ws_x_margin();
+    int32_t ml = psx_ws_x_margin_left(), mr = psx_ws_x_margin_right();
     uint32_t bound = (uint32_t)(int32_t)(int16_t)(uint16_t)imm;
-    return (((x + (uint32_t)margin) & 0xFFFFu) <
-            (bound + 2u * (uint32_t)margin)) ? 1 : 0;
+    return (((x + (uint32_t)ml) & 0xFFFFu) <
+            (bound + (uint32_t)(ml + mr))) ? 1 : 0;
 }
 
 /* ---- Cull signature configuration ([widescreen.cull] screen_w_imms /
@@ -1413,7 +1534,10 @@ int psx_ws_backdrop_x(int x) {
         int32_t extra = ws_nw_extra();
         int32_t cx = W / 2;
         int32_t d = (int16_t)x - cx;
-        return (int)(cx + (d * (W + extra) + (d >= 0 ? W / 2 : -W / 2)) / W);
+        /* Anchor shift: the stretched span [-left, W+right] is the centred
+         * one moved by (right - left) / 2 (0 for the centred anchor). */
+        return (int)(cx + (d * (W + extra) + (d >= 0 ? W / 2 : -W / 2)) / W
+                     + (ws_nw_right() - ws_nw_left()) / 2);
     }
     if (!ws_active()) return (int16_t)x;
     int32_t cx = ws_disp_w() / 2;                 /* screen centre (=160 @ 320) */
@@ -1559,6 +1683,13 @@ void gpu_ws_get_debug(GpuWsDebug* out) {
     out->xden              = ws_xden;
     out->mode              = ws_mode;
     out->nw_extra          = ws_nw_extra();
+    out->nw_left           = ws_nw_left();
+    out->nw_right          = ws_nw_right();
+    out->nw_anchor         = ws_nw_anchor_eff();
+    out->nw_anchor_cfg     = ws_nw_anchor;
+    out->nw_anchor_gate    = ws_nw_anchor_gate;
+    out->nw_anchor_world   = ws_nw_anchor_world;
+    out->bg2d_last_frame   = ws_bg2d_stamp;
     out->cur_frame         = s_frame_count;
     out->last_tag_frame    = ws_last_tag_stamp;
     out->last_3d_frame     = ws_last_3d_stamp;
@@ -1844,9 +1975,8 @@ static void ws_expand_fullscreen_rect(int32_t *x, int32_t y, int *w, int h) {
     if (!ws_native_wide_active()) return;
     int W = (int)ws_disp_w(), H = (int)ws_disp_h();
     if (*x <= 0 && *x + *w >= W && y <= 0 && y + h >= H) {
-        int off = ws_nw_offset();
-        *x -= off;
-        *w += 2 * off;
+        *x -= ws_nw_left();
+        *w += ws_nw_extra();
     }
 }
 
@@ -2015,8 +2145,7 @@ static int ws_nw_left_hud_packet(void) {
 }
 static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
     if (!ws_native_wide_active()) return 0;
-    int32_t off = ws_nw_offset();
-    if (off <= 0) return 0;
+    if (ws_nw_extra() <= 0) return 0;
     if (!ws_nw_left_hud_packet() && !ws_nw_hud_corners) return 0;
     /* Sprite-tag titles (anchor configured): HUD ≡ UNTAGGED rect-family prims
      * — the same discriminator the squash path's hud_sprt_squash used. Tagged
@@ -2029,9 +2158,9 @@ static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
     if (ws_anchor_addr && !ws_nw_hud_tag_rects && psx_ws_prim_is_tagged()) return 0;
     int32_t W  = ws_disp_w();
     int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
-    if (3 * cx < 2 * W) return -off;   /* left third  -> pull to left edge  */
-    if (3 * cx > 4 * W) return  off;   /* right third -> push to right edge */
-    return 0;                          /* middle third -> stay centred      */
+    if (3 * cx < 2 * W) return -ws_nw_left();   /* left third  -> pull to left edge  */
+    if (3 * cx > 4 * W) return  ws_nw_right();  /* right third -> push to right edge */
+    return 0;                                   /* middle third -> stay centred      */
 }
 
 /* Re-anchor every X coordinate of a HUD polygon as one rigid composite. The
@@ -2094,9 +2223,10 @@ static int ws_nw_backdrop_stretch_quad(int32_t *vx, const int32_t *vy) {
     /* Stretch X about the display centre by (W+extra)/W so [0,W] -> [-off, W+off],
      * which the wide compositor (+off) maps onto the full [0, W+extra] surface. */
     int32_t cx = W / 2;
+    const int32_t ashift = (ws_nw_right() - ws_nw_left()) / 2;   /* anchor */
     for (int i = 0; i < 4; i++) {
         int32_t d = vx[i] - cx;
-        vx[i] = cx + (d * (W + extra) + (d >= 0 ? W / 2 : -W / 2)) / W;
+        vx[i] = cx + (d * (W + extra) + (d >= 0 ? W / 2 : -W / 2)) / W + ashift;
     }
     return 1;
 }
@@ -2239,7 +2369,7 @@ static int ws_is_fb_base(uint32_t bx) {
  * disable mirroring for this draw. Called when the draw env changes. */
 static void ws_nw_sync_target(void) {
     if (!ws_native_wide_active()) { gr_wide_disable_target(); return; }
-    gr_wide_configure((int)ws_disp_w() + ws_nw_extra(), ws_nw_offset());
+    gr_wide_configure((int)ws_disp_w() + ws_nw_extra(), ws_nw_left(), (int)ws_disp_w());
     uint32_t base = draw_area_left;
     if (ws_is_fb_base(base)) gr_wide_set_target((int)base);
     else                     gr_wide_disable_target();
@@ -3086,21 +3216,19 @@ static void raster_pixel(int32_t x, int32_t y, uint16_t color) {
  * and contributed the original generalized fix in psxrecomp PR #73:
  * https://github.com/mstan/psxrecomp/pull/73
  * Keep that credit with this guarded framebuffer-target variant. */
-static inline int32_t draw_area_wide_x_margin(void) {
-    if (!ws_native_wide_active() || !ws_is_fb_base(draw_area_left)) return 0;
-    return (int32_t)ws_nw_offset();
+static inline int draw_area_wide_active(void) {
+    return ws_native_wide_active() && ws_is_fb_base(draw_area_left) && ws_nw_extra() > 0;
 }
 
 static inline void draw_area_host_x_bounds(int32_t *left, int32_t *right) {
-    int32_t margin = draw_area_wide_x_margin();
     *left  = (int32_t)draw_area_left;
     *right = (int32_t)draw_area_right;
-    if (margin > 0) {
+    if (draw_area_wide_active()) {
         /* Use the union of the guest draw area and the widescreen mirror.
          * Wider staging areas may share the framebuffer X origin; clamping them
          * to the mirror width would drop valid canonical VRAM writes. */
-        int32_t wide_left  = (int32_t)draw_area_left - margin;
-        int32_t wide_right = (int32_t)draw_area_left + (int32_t)ws_disp_w() + margin - 1;
+        int32_t wide_left  = (int32_t)draw_area_left - ws_nw_left();
+        int32_t wide_right = (int32_t)draw_area_left + (int32_t)ws_disp_w() + ws_nw_right() - 1;
         if (wide_left  < *left)  *left  = wide_left;
         if (wide_right > *right) *right = wide_right;
     }
@@ -4648,6 +4776,10 @@ static void gp0_execute_command(void) {
         ws_census_record(opcode, cvx, cvy);
         ws_note_overhang(opcode);   /* 2D-only-scene classifier world signal */
     }
+
+    /* Native-wide anchor gate: settle the effective anchor before anything
+     * is rasterised (a flip only ever lands between frames' primitives). */
+    if (opcode >= 0x02 && opcode <= 0x7F) ws_nw_anchor_refresh();
 
     /* Categorize for diagnostics */
     if (opcode <= 0x01) gp0_nop_count++;

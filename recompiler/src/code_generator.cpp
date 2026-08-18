@@ -894,6 +894,34 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                 site.y_reg, config_.ws_aspect_cone.y_reg)), comment);
     }
 
+    // Full-word-guarded screen-EDGE bounds ([[widescreen.cull.edge]]): a 2D
+    // title's camX-relative keep-alive / on-screen / spawn bound built from an
+    // immediate of the 4:3 width moves by the per-side reveal (left: -left,
+    // right: +right, width: +left+right). Identity at 4:3 (margins 0).
+    for (const auto& site : config_.ws_cull_edge_sites) {
+        if ((site.address & 0x1FFFFFFFu) != (addr & 0x1FFFFFFFu)) continue;
+        if (instr != site.expected) {
+            if (config_.overlay_mode) continue;
+            fmt::print(stderr,
+                       "ERROR: cull edge expected 0x{:08X} at 0x{:08X}, found 0x{:08X}\n",
+                       site.expected, addr, instr);
+            std::exit(1);
+        }
+        const char* delta =
+            site.side == 0 ? "- (uint32_t)psx_ws_x_margin_left()"
+          : site.side == 1 ? "+ (uint32_t)psx_ws_x_margin_right()"
+                           : "+ (uint32_t)(psx_ws_x_margin_left() + psx_ws_x_margin_right())";
+        if (opcode == 0x08 || opcode == 0x09) {   // addi / addiu
+            return fmt::format("{} = {} + (uint32_t)(int32_t){} {};  /* ws cull edge */{}",
+                               reg_name(get_rt(instr)), reg_name(get_rs(instr)),
+                               (int)get_imm16(instr), delta, comment);
+        }
+        // subu rd,rs,rt (left side only, enforced by the config loader)
+        return fmt::format("{} = {} - {} {};  /* ws cull edge */{}",
+                           reg_name(get_rd(instr)), reg_name(get_rs(instr)),
+                           reg_name(get_rt(instr)), delta, comment);
+    }
+
     // Full-word-guarded object/model participation compares. At 4:3 the
     // helper returns the comparison's vanilla value; when widescreen reveals
     // extra world it returns the configured keep verdict. Overlay variants
@@ -3127,6 +3155,8 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern void psx_ws_mmx6_bg_stage_init(void);    /* ws 2D stage reveal invalidation (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
+    ss << "extern int  psx_ws_x_margin_left(void);   /* per-side reveal margins ([widescreen] nw_anchor) */\n";
+    ss << "extern int  psx_ws_x_margin_right(void);\n";
     ss << "extern int32_t psx_ws_player_x_bound(int32_t vanilla);  /* typed gameplay X bound */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
