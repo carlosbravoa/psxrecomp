@@ -52,6 +52,9 @@ uint32_t psx_mod_alloc_guest_memory(uint32_t size, uint32_t alignment);
  * Allocate guest memory that is also addressable by 24-bit GPU linked-list
  * tags. This is intended for opt-in enhanced primitive/ordering-table arenas;
  * without an allocation the aperture remains unmapped and DMA stays faithful.
+ * The mapped bytes travel with savestates / rewind (BS_SEC_MODGPU), so an OT
+ * in guest RAM that links into the arena restores consistently. Allocate once
+ * (activation callback); the aperture is not freed.
  */
 uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t size, uint32_t alignment);
 

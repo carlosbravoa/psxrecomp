@@ -100,6 +100,12 @@ enum {
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
                               from identical baselines). Optional on load for
                               old blobs (left untouched when absent).          */
+    BS_SEC_MODGPU = 0x11,  /* mod GPU-DMA aperture bytes [0, used) (mod_memory.h):
+                              an enhancement's relocated primitive arena is guest
+                              memory the OT in RAM links into. Written only when
+                              something is allocated; on load copied into the
+                              current allocation (skipped when the aperture is
+                              unmapped, i.e. the enhancement is off).            */
 };
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */

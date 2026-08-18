@@ -8,6 +8,7 @@
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"    /* g_psx_icache_tv — fetch-cost tags in BS_SEC_ICACHE */
+#include "mod_memory.h"    /* mod GPU-DMA aperture bytes — BS_SEC_MODGPU          */
 #include "pst_wire.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -370,7 +371,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
-    h.section_count = 16;
+    h.section_count = 16u + (psx_mod_gpu_dma_memory_used_bytes() > 0u ? 1u : 0u);   /* + BS_SEC_MODGPU */
 
     ok = write_header_le(o, &h);
 
@@ -442,6 +443,12 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
         for (uint32_t i = 0; ok && i < 1024u; i++)
             ok = pst_w_u32(&w, g_psx_icache_tv[i]);
         if (ok) ok = write_section(o, BS_SEC_ICACHE, ib, sizeof ib);
+    }
+    if (ok && psx_mod_gpu_dma_memory_used_bytes() > 0u) {
+        /* Enhancement primitive arena (mod GPU-DMA aperture): the OT in RAM
+         * links into it, so a restored frame must find the same packets. */
+        ok = write_section(o, BS_SEC_MODGPU, psx_mod_gpu_dma_memory_ptr(),
+                           psx_mod_gpu_dma_memory_used_bytes());
     }
     if (ok) {
         uint32_t wc = dirty_ram_get_bitmap_word_count();
@@ -666,6 +673,14 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         }
         dirty_ram_set_bitmap_words(words, wc);
         free(words);
+        return 1;
+    }
+    case BS_SEC_MODGPU: {
+        /* Copy what the current allocation can hold; an unmapped aperture
+         * (enhancement off in this session) leaves nothing to restore. */
+        uint32_t used = psx_mod_gpu_dma_memory_used_bytes();
+        uint32_t n = len < used ? len : used;
+        if (n) memcpy(psx_mod_gpu_dma_memory_ptr(), p, n);
         return 1;
     }
     case BS_SEC_ICACHE: {

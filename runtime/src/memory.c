@@ -88,6 +88,9 @@ static int mod_gpu_dma_memory_offset(uint32_t phys, uint32_t width,
         phys, width, mod_gpu_dma_memory_used, offset);
 }
 
+uint8_t *psx_mod_gpu_dma_memory_ptr(void) { return mod_gpu_dma_memory; }
+uint32_t psx_mod_gpu_dma_memory_used_bytes(void) { return mod_gpu_dma_memory_used; }
+
 uint32_t psx_mod_gpu_dma_resolve_address(uint32_t address) {
     return psx_mod_gpu_dma_resolve_address_for(
         address, mod_gpu_dma_memory_used);

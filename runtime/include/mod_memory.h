@@ -43,6 +43,11 @@ static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
 
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment);
 uint32_t psx_mod_gpu_dma_resolve_address(uint32_t address);
+/* The mapped aperture bytes [0, used) — savestates carry them (BS_SEC_MODGPU):
+ * an enhancement's primitive arena is guest-visible memory the OT in RAM
+ * links into, so a restored frame must see the same packets. */
+uint8_t *psx_mod_gpu_dma_memory_ptr(void);
+uint32_t psx_mod_gpu_dma_memory_used_bytes(void);
 
 #ifdef __cplusplus
 }
