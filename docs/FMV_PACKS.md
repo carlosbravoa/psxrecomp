@@ -75,16 +75,23 @@ current `disc_file`.
    skeleton with the exact numbering an HD pack must follow.
 2. `tools/fmv_pack.py`:
    ```
+   fmv_pack.py export-str STR... --out DIR [--png]     the movies as MP4 (video + XA audio, one
+                                                        frame per STR frame) or PNG + WAV, straight
+                                                        from the disc tree's raw STR files (ffmpeg)
    fmv_pack.py info    PACK                              movies / frame counts / sizes / gaps
    fmv_pack.py upscale DUMP PACK --scale N [--filter]    N x every dumped frame (identity skeleton)
    fmv_pack.py from-video VIDEO PACK/MOVIE --frames N [--size WxH] [--jpg]
                                                          resample any video to exactly N frames (ffmpeg)
    fmv_pack.py check   PACK DUMP                         every dumped frame covered?
    ```
-   Typical: dump once → `from-video your_upscaled_ROCK8_0.mp4 pack/ROCK8_0
-   --frames <count from info>` (the video may have any fps/length; the
-   frames are distributed evenly, so an upscale of the original keeps sync
-   exactly) → `check`.
+   Typical round trip: `export-str game-assets/disc/cdrom/MOVIE/*.STR --out
+   movies/` → upscale / edit the MP4s in your own tool, keeping the cut →
+   `from-video movies_hd/ROCK8_0.mp4 pack/ROCK8_0 --frames <count export-str
+   printed>` (the video may have any fps/length; frames are distributed
+   evenly, so an upscale of the original keeps sync exactly) → `check`.
+   `export-str` needs the STRs as the tree stores them (raw 2336-byte
+   sectors; a cooked 2048 copy has no audio) — it wraps them into the 2352
+   sectors ffmpeg's `psxstr` demuxer expects.
 3. Point `[video] fmv_pack` at the directory and tick **HD movies**.
 
 Sizes: 12,500 frames of Mega Man 8's six movies at 640×480 are ~1 GB as

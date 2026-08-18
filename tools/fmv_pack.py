@@ -13,8 +13,14 @@ writes the native frames in exactly that layout, so:
                                                       resample a video (any fps/length) to exactly N
                                                       frames with ffmpeg — N = the dump's frame count
     fmv_pack.py check   PACK DUMP                     every dumped movie/frame covered by the pack?
+    fmv_pack.py export-str STR... OUTDIR [--png] [--crf N]
+                                                      decode PSX STR files (as stored in a disc tree,
+                                                      raw 2336-byte sectors, or 2352 raw) to MP4
+                                                      (video + XA audio, one frame per STR frame)
+                                                      or PNG frames + WAV — for upscalers/editors
 
-Only Pillow is required; `from-video` shells out to ffmpeg/ffprobe.
+Only Pillow is required; `from-video` / `export-str` shell out to ffmpeg/ffprobe.
+Round trip: export-str -> upscale/edit (keep the cut) -> from-video --frames <STR frames>.
 """
 from __future__ import annotations
 
@@ -123,6 +129,72 @@ def cmd_from_video(a):
     return 0 if got == a.frames else 1
 
 
+def wrap_2352(src: Path, dst: Path) -> int:
+    """PSX STR as stored in a disc tree = raw 2336-byte sectors (subheader + data +
+    EDC); ffmpeg's psxstr demuxer wants full 2352-byte sectors with sync + header,
+    so prepend them (MSF is cosmetic). Returns the sector count; passes 2352 files through."""
+    data = src.read_bytes()
+    if len(data) % 2352 == 0 and data[:12] == bytes([0] + [0xFF] * 10 + [0]):
+        dst.write_bytes(data)
+        return len(data) // 2352
+    if len(data) % 2336:
+        sys.exit(f"{src}: {len(data)} bytes is neither raw 2336 nor 2352 sectors (a cooked 2048 copy has no XA audio; copy the STR raw — disc_tree.py copy)")
+    sync = bytes([0] + [0xFF] * 10 + [0])
+    def bcd(v): return ((v // 10) << 4) | (v % 10)
+    out = bytearray()
+    n = len(data) // 2336
+    for i in range(n):
+        lba = i + 150
+        out += sync + bytes([bcd(lba // 4500), bcd((lba // 75) % 60), bcd(lba % 75), 2]) + data[i * 2336:(i + 1) * 2336]
+    dst.write_bytes(out)
+    return n
+
+
+def cmd_export_str(a):
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        sys.exit("export-str needs ffmpeg and ffprobe on PATH")
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    rc = 0
+    for f in a.strs:
+        src = Path(f)
+        name = src.stem.upper()
+        with tempfile.NamedTemporaryFile(suffix=".str", delete=False) as t:
+            tmp = Path(t.name)
+        try:
+            wrap_2352(src, tmp)
+            pr = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+                                 "-show_entries", "stream=nb_read_frames,width,height,r_frame_rate",
+                                 "-of", "json", str(tmp)], capture_output=True, text=True)
+            try:
+                st = json.loads(pr.stdout)["streams"][0]
+                frames = int(st.get("nb_read_frames") or 0)
+                print(f"{src.name}: {st.get('width')}x{st.get('height')} @ {st.get('r_frame_rate')}, {frames} frames")
+            except (KeyError, IndexError, ValueError, json.JSONDecodeError):
+                print(f"{src.name}: ffprobe could not read it ({pr.stderr.strip()[:200]})", file=sys.stderr)
+                rc = 1
+                continue
+            if a.png:
+                d = out / name
+                d.mkdir(parents=True, exist_ok=True)
+                r = subprocess.run([ffmpeg, "-v", "error", "-y", "-i", str(tmp), "-start_number", "0", str(d / "%05d.png")])
+                r2 = subprocess.run([ffmpeg, "-v", "error", "-y", "-i", str(tmp), "-vn", "-c:a", "pcm_s16le", str(d / "audio.wav")])
+                ok = r.returncode == 0 and r2.returncode == 0
+                print(f"   -> {d}/00000.png .. {frames - 1:05d}.png + audio.wav" if ok else "   ffmpeg failed")
+            else:
+                mp4 = out / f"{name}.mp4"
+                r = subprocess.run([ffmpeg, "-v", "error", "-y", "-i", str(tmp), "-c:v", "libx264", "-crf", str(a.crf),
+                                    "-preset", "slow", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(mp4)])
+                ok = r.returncode == 0
+                print(f"   -> {mp4}  (use --frames {frames} with from-video)" if ok else "   ffmpeg failed")
+            rc |= 0 if ok else 1
+        finally:
+            tmp.unlink(missing_ok=True)
+    return rc
+
+
 def cmd_check(a):
     pack, dump = Path(a.pack), Path(a.dump)
     bad = 0
@@ -154,6 +226,10 @@ def main():
     p.add_argument("--jpg", action="store_true", help="write JPEG frames (smaller, faster to decode)")
     p.set_defaults(fn=cmd_from_video)
     p = sub.add_parser("check"); p.add_argument("pack"); p.add_argument("dump"); p.set_defaults(fn=cmd_check)
+    p = sub.add_parser("export-str"); p.add_argument("strs", nargs="+"); p.add_argument("--out", required=True)
+    p.add_argument("--png", action="store_true", help="PNG frame folder + audio.wav per movie instead of MP4")
+    p.add_argument("--crf", type=int, default=10, help="x264 quality for MP4 (lower = better; 10 is visually lossless)")
+    p.set_defaults(fn=cmd_export_str)
     a = ap.parse_args()
     return a.fn(a)
 
