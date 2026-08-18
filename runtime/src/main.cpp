@@ -4430,6 +4430,32 @@ static int savestate_resume_inputs_held(void) {
     return any_controller_button_down();
 }
 
+/* Host-menu input isolation: while the savestate menu or the system (ESC)
+ * menu is open the game sees a released pad, and after either closes (or a
+ * slot save/load was submitted) the pad stays released until every key /
+ * button is up — so the Enter / button that confirmed the menu action never
+ * reaches the game as START / X (a save opening the game's pause menu, a
+ * load into the stage select entering a stage). Bounded by 3 s in case a key
+ * is genuinely held. */
+static int      g_menu_release_guard = 0;
+static uint32_t g_menu_release_guard_until = 0;
+static void menu_release_guard_arm(void) {
+    g_menu_release_guard = 1;
+    g_menu_release_guard_until = (uint32_t)SDL_GetTicks() + 3000u;
+}
+static int  savestate_menu_open_flag(void);   /* fwd: statics defined below */
+static int  sysmenu_open_flag(void);
+static int  host_menu_input_isolated(void) {
+    if (savestate_menu_open_flag() || sysmenu_open_flag()) return 1;
+    if (!g_menu_release_guard) return 0;
+    if ((int32_t)((uint32_t)SDL_GetTicks() - g_menu_release_guard_until) >= 0 ||
+        !savestate_resume_inputs_held()) {
+        g_menu_release_guard = 0;
+        return 0;
+    }
+    return 1;
+}
+
 static int savestate_input_guard_active(void) {
     uint32_t now;
     if (g_savestate_input_guard_max_until == 0)
@@ -4544,7 +4570,7 @@ static int capture_pad_slot(int s, PsxNetPad* out) {
         else if (hybrid_dpad_active(p, player, src)) p.hybrid_analog = false;
         eff_analog = p.hybrid_analog ? 1 : 0;
     }
-    if (savestate_input_guard_active()) {
+    if (savestate_input_guard_active() || host_menu_input_isolated()) {
         out->buttons = 0xFFFFu;
         out->lx = out->ly = out->rx = out->ry = 0x80u;
         out->analog = eff_analog ? 1u : 0u;
@@ -5509,6 +5535,7 @@ static int hotkey_pad_binding_down(int binding) {
 }
 
 static int savestate_menu_open = 0;
+static int savestate_menu_open_flag(void) { return savestate_menu_open; }
 static int savestate_menu_slot = 0;
 static int savestate_menu_ignore_toggle_release = 0;
 static SDL_Keycode savestate_menu_open_key = 0;
@@ -5527,6 +5554,7 @@ static void savestate_menu_close(void) {
     savestate_menu_confirm = 0;
     savestate_menu_open = 0;
     savestate_menu_sync_overlay();
+    menu_release_guard_arm();
     host_osd_push("Save states closed", 800);
 }
 
@@ -5571,6 +5599,7 @@ enum {
 };
 
 static int  g_sysmenu_open = 0;
+static int  sysmenu_open_flag(void) { return g_sysmenu_open; }
 static int  g_sysmenu_sel  = 0;   /* index into the VISIBLE rows */
 /* Which of the three scanline parameters LEFT/RIGHT adjust on the SCANLINES
  * row (0 opacity, 1 size, 2 glow); Enter cycles it. Bracketed in the label. */
@@ -5744,6 +5773,7 @@ static void sysmenu_restart(void) {
 
 static void sysmenu_close(void) {
     g_sysmenu_open = 0;
+    menu_release_guard_arm();
     sysmenu_sync();
 }
 
@@ -5905,6 +5935,7 @@ static int savestate_submit_slot(int slot, int save) {
     }
     if (!save)
         savestate_input_guard_arm();
+    menu_release_guard_arm();          /* the confirming key/button must be released before the game sees input */
     if (psx_netplay_active()) {
         if (!psx_netplay_is_host()) {
             host_osd_push("Save states are host-only in netplay", 1500);

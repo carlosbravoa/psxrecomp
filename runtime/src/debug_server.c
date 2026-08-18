@@ -4076,6 +4076,7 @@ static const char *thread_kind_name(uint32_t kind)
         case 32: return "deferred_switch_escape";
         case 33: return "deferred_switch_stale";
         case 40: return "sched_safety_net_resume";    /* target's top-level dispatch returned pc==0 -> yielder resumed (traps.c) */
+        case 41: return "sched_lost_return_resume";   /* same, but the thread was resumed at its $ra instead (traps.c) */
         default: return "unknown";
     }
 }
@@ -9993,6 +9994,7 @@ static void handle_sched_escape_ring(int id, const char *json)
     typedef struct { uint32_t seq, frame, reason, current_tcb, target_tcb, resume_pc, pc, ra, sp; } E;
     extern E g_sched_escape_ring[]; extern uint64_t g_sched_escape_seq;
     extern uint64_t g_sched_safety_net_count; extern uint32_t g_sched_safety_net_last_frame;
+    extern uint64_t g_sched_lost_return_count; extern uint32_t g_sched_lost_return_last_frame, g_sched_lost_return_last_ra;
     const uint32_t cap = 1024u;   /* SCHED_ESCAPE_RING_CAP in traps.c */
     int count = json_get_int(json, "count", 256);
     if (count < 1) count = 1;
@@ -10004,9 +10006,11 @@ static void handle_sched_escape_ring(int id, const char *json)
     char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
     size_t pos = (size_t)snprintf(buf, BUF_SZ,
         "{\"id\":%d,\"ok\":true,\"total\":%llu,\"safety_net_resumes\":%llu,\"safety_net_last_frame\":%u,"
-        "\"reasons\":{\"0\":\"continue\",\"1\":\"yield_to_tcb\",\"2\":\"resume_current\",\"3\":\"guest_exit\",\"4\":\"return_to_lobby\",\"5\":\"fatal\",\"100\":\"safety_net_resume\"},"
+        "\"lost_return_resumes\":%llu,\"lost_return_last_frame\":%u,\"lost_return_last_ra\":\"0x%08X\","
+        "\"reasons\":{\"0\":\"continue\",\"1\":\"yield_to_tcb\",\"2\":\"resume_current\",\"3\":\"guest_exit\",\"4\":\"return_to_lobby\",\"5\":\"fatal\",\"100\":\"safety_net_resume\",\"101\":\"lost_return_resume\"},"
         "\"entries\":[",
-        id, (unsigned long long)total, (unsigned long long)g_sched_safety_net_count, g_sched_safety_net_last_frame);
+        id, (unsigned long long)total, (unsigned long long)g_sched_safety_net_count, g_sched_safety_net_last_frame,
+        (unsigned long long)g_sched_lost_return_count, g_sched_lost_return_last_frame, g_sched_lost_return_last_ra);
     for (uint32_t i = 0; i < n && pos < BUF_SZ - 256; i++) {
         uint64_t idx = total - n + i;
         const E *e = &g_sched_escape_ring[idx & (cap - 1u)];

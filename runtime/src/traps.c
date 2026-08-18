@@ -70,6 +70,25 @@ uint64_t g_sched_escape_seq = 0;
 #define PSX_RUN_SAFETY_NET_RESUME 100u
 uint64_t g_sched_safety_net_count = 0;
 uint32_t g_sched_safety_net_last_frame = 0;
+/* Pseudo-reason 101: the yielded-to thread's dispatch returned pc==0 while its
+ * $ra is a sane game re-entry point — a call whose return obligation was lost
+ * somewhere in the dispatch chain (the callee finished as a C return). The
+ * thread is resumed at $ra with the registers as they are (exactly what its
+ * `jr $ra` would have done) instead of being abandoned to the safety net,
+ * which left the thread parked (Mega Man 8 black-screen #19: the game
+ * thread's sleep counter underflowed because root ran again early). */
+#define PSX_RUN_LOST_RETURN_RESUME 101u
+uint64_t g_sched_lost_return_count = 0;
+uint32_t g_sched_lost_return_last_frame = 0;
+uint32_t g_sched_lost_return_last_ra = 0;
+
+static int sched_ra_resume_ok(uint32_t pc)
+{
+    if (!psx_is_dispatchable(pc) || (pc & 3u)) return 0;
+    if (pc == 0x80000080u || pc == 0xbfc00180u || pc == 0x80000000u) return 0;
+    const uint32_t phys = pc & 0x1fffffffu;
+    return phys >= 0x10000u && phys < 0x200000u;   /* game RAM above the kernel */
+}
 
 static void sched_escape_ring_log(CPUState* cpu, uint32_t reason,
                                   uint32_t current_tcb, uint32_t target_tcb,
@@ -901,6 +920,23 @@ void psx_scheduler_run(CPUState* cpu)
          * instead of tearing down the whole run. Otherwise it's the legacy
          * top-level abnormal exit — unless an RB top-level resume can recover
          * at $ra / sticky BB (returning-leaf snap after flush_resume). */
+        if (psx_is_valid_tcb(cpu, g_sched_return_tcb) &&
+            g_sched_return_tcb != psx_current_tcb_ptr(cpu) &&
+            psx_tcb_state(cpu, psx_current_tcb_ptr(cpu)) == 0x4000u &&
+            sched_ra_resume_ok(cpu->gpr[31])) {
+            /* Lost return obligation inside a running thread: continue it at
+             * $ra rather than parking it (see PSX_RUN_LOST_RETURN_RESUME). */
+            const uint32_t ra = cpu->gpr[31];
+            g_sched_lost_return_count++;
+            { extern uint64_t s_frame_count; g_sched_lost_return_last_frame = (uint32_t)s_frame_count; }
+            g_sched_lost_return_last_ra = ra;
+            sched_escape_ring_log(cpu, PSX_RUN_LOST_RETURN_RESUME, psx_current_tcb_ptr(cpu), g_sched_return_tcb, ra);
+            debug_server_log_thread_event(41, cpu, psx_current_tcb_ptr(cpu), g_sched_return_tcb, ra);
+            g_sched_escape.target_tcb = 0;
+            g_sched_escape.resume_pc  = ra;
+            g_sched_escape.reason     = PSX_RUN_RESUME_CURRENT;
+            continue;
+        }
         if (psx_is_valid_tcb(cpu, g_sched_return_tcb) &&
             g_sched_return_tcb != psx_current_tcb_ptr(cpu)) {
             uint32_t yielder = g_sched_return_tcb;

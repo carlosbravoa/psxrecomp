@@ -22,9 +22,9 @@ KINDS = {1: "save", 2: "restore", 3: "change_enter", 4: "invalid", 5: "same", 6:
          12: "fiber_return_restore", 13: "fiber_dispatch_exit", 20: "syscall3_enter",
          24: "syscall3_enter_in_exc", 26: "fiber_dispatch_exit_in_exc", 30: "inexc_switch_escape",
          31: "inexc_switch_defer", 32: "deferred_switch_escape", 33: "deferred_switch_stale",
-         40: "SCHED_SAFETY_NET_RESUME"}
+         40: "SCHED_SAFETY_NET_RESUME", 41: "SCHED_LOST_RETURN_RESUME"}
 REASONS = {0: "continue", 1: "yield_to_tcb", 2: "resume_current", 3: "guest_exit",
-           4: "return_to_lobby", 5: "fatal", 100: "SAFETY_NET_RESUME"}
+           4: "return_to_lobby", 5: "fatal", 100: "SAFETY_NET_RESUME", 101: "LOST_RETURN_RESUME"}
 
 
 def main():
@@ -38,7 +38,8 @@ def main():
     print(f"bundle {a.bundle}: frame {rt.get('ping', {}).get('frame')}, renderer {host.get('renderer')}, build {host.get('build')}")
     esc = rt.get("sched_escape_ring", {})
     ents = esc.get("entries", [])
-    print(f"\n== scheduler escapes: total {esc.get('total')}, safety-net resumes {esc.get('safety_net_resumes')} (last at frame {esc.get('safety_net_last_frame')}), {len(ents)} in ring")
+    print(f"\n== scheduler escapes: total {esc.get('total')}, safety-net resumes {esc.get('safety_net_resumes')} (last at frame {esc.get('safety_net_last_frame')}), "
+          f"lost-return resumes {esc.get('lost_return_resumes')} (last at frame {esc.get('lost_return_last_frame')}, ra {esc.get('lost_return_last_ra')}), {len(ents)} in ring")
     # cadence: per frame, which TCBs appeared as targets
     by_frame = collections.OrderedDict()
     for e in ents:
@@ -66,6 +67,9 @@ def main():
     kinds = collections.Counter(KINDS.get(e.get("kind"), e.get("kind")) for e in tents)
     print("   kinds:", dict(kinds))
     odd = [e for e in tents if e.get("kind") not in (1, 2, 3, 5, 8, 20)]
+    sn = [e for e in ents if e.get("reason") in (100, 101)]
+    if sn:
+        print(f"   !! {len(sn)} safety-net / lost-return escapes:", [(e['frame'], REASONS.get(e['reason']), e['ra']) for e in sn[-10:]])
     if odd:
         print(f"   !! {len(odd)} non-routine events (newest last):")
         for e in odd[-20:]:
