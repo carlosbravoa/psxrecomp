@@ -13,6 +13,10 @@ writes the native frames in exactly that layout, so:
                                                       resample a video (any fps/length) to exactly N
                                                       frames with ffmpeg — N = the dump's frame count
     fmv_pack.py check   PACK DUMP                     every dumped movie/frame covered by the pack?
+    fmv_pack.py align   STR VIDEO [--write PACK/MOVIE]  frame offset between the STR and an edited/upscaled
+                                                      video (an upscaler that trims a black lead-in shifts
+                                                      everything): prints the best shift and can write
+                                                      movie.toml `offset = -N` into the pack directory
     fmv_pack.py export-str STR... OUTDIR [--png] [--crf N]
                                                       decode PSX STR files (as stored in a disc tree,
                                                       raw 2336-byte sectors, or 2352 raw) to MP4
@@ -109,24 +113,57 @@ def cmd_from_video(a):
         sys.exit(f"ffprobe could not read the duration of {a.video}: {pr.stderr.strip()}")
     if duration <= 0:
         sys.exit("zero-length video")
+    # Exact frame count of the source (nb_frames from the container when present,
+    # else a decode-and-count pass): a video that already has the wanted number
+    # of frames is copied 1:1 — no fps resampling that could drop/duplicate.
+    src_frames = 0
+    pr2 = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames",
+                          "-of", "default=nw=1:nk=1", a.video], capture_output=True, text=True)
+    try:
+        src_frames = int(pr2.stdout.strip())
+    except ValueError:
+        pr3 = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+                              "-show_entries", "stream=nb_read_frames", "-of", "default=nw=1:nk=1", a.video],
+                             capture_output=True, text=True)
+        try:
+            src_frames = int(pr3.stdout.strip())
+        except ValueError:
+            src_frames = 0
+    vfs = []
+    one_to_one = src_frames == a.frames
     fps = a.frames / duration
-    vf = f"fps={fps:.6f}"
+    if not one_to_one:
+        vfs.append(f"fps={fps:.6f}")
     if a.size:
         w, h = a.size.lower().split("x")
-        vf += f",scale={int(w)}:{int(h)}"
+        vfs.append(f"scale={int(w)}:{int(h)}")
     ext = "jpg" if a.jpg else "png"
-    cmd = [ffmpeg, "-v", "error", "-y", "-i", a.video, "-vf", vf, "-frames:v", str(a.frames),
-           "-start_number", "0"]
+    cmd = [ffmpeg, "-v", "error", "-y", "-i", a.video]
+    if vfs:
+        cmd += ["-vf", ",".join(vfs)]
+    cmd += ["-frames:v", str(a.frames), "-start_number", "0"]
     if a.jpg:
         cmd += ["-q:v", "3"]
     cmd.append(str(out / f"%05d.{ext}"))
     r = subprocess.run(cmd)
     if r.returncode != 0:
         sys.exit("ffmpeg failed")
-    got = len(movie_frames(out))
-    print(f"{a.video}: {duration:.2f}s -> {got} frames at {fps:.3f} fps in {out}"
-          + ("" if got == a.frames else f" (WARNING: wanted {a.frames})"))
-    return 0 if got == a.frames else 1
+    got = movie_frames(out)
+    n_got = len(got)
+    # A source a few frames short (rounding of the resample, a trimmed tail): hold
+    # the last picture so the pack still covers every decode index.
+    padded = 0
+    if 0 < n_got < a.frames:
+        last = got[max(got)]
+        for i in range(max(got) + 1, a.frames):
+            shutil.copyfile(last, out / f"{i:05d}.{ext}")
+            padded += 1
+        n_got = len(movie_frames(out))
+    print(f"{a.video}: {duration:.2f}s, {src_frames or '?'} source frames -> {n_got} frames in {out}"
+          + (" (1:1)" if one_to_one else f" (resampled at {fps:.3f} fps)")
+          + (f", last frame held for {padded} missing at the end" if padded else "")
+          + ("" if n_got == a.frames else f" (WARNING: wanted {a.frames})"))
+    return 0 if n_got == a.frames else 1
 
 
 def wrap_2352(src: Path, dst: Path) -> int:
@@ -195,6 +232,59 @@ def cmd_export_str(a):
     return rc
 
 
+def gray_thumbs(ffmpeg: str, src: Path, w: int = 32, h: int = 24):
+    """List of w*h grayscale frames (bytes) of a video / wrapped STR."""
+    r = subprocess.run([ffmpeg, "-v", "error", "-i", str(src), "-vf", f"scale={w}:{h}", "-pix_fmt", "gray",
+                        "-f", "rawvideo", "-"], capture_output=True)
+    if r.returncode != 0:
+        sys.exit(f"ffmpeg could not decode {src}: {r.stderr.decode(errors='replace')[:200]}")
+    n = w * h
+    return [r.stdout[i * n:(i + 1) * n] for i in range(len(r.stdout) // n)]
+
+
+def cmd_align(a):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        sys.exit("align needs ffmpeg on PATH")
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".str", delete=False) as t:
+        tmp = Path(t.name)
+    try:
+        wrap_2352(Path(a.str), tmp)
+        A = gray_thumbs(ffmpeg, tmp)
+    finally:
+        tmp.unlink(missing_ok=True)
+    B = gray_thumbs(ffmpeg, Path(a.video))
+    n = 32 * 24
+    def dist(x, y):
+        return sum(abs(p - q) for p, q in zip(x, y)) / n
+    print(f"{Path(a.str).name}: {len(A)} frames; {Path(a.video).name}: {len(B)} frames")
+    best = None
+    step = max(1, len(B) // 400)                       # ~400 sample points
+    for k in range(-a.range, a.range + 1):             # video frame j <-> STR frame j + k
+        good = tot = 0
+        for j in range(0, len(B), step):
+            i = j + k
+            if 0 <= i < len(A):
+                good += 1 if dist(A[i], B[j]) < 6 else 0
+                tot += 1
+        if tot and (best is None or good > best[1]):
+            best = (k, good, tot)
+    k, good, tot = best
+    print(f"best: video frame j = STR frame j + {k}  ({good}/{tot} sample frames match closely)")
+    print(f"pack offset = {-k}  (pack index = decode index {'-' if k > 0 else '+'} {abs(k)})" if k else "in sync: no offset needed")
+    if a.write:
+        d = Path(a.write)
+        d.mkdir(parents=True, exist_ok=True)
+        toml = d / "movie.toml"
+        lines = [l for l in (toml.read_text().splitlines() if toml.exists() else []) if not l.strip().startswith("offset")]
+        if k:
+            lines.append(f"offset = {-k}")
+        toml.write_text("\n".join(lines) + ("\n" if lines else ""))
+        print(f"wrote {toml}")
+    return 0
+
+
 def cmd_check(a):
     pack, dump = Path(a.pack), Path(a.dump)
     bad = 0
@@ -226,6 +316,10 @@ def main():
     p.add_argument("--jpg", action="store_true", help="write JPEG frames (smaller, faster to decode)")
     p.set_defaults(fn=cmd_from_video)
     p = sub.add_parser("check"); p.add_argument("pack"); p.add_argument("dump"); p.set_defaults(fn=cmd_check)
+    p = sub.add_parser("align"); p.add_argument("str"); p.add_argument("video")
+    p.add_argument("--range", type=int, default=60, help="max shift searched, frames")
+    p.add_argument("--write", help="PACK/MOVIE directory to write movie.toml offset into")
+    p.set_defaults(fn=cmd_align)
     p = sub.add_parser("export-str"); p.add_argument("strs", nargs="+"); p.add_argument("--out", required=True)
     p.add_argument("--png", action="store_true", help="PNG frame folder + audio.wav per movie instead of MP4")
     p.add_argument("--crf", type=int, default=10, help="x264 quality for MP4 (lower = better; 10 is visually lossless)")

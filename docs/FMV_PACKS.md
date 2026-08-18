@@ -81,7 +81,11 @@ current `disc_file`.
    fmv_pack.py info    PACK                              movies / frame counts / sizes / gaps
    fmv_pack.py upscale DUMP PACK --scale N [--filter]    N x every dumped frame (identity skeleton)
    fmv_pack.py from-video VIDEO PACK/MOVIE --frames N [--size WxH] [--jpg]
-                                                         resample any video to exactly N frames (ffmpeg)
+                                                         a video with exactly N frames is copied 1:1, any
+                                                         other length is resampled to N (ffmpeg); a short
+                                                         tail holds the last frame
+   fmv_pack.py align   STR VIDEO [--write PACK/MOVIE]    frame shift between the STR and an edited video
+                                                         (upscalers that trim a black lead-in) -> movie.toml offset
    fmv_pack.py check   PACK DUMP                         every dumped frame covered?
    ```
    Typical round trip: `export-str game-assets/disc/cdrom/MOVIE/*.STR --out
@@ -92,6 +96,11 @@ current `disc_file`.
    `export-str` needs the STRs as the tree stores them (raw 2336-byte
    sectors; a cooked 2048 copy has no audio) — it wraps them into the 2352
    sectors ffmpeg's `psxstr` demuxer expects.
+   Real case (Mega Man 8, six movies HEVC 1280×960 from an AI upscaler): five
+   came back with exactly the STR's frame count (copied 1:1); one had its
+   14-frame black lead-in trimmed — `align` found `video frame j = STR frame
+   j + 14` and wrote `offset = -14`, so decode index 135 shows pack frame 121
+   (the same picture) and the first 14 decodes show the native black frames.
 3. Point `[video] fmv_pack` at the directory and tick **HD movies**.
 
 Sizes: 12,500 frames of Mega Man 8's six movies at 640×480 are ~1 GB as
