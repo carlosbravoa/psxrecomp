@@ -1663,21 +1663,32 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                     if (side == "left") site.side = 0;
                     else if (side == "right") site.side = 1;
                     else if (side == "width") site.side = 2;
+                    else if (side == "bias") site.side = 3;
+                    else if (side == "range") site.side = 4;
                     else
                         throw std::runtime_error(fmt::format(
-                            "{}: [[widescreen.cull.edge]] side must be \"left\", \"right\" or \"width\"",
+                            "{}: [[widescreen.cull.edge]] side must be \"left\", \"right\", \"width\", \"bias\" or \"range\"",
                             config_path.string()));
                     const uint32_t op = site.expected >> 26;
                     const uint32_t fn = site.expected & 0x3Fu;
                     const bool addi = (op == 0x08u || op == 0x09u);
                     const bool subu = (op == 0u && fn == 0x23u);
-                    if (!(addi || subu))
+                    const bool sltiu = (op == 0x0Bu);
+                    if (!(addi || subu || sltiu))
                         throw std::runtime_error(fmt::format(
-                            "{}: [[widescreen.cull.edge]] expected must be ADDI/ADDIU or SUBU",
+                            "{}: [[widescreen.cull.edge]] expected must be ADDI/ADDIU, SUBU or SLTIU",
                             config_path.string()));
                     if (subu && site.side != 0)
                         throw std::runtime_error(fmt::format(
                             "{}: [[widescreen.cull.edge]] a SUBU site must be side = \"left\"",
+                            config_path.string()));
+                    if (sltiu != (site.side == 4))
+                        throw std::runtime_error(fmt::format(
+                            "{}: [[widescreen.cull.edge]] side = \"range\" is for SLTIU sites (and only those)",
+                            config_path.string()));
+                    if (site.side == 3 && !addi)
+                        throw std::runtime_error(fmt::format(
+                            "{}: [[widescreen.cull.edge]] side = \"bias\" needs an ADDI/ADDIU site",
                             config_path.string()));
                     /* Overlay variants may legitimately list the same VA with a
                      * different instruction word; only an exact repeat is an error. */

@@ -642,6 +642,7 @@ int psx_ws_cull_edge_site(uint32_t pc, uint32_t instr, int32_t *delta) {
         if (delta) {
             *delta = site->side == 0 ? -psx_ws_x_margin_left()
                    : site->side == 1 ?  psx_ws_x_margin_right()
+                   : site->side == 3 ?  psx_ws_x_margin_left()
                                      :  psx_ws_x_margin_left() + psx_ws_x_margin_right();
         }
         return 1;

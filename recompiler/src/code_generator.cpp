@@ -910,7 +910,13 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         const char* delta =
             site.side == 0 ? "- (uint32_t)psx_ws_x_margin_left()"
           : site.side == 1 ? "+ (uint32_t)psx_ws_x_margin_right()"
+          : site.side == 3 ? "+ (uint32_t)psx_ws_x_margin_left()"
                            : "+ (uint32_t)(psx_ws_x_margin_left() + psx_ws_x_margin_right())";
+        if (opcode == 0x0B) {   // sltiu (side "range"): unsigned width test
+            return fmt::format("{} = ({} < (uint32_t)((int32_t){} {})) ? 1u : 0u;  /* ws cull edge range */{}",
+                               reg_name(get_rt(instr)), reg_name(get_rs(instr)),
+                               (int)get_imm16(instr), delta, comment);
+        }
         if (opcode == 0x08 || opcode == 0x09) {   // addi / addiu
             return fmt::format("{} = {} + (uint32_t)(int32_t){} {};  /* ws cull edge */{}",
                                reg_name(get_rt(instr)), reg_name(get_rs(instr)),

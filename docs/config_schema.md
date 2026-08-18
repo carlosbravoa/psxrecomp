@@ -364,7 +364,10 @@ edge = [
 ]
 ```
 
-- `expected` must be `ADDI`/`ADDIU` (any side) or `SUBU` (side `left`).
+- `expected` must be `ADDI`/`ADDIU` (sides `left`/`right`/`width`/`bias`),
+  `SUBU` (side `left`) or `SLTIU` (side `range`). `bias` (`+= left`) and
+  `range` (`+= left+right`) are the two halves of the unsigned bias+range
+  keep-alive idiom `(x - camX + K) <u W` — alive iff `-K <= x-camX < W-K`.
 - Full-word guarded: an overlay entry applies only where the stage's code holds
   exactly that instruction; the same VA may be listed once per variant word.
 - Identity at 4:3 (both margins 0). Native generated code, overlay shards and

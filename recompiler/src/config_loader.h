@@ -78,7 +78,7 @@ struct WidescreenCullKeepSite {
 struct WidescreenCullEdgeSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded ADDI/ADDIU/SUBU instruction
-    uint32_t side = 0;     // 0 left, 1 right, 2 width
+    uint32_t side = 0;     // 0 left, 1 right, 2 width, 3 bias (+left), 4 range (SLTIU, +left+right)
 };
 
 // Aspect-scaled 12-bit angular half-extent. These sites load a positive angle
@@ -866,7 +866,10 @@ struct GameConfig {
     // title's game logic (keep-alive, on-screen, spawn strips) that carry the
     // 4:3 width as an immediate; moved by the per-side reveal so objects live,
     // act and spawn just off the WIDE edge exactly as they did off the 4:3
-    // one. Empty by default; identity at 4:3; regen required.
+    // one. Sides "bias" (an ADDIU adding a left margin to x-camX before an
+    // unsigned range test, += left) and "range" (that SLTIU width, +=
+    // left+right) cover the bias+range idiom. Empty by default; identity at
+    // 4:3; regen required.
     std::vector<WidescreenCullEdgeSite> ws_cull_edge_sites;
     // Exact 12-bit angular half-extents used by terrain-cell frusta.
     std::vector<WidescreenAngleSite> ws_cull_angle_sites;

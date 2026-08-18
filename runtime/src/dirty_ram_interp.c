@@ -1916,8 +1916,11 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
          * shared helper for a flagged render-cull site — it is byte-identical
          * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
          * code path serves both aspects (no widescreen-specific caching). */
+        int32_t edge = 0;
         if (psx_ws_cull_keep_site(pc, insn, vanilla, &kept))
             cpu->gpr[rt] = kept;
+        else if (psx_ws_cull_edge_site(pc, insn, &edge))
+            cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)(simm + edge)) ? 1u : 0u;
         else if (psx_ws_is_cull_depth_site(pc))
             cpu->gpr[rt] = (cpu->gpr[rs] <
                             (uint32_t)psx_ws_depth_bound(simm)) ? 1u : 0u;
