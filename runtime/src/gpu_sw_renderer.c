@@ -1945,6 +1945,32 @@ int sw_render_wide_display(uint32_t *out_pixels, int out_pitch, int base_x,
         uint32_t *dst = (uint32_t *)((uint8_t *)out_pixels + row * out_pitch);
         for (int col = 0; col < W; col++) { dst[col] = rgb555_to_argb(src[col]); count++; }
     }
+    /* Void borders (gpu.c gpu_ws_nw_void): presented columns beyond the
+     * authored map on each side take the [widescreen] nw_border image, scaled
+     * to the wide frame (alpha < 128 leaves the game pixel). */
+    {
+        extern int gpu_ws_nw_void(int *left, int *right);
+        extern const uint32_t *gpu_ws_nw_border_image(int *w, int *h, uint32_t *gen);
+        int vl = 0, vr = 0, bw = 0, bh = 0;
+        const uint32_t *bp = gpu_ws_nw_border_image(&bw, &bh, NULL);
+        if (bp && bw > 0 && bh > 0 && gpu_ws_nw_void(&vl, &vr) && out_h > 0) {
+            int lpx = vl * s, rpx = vr * s;
+            if (lpx > W) lpx = W;
+            if (rpx > W - lpx) rpx = W - lpx;
+            for (int row = 0; row < out_h; row++) {
+                uint32_t *dst = (uint32_t *)((uint8_t *)out_pixels + row * out_pitch);
+                const uint32_t *brow = bp + (size_t)((long long)row * bh / out_h) * bw;
+                for (int col = 0; col < lpx; col++) {
+                    uint32_t c = brow[(long long)col * bw / W];
+                    if ((c >> 24) >= 128u) dst[col] = c | 0xFF000000u;
+                }
+                for (int col = W - rpx; col < W; col++) {
+                    uint32_t c = brow[(long long)col * bw / W];
+                    if ((c >> 24) >= 128u) dst[col] = c | 0xFF000000u;
+                }
+            }
+        }
+    }
     return count;
 }
 

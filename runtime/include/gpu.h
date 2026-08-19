@@ -227,6 +227,14 @@ void gpu_ws_set_nw_anchor(int anchor);
 void gpu_ws_set_nw_anchor_gate(int gate);
 /* Mod veto: 0 = the frames being built are not the game world (centre). */
 void gpu_ws_set_nw_anchor_world(int on);
+/* Dynamic window (nw_anchor = "dynamic" / 3): left_px of the EXTRA revealed on
+ * the left (-1 = keep), slewed; void_left/right = presented columns beyond the
+ * authored map on each side, painted with the nw_border image at present. */
+void gpu_ws_set_nw_window(int left_px, int void_left, int void_right);
+void gpu_ws_set_nw_border(const uint32_t *argb, int w, int h);   /* copies */
+const uint32_t *gpu_ws_nw_border_image(int *w, int *h, uint32_t *gen);
+/* Renderers: void widths (presented px) to paint this frame; 0 = none. */
+int  gpu_ws_nw_void(int *left, int *right);
 int  gpu_ws_get_nw_anchor(void);   /* effective anchor this frame */
 void gpu_ws_set_cull_guard_pixels(int pixels);
 /* Bias/range activation-window margin. This may include an additional
@@ -435,6 +443,8 @@ typedef struct {
     int      nw_anchor_cfg;     /* configured [widescreen] nw_anchor */
     int      nw_anchor_gate;    /* 0 always, 1 bg2d frames only */
     int      nw_anchor_world;   /* mod veto (psx_mod_widescreen_set_world) */
+    int      nw_dyn_target;     /* dynamic window: requested left reveal (-1 centre) */
+    int      nw_void_left, nw_void_right; /* border columns this frame */
     uint32_t bg2d_last_frame;   /* frame of the last bg2d count hook */
     uint64_t cur_frame;
     uint32_t last_tag_frame;    /* frame of newest tagged prim */

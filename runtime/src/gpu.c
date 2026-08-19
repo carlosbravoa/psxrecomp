@@ -391,22 +391,112 @@ void gpu_ws_set_nw_anchor_world(int on) {
     ws_nw_anchor_world = on ? 1 : 0;
     ws_nw_anchor_refresh();
 }
-static int ws_nw_anchor_eff(void) {
+/* A world frame: the anchor (and the void borders below) apply; otherwise
+ * the wide window is centred and nothing is bordered (menus, loading). */
+static int ws_nw_world_frame(void) {
     if (!ws_nw_anchor_world) return 0;
     if (ws_nw_anchor_gate == 1 &&
         (uint32_t)s_frame_count - ws_bg2d_stamp > 1u) return 0;
-    return ws_nw_anchor;
+    return 1;
 }
-/* Re-point the compositor when the effective anchor changed (gate flips). */
+static int ws_nw_anchor_eff(void) {
+    return ws_nw_world_frame() ? ws_nw_anchor : 0;
+}
+
+/* ---- Dynamic window (nw_anchor = "dynamic", mode 3) and void borders -----
+ * A trusted plugin that knows the stage's authored map extent places the wide
+ * window over the world each frame: gpu_ws_set_nw_window(left_px, ...) asks
+ * for `left_px` of the EXTRA to be revealed on the left (the rest on the
+ * right); the value is slewed a few px per frame so a room change never jumps.
+ * The game-logic margins (psx_ws_x_margin_left/right, [widescreen.bg2d]
+ * columns) are the WIDEST the window can reach on each side — the full EXTRA
+ * both ways — so where the window currently sits never changes what the game
+ * keeps alive, spawns or draws; only what the compositor shows.
+ *
+ * Void borders: the plugin also reports how many presented columns on each
+ * side fall beyond the authored map ("void"); at present the renderers paint
+ * the configured [widescreen] nw_border image over those columns (the way 4:3
+ * titles adapted to wide screens carry a frame) instead of whatever the
+ * tile fetch produced there. Presentation only. Per-frame values: a stale
+ * report (> 2 frames) paints nothing. */
+#define WS_NW_DYN_SLEW 3
+static int ws_nw_dyn_target = -1;        /* requested left reveal, -1 = centre */
+static int ws_nw_dyn_left   = -1;        /* slewed left reveal (-1 = centre)   */
+static uint32_t ws_nw_dyn_frame = (uint32_t)-1;
+static int ws_nw_void_l = 0, ws_nw_void_r = 0;
+static uint32_t ws_nw_void_frame = (uint32_t)-1000;
+static uint32_t *ws_nw_border_px = NULL;
+static int ws_nw_border_w = 0, ws_nw_border_h = 0;
+static uint32_t ws_nw_border_gen = 0;
+
+void gpu_ws_set_nw_window(int left_px, int void_left, int void_right) {
+    if (left_px >= -1) ws_nw_dyn_target = left_px;
+    ws_nw_void_l = void_left < 0 ? 0 : void_left;
+    ws_nw_void_r = void_right < 0 ? 0 : void_right;
+    ws_nw_void_frame = (uint32_t)s_frame_count;
+}
+void gpu_ws_set_nw_border(const uint32_t *argb, int w, int h) {
+    free(ws_nw_border_px); ws_nw_border_px = NULL; ws_nw_border_w = ws_nw_border_h = 0;
+    if (argb && w > 0 && h > 0) {
+        size_t n = (size_t)w * (size_t)h;
+        ws_nw_border_px = (uint32_t*)malloc(n * sizeof(uint32_t));
+        if (ws_nw_border_px) { memcpy(ws_nw_border_px, argb, n * sizeof(uint32_t)); ws_nw_border_w = w; ws_nw_border_h = h; }
+    }
+    ws_nw_border_gen++;
+}
+const uint32_t *gpu_ws_nw_border_image(int *w, int *h, uint32_t *gen) {
+    if (w) *w = ws_nw_border_w;
+    if (h) *h = ws_nw_border_h;
+    if (gen) *gen = ws_nw_border_gen;
+    return ws_nw_border_px;
+}
+int gpu_ws_nw_void(int *left, int *right) {
+    if (left) *left = 0;
+    if (right) *right = 0;
+    if (!ws_nw_border_px || !ws_native_wide_active() || !ws_nw_world_frame()) return 0;
+    if ((uint32_t)s_frame_count - ws_nw_void_frame > 2u) return 0;
+    int ex = ws_nw_extra();
+    int l = ws_nw_void_l > ex ? ex : ws_nw_void_l;
+    int r = ws_nw_void_r > ex ? ex : ws_nw_void_r;
+    if (left) *left = l;
+    if (right) *right = r;
+    return (l > 0 || r > 0) ? 1 : 0;
+}
+/* Slew the dynamic left reveal toward its target once per frame. Returns 1 if
+ * the presented split changed (the compositor must be re-pointed). */
+static int ws_nw_dyn_world_prev = 0;
+static int ws_nw_dyn_tick(void) {
+    if (ws_nw_anchor != 3) return 0;
+    const uint32_t f = (uint32_t)s_frame_count;
+    if (f == ws_nw_dyn_frame) return 0;
+    ws_nw_dyn_frame = f;
+    const int ex = ws_nw_extra();
+    int target = ws_nw_dyn_target < 0 ? ex / 2 : ws_nw_dyn_target;
+    if (target > ex) target = ex;
+    /* Snap on the first use and whenever the world comes back after a
+     * non-world stretch (stage start, menu close): those transitions are
+     * behind a wipe, so the window lands where the plugin wants it at once
+     * instead of visibly sliding into place. Within the world: slew. */
+    const int world = ws_nw_world_frame();
+    int cur = (ws_nw_dyn_left < 0 || (world && !ws_nw_dyn_world_prev)) ? target : ws_nw_dyn_left;
+    ws_nw_dyn_world_prev = world;
+    if (cur < target) cur = (target - cur > WS_NW_DYN_SLEW) ? cur + WS_NW_DYN_SLEW : target;
+    else if (cur > target) cur = (cur - target > WS_NW_DYN_SLEW) ? cur - WS_NW_DYN_SLEW : target;
+    const int changed = (cur != ws_nw_dyn_left);
+    ws_nw_dyn_left = cur;
+    return changed;
+}
+
+/* Re-point the compositor when the effective anchor or the dynamic window
+ * changed (gate flips, window slews). */
 static void ws_nw_anchor_refresh(void) {
-    if (ws_nw_anchor_gate == 0 && ws_nw_anchor_world) return;
+    int dirty = ws_nw_dyn_tick();
     const int eff = ws_nw_anchor_eff();
-    if (eff == ws_nw_anchor_applied) return;
-    ws_nw_anchor_applied = eff;
-    ws_nw_sync_target();
+    if (eff != ws_nw_anchor_applied) { ws_nw_anchor_applied = eff; dirty = 1; }
+    if (dirty) ws_nw_sync_target();
 }
 void gpu_ws_set_nw_anchor(int anchor) {
-    ws_nw_anchor = (anchor == 1 || anchor == 2) ? anchor : 0;
+    ws_nw_anchor = (anchor >= 1 && anchor <= 3) ? anchor : 0;
     ws_nw_anchor_applied = ws_nw_anchor_eff();
     ws_nw_sync_target();
 }
@@ -416,16 +506,33 @@ void gpu_ws_set_nw_anchor_gate(int gate) {
     ws_nw_sync_target();
 }
 int gpu_ws_get_nw_anchor(void) { return ws_nw_anchor_eff(); }
+/* PRESENTED split: how much of the EXTRA the compositor shows on the left. */
 static int ws_nw_split_left(int off) {
     const int a = ws_nw_anchor_eff();
-    return a == 1 ? 0 : (a == 2 ? 2 * off : off);
+    if (a == 1) return 0;
+    if (a == 2) return 2 * off;
+    if (a == 3) {
+        int l = ws_nw_dyn_left < 0 ? off : ws_nw_dyn_left;
+        return l > 2 * off ? 2 * off : (l < 0 ? 0 : l);
+    }
+    return off;
 }
-/* Per-side reveal in screen px while native-wide is ACTIVE (0 otherwise). */
+/* LOGIC split: the widest reveal each side can reach in this anchor mode —
+ * what the cull / spawn / keep-alive / tile-column widening must cover. */
+static int ws_nw_logic_left(int off) {
+    const int a = ws_nw_anchor_eff();
+    return a == 1 ? 0 : (a == 0 ? off : 2 * off);
+}
+static int ws_nw_logic_right(int off) {
+    const int a = ws_nw_anchor_eff();
+    return a == 2 ? 0 : (a == 0 ? off : 2 * off);
+}
+/* Per-side PRESENTED reveal in screen px while native-wide is ACTIVE (0 otherwise). */
 static int ws_nw_left(void)  { return ws_nw_split_left(ws_nw_offset()); }
 static int ws_nw_right(void) { return ws_nw_extra() - ws_nw_left(); }
-/* Same split for the CONFIGURED viewport (pre-classification setup paths). */
-static int ws_nw_configured_left(void)  { return ws_nw_split_left(ws_nw_configured_offset()); }
-static int ws_nw_configured_right(void) { return 2 * ws_nw_configured_offset() - ws_nw_configured_left(); }
+/* LOGIC margins for the CONFIGURED viewport (pre-classification setup paths). */
+static int ws_nw_configured_left(void)  { return ws_nw_logic_left(ws_nw_configured_offset()); }
+static int ws_nw_configured_right(void) { return ws_nw_logic_right(ws_nw_configured_offset()); }
 
 /* Per-side X cull margin in screen/world units (the game's draw classifier
  * works in objX-camX where 1 unit ~= 1 native-4:3 screen pixel). The squash
@@ -1127,8 +1234,8 @@ static int ws_bg2d_side_cols(int off) {
     return (off + 15) / 16;             /* ceil to whole tile columns */
 }
 /* Extra tile columns on each side (the per-side reveal, ceil'd to tiles). */
-static int ws_bg2d_left_cols(void)  { return ws_bg2d_side_cols(ws_nw_left()); }
-static int ws_bg2d_right_cols(void) { return ws_bg2d_side_cols(ws_nw_right()); }
+static int ws_bg2d_left_cols(void)  { return ws_bg2d_side_cols(ws_nw_logic_left(ws_nw_offset())); }
+static int ws_bg2d_right_cols(void) { return ws_bg2d_side_cols(ws_nw_logic_right(ws_nw_offset())); }
 /* Column count: base + both-side reveal. */
 static void mmx6_bg_refill_tick(void);   /* defined below (ring-freshness fix) */
 int psx_ws_bg2d_cols(int base) {
@@ -1690,6 +1797,8 @@ void gpu_ws_get_debug(GpuWsDebug* out) {
     out->nw_anchor_cfg     = ws_nw_anchor;
     out->nw_anchor_gate    = ws_nw_anchor_gate;
     out->nw_anchor_world   = ws_nw_anchor_world;
+    out->nw_dyn_target     = ws_nw_dyn_target;
+    gpu_ws_nw_void(&out->nw_void_left, &out->nw_void_right);
     out->bg2d_last_frame   = ws_bg2d_stamp;
     out->cur_frame         = s_frame_count;
     out->last_tag_frame    = ws_last_tag_stamp;

@@ -994,11 +994,16 @@ struct GameConfig {
     // edge is the 4:3 left edge; the whole reveal is on the right) or "right".
     // A side-scroller whose gameplay is authored against the 4:3 left edge
     // keeps every left-side alignment with "left". Runtime-only — no regen.
-    int ws_nw_anchor = 0;   // 0 center, 1 left, 2 right
+    int ws_nw_anchor = 0;   // 0 center, 1 left, 2 right, 3 dynamic (a plugin places the window)
     // [widescreen] nw_anchor_gate — "always" (default) or "bg2d": the anchor
     // applies only on frames the [widescreen.bg2d] tile renderer ran (the
     // stage world); other frames (menus, title, results) use the centred split.
     int ws_nw_anchor_gate = 0;   // 0 always, 1 bg2d
+    // [widescreen] nw_border — image painted over presented columns that fall
+    // beyond the authored map (a plugin reports them per frame through
+    // psx_mod_widescreen_set_window); any size, scaled to the wide frame.
+    // Relative to the project root. Runtime-only.
+    std::filesystem::path ws_nw_border;
 
     // [widescreen] clear_reveal — opt a title into synthetic native-wide margin
     // cleanup. A game-specific stage/map boundary can clear only proven-void

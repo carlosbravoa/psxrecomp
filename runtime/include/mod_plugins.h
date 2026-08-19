@@ -78,6 +78,19 @@ int32_t psx_mod_widescreen_x_margin_right(void);
 void psx_mod_widescreen_set_world(int in_world);
 
 /*
+ * Native-wide window placement (see gpu.h gpu_ws_set_nw_window). A plugin
+ * that knows the stage's authored map extent chooses the anchor mode
+ * (0 centre, 1 left, 2 right, 3 dynamic) and, per world frame, where the wide
+ * window sits (left_px of the extra revealed on the left, -1 = keep) and how
+ * many presented columns on each side fall beyond the map (void), which the
+ * runtime covers with the configured border image. Presentation only.
+ */
+void psx_mod_widescreen_set_anchor(int anchor);
+void psx_mod_widescreen_set_window(int left_px, int void_left, int void_right);
+/* Total native-wide extra width in px (0 at 4:3) — the reveal budget. */
+int32_t psx_mod_widescreen_extra(void);
+
+/*
  * Read the committed value of one of this package's declared options, as the
  * player left it in the launcher (or the manifest default when untouched).
  * Writes a NUL-terminated string into `out` and returns 1; returns 0 with

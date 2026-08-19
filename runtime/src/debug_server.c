@@ -5243,7 +5243,7 @@ static void handle_gpu_state(int id, const char *json)
              "\"ws\":{\"configured\":%d,\"active\":%d,\"game_mode\":%d,"
              "\"present_native_43\":%d,\"x_margin\":%d,"
              "\"activation_margin\":%d,\"squash\":[%d,%d],"
-             "\"mode\":%d,\"nw_extra\":%d,\"nw_left\":%d,\"nw_right\":%d,\"nw_anchor\":%d,\"nw_anchor_cfg\":%d,\"nw_anchor_gate\":%d,\"nw_anchor_world\":%d,\"bg2d_last_frame\":%u,"
+             "\"mode\":%d,\"nw_extra\":%d,\"nw_left\":%d,\"nw_right\":%d,\"nw_anchor\":%d,\"nw_anchor_cfg\":%d,\"nw_anchor_gate\":%d,\"nw_anchor_world\":%d,\"nw_dyn_target\":%d,\"nw_void\":[%d,%d],\"bg2d_last_frame\":%u,"
              "\"cur_frame\":%llu,\"last_tag_frame\":%u,\"last_3d_frame\":%u,"
              "\"gte_verts\":%u,\"last_world3d_frame\":%u,"
              "\"ovh_prims\":%u,\"last_ovh_frame\":%u,"
@@ -5273,7 +5273,7 @@ static void handle_gpu_state(int id, const char *json)
              ws.present_native_43, ws.x_margin, ws.activation_margin,
              ws.xnum, ws.xden,
              ws.mode, ws.nw_extra, ws.nw_left, ws.nw_right, ws.nw_anchor,
-             ws.nw_anchor_cfg, ws.nw_anchor_gate, ws.nw_anchor_world, ws.bg2d_last_frame,
+             ws.nw_anchor_cfg, ws.nw_anchor_gate, ws.nw_anchor_world, ws.nw_dyn_target, ws.nw_void_left, ws.nw_void_right, ws.bg2d_last_frame,
              (unsigned long long)ws.cur_frame, ws.last_tag_frame,
               ws.last_3d_frame, ws.gte_verts, ws.last_world3d_frame,
               ws.ovh_prims, ws.last_ovh_frame,

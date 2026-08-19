@@ -326,8 +326,9 @@ extra width is on the right (`"right"` mirrors it):
 
 ```toml
 [widescreen]
-nw_anchor      = "left"     # "center" (default) | "left" | "right"
+nw_anchor      = "left"     # "center" (default) | "left" | "right" | "dynamic"
 nw_anchor_gate = "bg2d"     # "always" (default) | "bg2d"
+nw_border      = "assets/widescreen_border.png"   # optional, see below
 ```
 
 - `nw_anchor` is runtime-only (no regen). The compositor, the draw-area
@@ -344,6 +345,19 @@ nw_anchor_gate = "bg2d"     # "always" (default) | "bg2d"
 - A trusted mod plugin can veto the anchor for frames it knows are not the
   world (`psx_mod_widescreen_set_world(0)`; MM8: title / stage select are
   built by the same tile renderer as the stages).
+- `nw_anchor = "dynamic"` hands the split to a plugin: each world frame it
+  calls `psx_mod_widescreen_set_window(left_px, void_left, void_right)` —
+  `left_px` of the extra revealed on the left (slewed 3 px/frame; snapped on
+  world entry so stage starts and menu closes do not visibly slide) — and the
+  plugin may also switch the mode at activation (`psx_mod_widescreen_set_anchor`).
+  In dynamic mode the game-logic margins (`psx_ws_x_margin_left/right`, the
+  bg2d columns) are the full extra on BOTH sides: where the window sits never
+  changes what the game spawns, keeps alive or draws — only what is shown.
+- `nw_border` — an image (any size, scaled to the wide frame) painted at
+  present over the `void_left` / `void_right` presented columns the plugin
+  reports as lying beyond the authored map (the frame a 4:3 title wears on a
+  wide screen). Software and OpenGL presents; pixels with alpha < 128 keep the
+  game. Only on world frames and only while native-wide is active.
 - Identity at 4:3; a headless run engages native-wide exactly like a window
   and `present_capture` writes the wide frame (see HEADLESS.md).
 

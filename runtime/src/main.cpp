@@ -32,6 +32,7 @@
 extern "C" void psx_event_step_conservative_env_init(void);
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "png_read.h"
 #include "interrupts.h"
 #include "present_ring.h"
 #include "load_transition_ring.h"
@@ -11359,6 +11360,14 @@ int main(int argc, char** argv) {
             /* [widescreen] nw_anchor — centre / left / right split of the reveal. */
             gpu_ws_set_nw_anchor(gc.ws_nw_anchor);
             gpu_ws_set_nw_anchor_gate(gc.ws_nw_anchor_gate);
+            /* [widescreen] nw_border — painted over map-less reveal columns. */
+            if (!gc.ws_nw_border.empty()) {
+                int bw = 0, bh = 0;
+                uint32_t* bpx = png_read_argb(gc.ws_nw_border.string().c_str(), &bw, &bh);
+                if (bpx) { gpu_ws_set_nw_border(bpx, bw, bh); free(bpx); }
+                else std::fprintf(stderr, "psxrecomp: [widescreen] nw_border %s could not be read\n",
+                                  gc.ws_nw_border.string().c_str());
+            }
             /* [widescreen] nw_flat_backdrop — stretch flat sky/backdrop prims
              * in the native-wide mirror, preserving the canonical 4:3 image. */
             gpu_ws_set_nw_flat_backdrop(gc.ws_nw_flat_backdrop ? 1 : 0);

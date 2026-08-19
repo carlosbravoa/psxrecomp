@@ -1356,6 +1356,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_nw_backdrop = false;
     int ws_nw_anchor = 0;
     int ws_nw_anchor_gate = 0;
+    fs::path ws_nw_border;
     bool ws_clear_reveal = false;
     bool ws_nw_flat_backdrop = false;
     bool ws_nw_phase_backdrop = false;
@@ -1542,6 +1543,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         }
         if (ws.contains("nw_backdrop"))
             ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
+        if (ws.contains("nw_border")) {
+            const std::string b = toml::find<std::string>(ws, "nw_border");
+            if (!b.empty()) ws_nw_border = fs::absolute(root / b);
+        }
         if (ws.contains("nw_anchor_gate")) {
             const std::string g = toml::find<std::string>(ws, "nw_anchor_gate");
             if (g == "always") ws_nw_anchor_gate = 0;
@@ -1556,9 +1561,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             if (a == "center" || a == "centre") ws_nw_anchor = 0;
             else if (a == "left") ws_nw_anchor = 1;
             else if (a == "right") ws_nw_anchor = 2;
+            else if (a == "dynamic") ws_nw_anchor = 3;
             else
                 throw std::runtime_error(fmt::format(
-                    "{}: [widescreen] nw_anchor must be \"center\", \"left\" or \"right\" (got \"{}\")",
+                    "{}: [widescreen] nw_anchor must be \"center\", \"left\", \"right\" or \"dynamic\" (got \"{}\")",
                     config_path.string(), a));
         }
         if (ws.contains("clear_reveal"))
@@ -2148,6 +2154,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_nw_backdrop*/        ws_nw_backdrop,
         /*ws_nw_anchor*/          ws_nw_anchor,
         /*ws_nw_anchor_gate*/     ws_nw_anchor_gate,
+        /*ws_nw_border*/          ws_nw_border,
         /*ws_clear_reveal*/       ws_clear_reveal,
         /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
         /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,

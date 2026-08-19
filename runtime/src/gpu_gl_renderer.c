@@ -4813,6 +4813,61 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 }
 
+/* Void borders ([widescreen] nw_border): the border image lives in its own
+ * FBO (uploaded once per image generation); the columns gpu.c reports as
+ * beyond the authored map are blitted from it into the wide FBO's displayed
+ * band right before present — on top of whatever the tile fetch drew there.
+ * Presentation only; identity when no border / no void. */
+static GLuint s_border_tex = 0, s_border_fbo = 0;
+static int s_border_w = 0, s_border_h = 0;
+static uint32_t s_border_gen = 0;
+static void wide_blit_border(GLuint wide_fbo, int disp_y, int disp_h) {
+    extern int gpu_ws_nw_void(int *left, int *right);
+    extern const uint32_t *gpu_ws_nw_border_image(int *w, int *h, uint32_t *gen);
+    int vl = 0, vr = 0, bw = 0, bh = 0; uint32_t gen = 0;
+    const uint32_t *bp = gpu_ws_nw_border_image(&bw, &bh, &gen);
+    if (!bp || bw <= 0 || bh <= 0 || g_wide_w <= 0) return;
+    if (!gpu_ws_nw_void(&vl, &vr)) return;
+    if (!s_border_tex || gen != s_border_gen) {
+        if (!s_border_tex) { glGenTextures(1, &s_border_tex); p_glGenFramebuffers(1, &s_border_fbo); }
+        glBindTexture(GL_TEXTURE_2D, s_border_tex);
+        /* ARGB8888 host words -> RGBA bytes */
+        uint8_t *rgba = (uint8_t*)malloc((size_t)bw * bh * 4);
+        if (!rgba) return;
+        for (size_t i = 0; i < (size_t)bw * bh; i++) {
+            uint32_t c = bp[i];
+            rgba[i*4+0] = (uint8_t)(c >> 16); rgba[i*4+1] = (uint8_t)(c >> 8);
+            rgba[i*4+2] = (uint8_t)c; rgba[i*4+3] = 255;
+        }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        free(rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_border_fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_border_tex, 0);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+        s_border_w = bw; s_border_h = bh; s_border_gen = gen;
+    }
+    const int S = s_scale, W = g_wide_w * S;
+    int lpx = vl * S, rpx = vr * S;
+    if (lpx > W) lpx = W;
+    if (rpx > W - lpx) rpx = W - lpx;
+    const int y0 = disp_y * S, y1 = (disp_y + disp_h) * S;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_border_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    if (lpx > 0)
+        p_glBlitFramebuffer(0, 0, lpx * bw / W, bh, 0, y0, lpx, y1,
+                            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    if (rpx > 0)
+        p_glBlitFramebuffer((W - rpx) * bw / W, 0, bw, bh, W - rpx, y0, W, y1,
+                            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+}
+
 /* GPU-direct native-wide present: blit the displayed buffer's wide FBO straight
  * to the window (no glReadPixels / glFinish CPU round-trip). The wide surface is
  * g_wide_w wide × VRAM_H tall (at scale S); present its [0,g_wide_w] × [disp_y,
@@ -4846,6 +4901,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
+    wide_blit_border(fbo, disp_y, disp_h);           /* void borders over the map-less columns */
 
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
