@@ -429,10 +429,23 @@ static uint32_t *ws_nw_border_px = NULL;
 static int ws_nw_border_w = 0, ws_nw_border_h = 0;
 static uint32_t ws_nw_border_gen = 0;
 
+static int ws_nw_void_streak = 0;   /* consecutive identical non-zero reports */
 void gpu_ws_set_nw_window(int left_px, int void_left, int void_right) {
     if (left_px >= -1) ws_nw_dyn_target = left_px;
-    ws_nw_void_l = void_left < 0 ? 0 : void_left;
-    ws_nw_void_r = void_right < 0 ? 0 : void_right;
+    const int vl = void_left < 0 ? 0 : void_left;
+    const int vr = void_right < 0 ? 0 : void_right;
+    /* Borders only after the SAME non-zero pair has been reported for a run
+     * of frames: a transition state that happens to look like a bordered room
+     * for a few frames (menu wipes) never paints; a real bordered room
+     * (stage start, boss arena) reports constantly and shows ~10 frames in,
+     * behind its own wipe. Zero pairs pass through immediately. */
+    if (vl == ws_nw_void_l && vr == ws_nw_void_r) {
+        if (ws_nw_void_streak < 1000) ws_nw_void_streak++;
+    } else {
+        ws_nw_void_streak = 0;
+        ws_nw_void_l = vl;
+        ws_nw_void_r = vr;
+    }
     ws_nw_void_frame = (uint32_t)s_frame_count;
 }
 void gpu_ws_set_nw_border(const uint32_t *argb, int w, int h) {
@@ -455,6 +468,7 @@ int gpu_ws_nw_void(int *left, int *right) {
     if (right) *right = 0;
     if (!ws_nw_border_px || !ws_native_wide_active() || !ws_nw_world_frame()) return 0;
     if ((uint32_t)s_frame_count - ws_nw_void_frame > 2u) return 0;
+    if ((ws_nw_void_l > 0 || ws_nw_void_r > 0) && ws_nw_void_streak < 10) return 0;
     int ex = ws_nw_extra();
     int l = ws_nw_void_l > ex ? ex : ws_nw_void_l;
     int r = ws_nw_void_r > ex ? ex : ws_nw_void_r;
@@ -464,7 +478,7 @@ int gpu_ws_nw_void(int *left, int *right) {
 }
 /* Slew the dynamic left reveal toward its target once per frame. Returns 1 if
  * the presented split changed (the compositor must be re-pointed). */
-static int ws_nw_dyn_world_prev = 0;
+static uint32_t ws_nw_dyn_nonworld = 0;   /* consecutive non-world frames seen */
 static int ws_nw_dyn_tick(void) {
     if (ws_nw_anchor != 3) return 0;
     const uint32_t f = (uint32_t)s_frame_count;
@@ -473,13 +487,15 @@ static int ws_nw_dyn_tick(void) {
     const int ex = ws_nw_extra();
     int target = ws_nw_dyn_target < 0 ? ex / 2 : ws_nw_dyn_target;
     if (target > ex) target = ex;
-    /* Snap on the first use and whenever the world comes back after a
-     * non-world stretch (stage start, menu close): those transitions are
-     * behind a wipe, so the window lands where the plugin wants it at once
-     * instead of visibly sliding into place. Within the world: slew. */
+    /* Snap on the first use and whenever the world comes back after a REAL
+     * non-world stretch (stage start, menu close — both behind a wipe), so
+     * the window lands where the plugin wants it at once instead of visibly
+     * sliding into place. A 1–2 frame classification hiccup mid-play is NOT
+     * a transition: those slew, never snap. */
     const int world = ws_nw_world_frame();
-    int cur = (ws_nw_dyn_left < 0 || (world && !ws_nw_dyn_world_prev)) ? target : ws_nw_dyn_left;
-    ws_nw_dyn_world_prev = world;
+    const int returning = world && ws_nw_dyn_nonworld >= 10u;
+    int cur = (ws_nw_dyn_left < 0 || returning) ? target : ws_nw_dyn_left;
+    ws_nw_dyn_nonworld = world ? 0u : ws_nw_dyn_nonworld + 1u;
     if (cur < target) cur = (target - cur > WS_NW_DYN_SLEW) ? cur + WS_NW_DYN_SLEW : target;
     else if (cur > target) cur = (cur - target > WS_NW_DYN_SLEW) ? cur - WS_NW_DYN_SLEW : target;
     const int changed = (cur != ws_nw_dyn_left);

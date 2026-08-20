@@ -1004,6 +1004,10 @@ struct GameConfig {
     // psx_mod_widescreen_set_window); any size, scaled to the wide frame.
     // Relative to the project root. Runtime-only.
     std::filesystem::path ws_nw_border;
+    // [widescreen] border_43 — also paint the window's 4:3 pillarbox side bars
+    // with nw_border on game/menu presents (fullscreen 4:3 play; never movies).
+    // OpenGL presenter. Runtime-only.
+    bool ws_border_43 = false;
 
     // [widescreen] clear_reveal — opt a title into synthetic native-wide margin
     // cleanup. A game-specific stage/map boundary can clear only proven-void

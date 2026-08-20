@@ -1357,6 +1357,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     int ws_nw_anchor = 0;
     int ws_nw_anchor_gate = 0;
     fs::path ws_nw_border;
+    bool ws_border_43 = false;
     bool ws_clear_reveal = false;
     bool ws_nw_flat_backdrop = false;
     bool ws_nw_phase_backdrop = false;
@@ -1547,6 +1548,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             const std::string b = toml::find<std::string>(ws, "nw_border");
             if (!b.empty()) ws_nw_border = fs::absolute(root / b);
         }
+        if (ws.contains("border_43"))
+            ws_border_43 = toml::find<bool>(ws, "border_43");
         if (ws.contains("nw_anchor_gate")) {
             const std::string g = toml::find<std::string>(ws, "nw_anchor_gate");
             if (g == "always") ws_nw_anchor_gate = 0;
@@ -2155,6 +2158,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_nw_anchor*/          ws_nw_anchor,
         /*ws_nw_anchor_gate*/     ws_nw_anchor_gate,
         /*ws_nw_border*/          ws_nw_border,
+        /*ws_border_43*/          ws_border_43,
         /*ws_clear_reveal*/       ws_clear_reveal,
         /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
         /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,

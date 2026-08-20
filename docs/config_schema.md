@@ -357,7 +357,13 @@ nw_border      = "assets/widescreen_border.png"   # optional, see below
   present over the `void_left` / `void_right` presented columns the plugin
   reports as lying beyond the authored map (the frame a 4:3 title wears on a
   wide screen). Software and OpenGL presents; pixels with alpha < 128 keep the
-  game. Only on world frames and only while native-wide is active.
+  game. Only on world frames and only while native-wide is active. The
+  runtime additionally requires the SAME non-zero void pair for 10 consecutive
+  reports before painting, so a transition state that briefly mimics a
+  bordered room (menu wipes) never flashes.
+- `border_43 = true` — also paint the window's 4:3 pillarbox side bars with
+  `nw_border` on 15-bit game/menu presents (plain 4:3 play fullscreen on a
+  wide monitor). Movies keep the cinematic black. OpenGL presenter.
 - Identity at 4:3; a headless run engages native-wide exactly like a window
   and `present_capture` writes the wide frame (see HEADLESS.md).
 

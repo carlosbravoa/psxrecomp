@@ -4717,6 +4717,8 @@ int gl_renderer_present_hold_last(void) {
     return 1;
 }
 
+static void border_blit_window_bars(int ww, int wh, int lx, int lw);
+
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
     if (!s_ctx || !s_raster_ok) return;
@@ -4750,6 +4752,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     glViewport(0, 0, ww, wh);
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
         glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+        border_blit_window_bars(ww, wh, lx, lw);
     }
     int interp_pair = interp_capture(s_hr_fbo, disp_x, disp_y, w, h,
                                      linear, force_4_3, GL_PRES_VRAM);
@@ -4821,19 +4824,21 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
 static GLuint s_border_tex = 0, s_border_fbo = 0;
 static int s_border_w = 0, s_border_h = 0;
 static uint32_t s_border_gen = 0;
-static void wide_blit_border(GLuint wide_fbo, int disp_y, int disp_h) {
-    extern int gpu_ws_nw_void(int *left, int *right);
+static int s_border_43 = 0;   /* [widescreen] border_43: paint 4:3 pillarbox bars */
+void gl_renderer_set_border_43(int on) { s_border_43 = on ? 1 : 0; }
+/* Upload/refresh the border image into s_border_fbo; 1 if usable. */
+static int border_fbo_ensure(void) {
     extern const uint32_t *gpu_ws_nw_border_image(int *w, int *h, uint32_t *gen);
-    int vl = 0, vr = 0, bw = 0, bh = 0; uint32_t gen = 0;
+    int bw = 0, bh = 0; uint32_t gen = 0;
     const uint32_t *bp = gpu_ws_nw_border_image(&bw, &bh, &gen);
-    if (!bp || bw <= 0 || bh <= 0 || g_wide_w <= 0) return;
-    if (!gpu_ws_nw_void(&vl, &vr)) return;
-    if (!s_border_tex || gen != s_border_gen) {
+    if (!bp || bw <= 0 || bh <= 0) return 0;
+    if (s_border_tex && gen == s_border_gen) return 1;
+    {
         if (!s_border_tex) { glGenTextures(1, &s_border_tex); p_glGenFramebuffers(1, &s_border_fbo); }
         glBindTexture(GL_TEXTURE_2D, s_border_tex);
         /* ARGB8888 host words -> RGBA bytes */
         uint8_t *rgba = (uint8_t*)malloc((size_t)bw * bh * 4);
-        if (!rgba) return;
+        if (!rgba) return 0;
         for (size_t i = 0; i < (size_t)bw * bh; i++) {
             uint32_t c = bp[i];
             rgba[i*4+0] = (uint8_t)(c >> 16); rgba[i*4+1] = (uint8_t)(c >> 8);
@@ -4850,6 +4855,34 @@ static void wide_blit_border(GLuint wide_fbo, int disp_y, int disp_h) {
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
         s_border_w = bw; s_border_h = bh; s_border_gen = gen;
     }
+    return 1;
+}
+/* [widescreen] border_43: paint the window's pillarbox side bars with the
+ * border image on 15-bit game/menu presents (never movies — those keep the
+ * cinematic black). The image spans the whole window; the game quad covers
+ * the centre. Presentation only. */
+static void border_blit_window_bars(int ww, int wh, int lx, int lw) {
+    if (!s_border_43 || (lx <= 0 && lw >= ww)) return;
+    if (!border_fbo_ensure()) return;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_border_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    /* left bar: left part of the image; right bar: right part (window scale) */
+    if (lx > 0)
+        p_glBlitFramebuffer(0, 0, lx * s_border_w / ww, s_border_h,
+                            0, 0, lx, wh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    if (lx + lw < ww)
+        p_glBlitFramebuffer((lx + lw) * s_border_w / ww, 0, s_border_w, s_border_h,
+                            lx + lw, 0, ww, wh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+}
+
+static void wide_blit_border(GLuint wide_fbo, int disp_y, int disp_h) {
+    extern int gpu_ws_nw_void(int *left, int *right);
+    int vl = 0, vr = 0;
+    if (g_wide_w <= 0) return;
+    if (!gpu_ws_nw_void(&vl, &vr)) return;
+    if (!border_fbo_ensure()) return;
+    const int bw = s_border_w, bh = s_border_h;
     const int S = s_scale, W = g_wide_w * S;
     int lpx = vl * S, rpx = vr * S;
     if (lpx > W) lpx = W;

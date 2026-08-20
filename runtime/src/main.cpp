@@ -1505,6 +1505,7 @@ static bool          g_ws_hud_sprt = false;
 /* Runtime-only transition cleanup; kept out of gpu.h because generated game
  * units include that ABI header and do not need this frontend-only setter. */
 extern "C" void gpu_ws_set_clear_reveal(int on);
+extern "C" void gl_renderer_set_border_43(int on);
 extern "C" void gpu_ws_set_nw_textured_edges(int on, int scale_pct);
 extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*, int);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
@@ -11368,6 +11369,8 @@ int main(int argc, char** argv) {
                 else std::fprintf(stderr, "psxrecomp: [widescreen] nw_border %s could not be read\n",
                                   gc.ws_nw_border.string().c_str());
             }
+            /* [widescreen] border_43 — border in the 4:3 pillarbox bars too. */
+            gl_renderer_set_border_43(gc.ws_border_43 ? 1 : 0);
             /* [widescreen] nw_flat_backdrop — stretch flat sky/backdrop prims
              * in the native-wide mirror, preserving the canonical 4:3 image. */
             gpu_ws_set_nw_flat_backdrop(gc.ws_nw_flat_backdrop ? 1 : 0);
