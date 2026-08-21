@@ -429,24 +429,21 @@ static uint32_t *ws_nw_border_px = NULL;
 static int ws_nw_border_w = 0, ws_nw_border_h = 0;
 static uint32_t ws_nw_border_gen = 0;
 
-static int ws_nw_void_streak = 0;   /* consecutive identical non-zero reports */
+/* Frame each side last reported NO void. A side paints only once it has been
+ * void for WS_NW_VOID_SETTLE frames — a transition state that briefly looks
+ * like a bordered room (a menu wipe, a half-loaded map) never flashes, while a
+ * border whose WIDTH changes every frame (an autoscrolling stage opening into
+ * its map) still paints, which an "identical value" streak would have refused. */
+#define WS_NW_VOID_SETTLE 8u
+static uint32_t ws_nw_void_zero_l = 0, ws_nw_void_zero_r = 0;
 void gpu_ws_set_nw_window(int left_px, int void_left, int void_right) {
     if (left_px >= -1) ws_nw_dyn_target = left_px;
-    const int vl = void_left < 0 ? 0 : void_left;
-    const int vr = void_right < 0 ? 0 : void_right;
-    /* Borders only after the SAME non-zero pair has been reported for a run
-     * of frames: a transition state that happens to look like a bordered room
-     * for a few frames (menu wipes) never paints; a real bordered room
-     * (stage start, boss arena) reports constantly and shows ~10 frames in,
-     * behind its own wipe. Zero pairs pass through immediately. */
-    if (vl == ws_nw_void_l && vr == ws_nw_void_r) {
-        if (ws_nw_void_streak < 1000) ws_nw_void_streak++;
-    } else {
-        ws_nw_void_streak = 0;
-        ws_nw_void_l = vl;
-        ws_nw_void_r = vr;
-    }
-    ws_nw_void_frame = (uint32_t)s_frame_count;
+    const uint32_t f = (uint32_t)s_frame_count;
+    ws_nw_void_l = void_left < 0 ? 0 : void_left;
+    ws_nw_void_r = void_right < 0 ? 0 : void_right;
+    if (ws_nw_void_l == 0) ws_nw_void_zero_l = f;
+    if (ws_nw_void_r == 0) ws_nw_void_zero_r = f;
+    ws_nw_void_frame = f;
 }
 void gpu_ws_set_nw_border(const uint32_t *argb, int w, int h) {
     free(ws_nw_border_px); ws_nw_border_px = NULL; ws_nw_border_w = ws_nw_border_h = 0;
@@ -468,10 +465,12 @@ int gpu_ws_nw_void(int *left, int *right) {
     if (right) *right = 0;
     if (!ws_nw_border_px || !ws_native_wide_active() || !ws_nw_world_frame()) return 0;
     if ((uint32_t)s_frame_count - ws_nw_void_frame > 2u) return 0;
-    if ((ws_nw_void_l > 0 || ws_nw_void_r > 0) && ws_nw_void_streak < 10) return 0;
+    const uint32_t f = (uint32_t)s_frame_count;
     int ex = ws_nw_extra();
     int l = ws_nw_void_l > ex ? ex : ws_nw_void_l;
     int r = ws_nw_void_r > ex ? ex : ws_nw_void_r;
+    if (f - ws_nw_void_zero_l < WS_NW_VOID_SETTLE) l = 0;
+    if (f - ws_nw_void_zero_r < WS_NW_VOID_SETTLE) r = 0;
     if (left) *left = l;
     if (right) *right = r;
     return (l > 0 || r > 0) ? 1 : 0;
@@ -485,7 +484,12 @@ static int ws_nw_dyn_tick(void) {
     if (f == ws_nw_dyn_frame) return 0;
     ws_nw_dyn_frame = f;
     const int ex = ws_nw_extra();
-    int target = ws_nw_dyn_target < 0 ? ex / 2 : ws_nw_dyn_target;
+    /* Nothing placed yet: present centred but commit nothing, so the first
+     * placement the plugin makes is adopted whole. Committing the centred
+     * default here made every stage entry slide from centred to its anchor
+     * over ~18 frames, trailing a shrinking empty strip. */
+    if (ws_nw_dyn_target < 0) return 0;
+    int target = ws_nw_dyn_target;
     if (target > ex) target = ex;
     /* Snap on the first use and whenever the world comes back after a REAL
      * non-world stretch (stage start, menu close — both behind a wipe), so

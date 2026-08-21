@@ -348,8 +348,10 @@ nw_border      = "assets/widescreen_border.png"   # optional, see below
 - `nw_anchor = "dynamic"` hands the split to a plugin: each world frame it
   calls `psx_mod_widescreen_set_window(left_px, void_left, void_right)` —
   `left_px` of the extra revealed on the left (slewed 3 px/frame; snapped on
-  world entry so stage starts and menu closes do not visibly slide) — and the
-  plugin may also switch the mode at activation (`psx_mod_widescreen_set_anchor`).
+  world entry so stage starts and menu closes do not visibly slide, and the
+  FIRST placement is adopted whole rather than slid into from centred) — and
+  the plugin may also switch the mode at activation
+  (`psx_mod_widescreen_set_anchor`).
   In dynamic mode the game-logic margins (`psx_ws_x_margin_left/right`, the
   bg2d columns) are the full extra on BOTH sides: where the window sits never
   changes what the game spawns, keeps alive or draws — only what is shown.
@@ -357,10 +359,16 @@ nw_border      = "assets/widescreen_border.png"   # optional, see below
   present over the `void_left` / `void_right` presented columns the plugin
   reports as lying beyond the authored map (the frame a 4:3 title wears on a
   wide screen). Software and OpenGL presents; pixels with alpha < 128 keep the
-  game. Only on world frames and only while native-wide is active. The
-  runtime additionally requires the SAME non-zero void pair for 10 consecutive
-  reports before painting, so a transition state that briefly mimics a
-  bordered room (menu wipes) never flashes.
+  game. Only on world frames and only while native-wide is active. A side is
+  painted only once it has reported non-zero for 8 consecutive frames — a
+  transition state that briefly mimics a bordered room (a menu wipe, a
+  half-loaded map) never flashes one — while its WIDTH may change freely, so a
+  border that shrinks as a stage scrolls into its map still paints.
+  How a plugin should measure the void: from the game's own background data
+  (Mega Man 8 reads its tile map exactly as its renderer does), not from
+  camera-travel bounds, which say where the camera may scroll and not where
+  the map has content — a locked camera in a scripted room collapses them to
+  a point in the middle of a stage.
 - `border_43 = true` — also paint the window's 4:3 pillarbox side bars with
   `nw_border` on 15-bit game/menu presents (plain 4:3 play fullscreen on a
   wide monitor). Movies keep the cinematic black. OpenGL presenter.
