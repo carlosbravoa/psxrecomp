@@ -372,6 +372,10 @@ nw_border      = "assets/widescreen_border.png"   # optional, see below
 - `border_43 = true` — also paint the window's 4:3 pillarbox side bars with
   `nw_border` on 15-bit game/menu presents (plain 4:3 play fullscreen on a
   wide monitor). Movies keep the cinematic black. OpenGL presenter.
+  Both border blits sample with the present's own filter (Display →
+  antialiasing), so a nearest-filtered setup keeps pixel-crisp bars, and the
+  window blit inverts its destination rows: a framebuffer blit counts rows
+  from the bottom while the image is uploaded top-first.
 - Identity at 4:3; a headless run engages native-wide exactly like a window
   and `present_capture` writes the wide frame (see HEADLESS.md).
 
