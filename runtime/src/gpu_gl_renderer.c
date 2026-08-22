@@ -4717,7 +4717,7 @@ int gl_renderer_present_hold_last(void) {
     return 1;
 }
 
-static void border_blit_window_bars(int ww, int wh, int lx, int lw);
+static void border_blit_window_bars(int ww, int wh, int lx, int lw, int linear);
 
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
@@ -4752,7 +4752,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     glViewport(0, 0, ww, wh);
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
         glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
-        border_blit_window_bars(ww, wh, lx, lw);
+        border_blit_window_bars(ww, wh, lx, lw, linear);
     }
     int interp_pair = interp_capture(s_hr_fbo, disp_x, disp_y, w, h,
                                      linear, force_4_3, GL_PRES_VRAM);
@@ -4861,22 +4861,28 @@ static int border_fbo_ensure(void) {
  * border image on 15-bit game/menu presents (never movies — those keep the
  * cinematic black). The image spans the whole window; the game quad covers
  * the centre. Presentation only. */
-static void border_blit_window_bars(int ww, int wh, int lx, int lw) {
+static void border_blit_window_bars(int ww, int wh, int lx, int lw, int linear) {
     if (!s_border_43 || (lx <= 0 && lw >= ww)) return;
     if (!border_fbo_ensure()) return;
+    /* The image was uploaded with its first row in texture row 0, and a
+     * framebuffer blit counts rows from the BOTTOM, so the destination Y range
+     * is inverted here — otherwise the art lands upside down. Filtering
+     * follows the present's own (Display -> antialiasing): with it off the
+     * bars stay as crisp as the game beside them. */
+    const GLenum filt = linear ? GL_LINEAR : GL_NEAREST;
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_border_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     /* left bar: left part of the image; right bar: right part (window scale) */
     if (lx > 0)
         p_glBlitFramebuffer(0, 0, lx * s_border_w / ww, s_border_h,
-                            0, 0, lx, wh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                            0, wh, lx, 0, GL_COLOR_BUFFER_BIT, filt);
     if (lx + lw < ww)
         p_glBlitFramebuffer((lx + lw) * s_border_w / ww, 0, s_border_w, s_border_h,
-                            lx + lw, 0, ww, wh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                            lx + lw, wh, ww, 0, GL_COLOR_BUFFER_BIT, filt);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
 }
 
-static void wide_blit_border(GLuint wide_fbo, int disp_y, int disp_h) {
+static void wide_blit_border(GLuint wide_fbo, int disp_y, int disp_h, int linear) {
     extern int gpu_ws_nw_void(int *left, int *right);
     int vl = 0, vr = 0;
     if (g_wide_w <= 0) return;
@@ -4891,12 +4897,13 @@ static void wide_blit_border(GLuint wide_fbo, int disp_y, int disp_h) {
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_border_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
     glDisable(GL_SCISSOR_TEST);
+    const GLenum filt = linear ? GL_LINEAR : GL_NEAREST;
     if (lpx > 0)
         p_glBlitFramebuffer(0, 0, lpx * bw / W, bh, 0, y0, lpx, y1,
-                            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                            GL_COLOR_BUFFER_BIT, filt);
     if (rpx > 0)
         p_glBlitFramebuffer((W - rpx) * bw / W, 0, bw, bh, W - rpx, y0, W, y1,
-                            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                            GL_COLOR_BUFFER_BIT, filt);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 }
@@ -4934,7 +4941,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
-    wide_blit_border(fbo, disp_y, disp_h);           /* void borders over the map-less columns */
+    wide_blit_border(fbo, disp_y, disp_h, linear);   /* void borders over the map-less columns */
 
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
